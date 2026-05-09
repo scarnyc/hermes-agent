@@ -58,9 +58,9 @@ class TestStartSession:
         assert result.overrides is not None
         assert result.overrides.model == "test/user-model"
 
-        # Verify limiter was registered
-        limiter = get_limiter("thread-1")
-        assert limiter is not None
+        # Tool limiter is NOT registered by session_manager anymore —
+        # it's handled by gateway_hooks.setup_tool_gate() inside run_sync()
+        # (keyed by hermes session_id, not thread_id)
 
         # Verify workspace was created
         mock_run.assert_called_once()
@@ -118,20 +118,18 @@ class TestEndSession:
 
     @patch("gateway.daimon.workspace.subprocess.run")
     def test_end_session_cleanup(self, mock_run):
-        """end_session unregisters limiter, destroys workspace, releases slot."""
+        """end_session destroys workspace, releases slot (limiter handled by gateway_hooks)."""
         mock_run.return_value = MagicMock(returncode=0)
         raw_config = _make_config(admin_users=["admin1"], max_active=5)
         mgr = DaimonSessionManager(raw_config)
 
         # Start then end
         mgr.start_session("thread-1", "user-1", raw_config)
-        assert get_limiter("thread-1") is not None
         assert mgr.active_sessions == 1
 
         promoted = mgr.end_session("thread-1")
 
         assert promoted is None
-        assert get_limiter("thread-1") is None
         assert mgr.active_sessions == 0
 
         # Verify workspace destroy was called

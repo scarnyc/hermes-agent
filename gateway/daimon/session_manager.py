@@ -85,9 +85,9 @@ class DaimonSessionManager:
         self._threads.register(thread_id, user_id)
         self._workspace.create(thread_id)
 
-        # Register tool limiter for this session
-        limiter = ToolLimiter(self._cfg.tool_limits)
-        register_limiter(thread_id, limiter)
+        # NOTE: Tool limiter registration is handled by gateway_hooks.setup_tool_gate()
+        # inside run_sync(), keyed by the Hermes session_id (not thread_id).
+        # This ensures the limiter key matches what model_tools.py uses for lookup.
 
         # Compute agent overrides
         overrides = compute_overrides(raw_config, user_id, "discord")
@@ -99,8 +99,8 @@ class DaimonSessionManager:
 
         Returns the next queued thread_id if one was promoted, else None.
         """
-        # Unregister limiter
-        unregister_limiter(thread_id)
+        # NOTE: Tool limiter unregistration is handled by gateway_hooks.teardown_tool_gate()
+        # in the finally block of run_sync(), keyed by session_id.
 
         # Nuke workspace
         self._workspace.destroy(thread_id)

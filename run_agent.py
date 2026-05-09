@@ -9693,6 +9693,17 @@ class AIAgent:
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
 
+        # ── Daimon tool gate — enforce per-session tool limits ──
+        try:
+            from gateway.daimon.tool_gate import check_tool_call
+            _gate_key = effective_task_id or getattr(self, "session_id", None) or ""
+            if _gate_key:
+                _denial = check_tool_call(_gate_key, function_name)
+                if _denial:
+                    return json.dumps({"error": _denial}, ensure_ascii=False)
+        except ImportError:
+            pass
+
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(
