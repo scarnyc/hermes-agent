@@ -9343,11 +9343,17 @@ class AIAgent:
         ``reasoning_content`` on every assistant tool-call message; omitting
         it causes the next replay to fail with HTTP 400.
         """
+        model = (self.model or "").lower()
         return (
             self.provider in {"kimi-coding", "kimi-coding-cn"}
             or base_url_host_matches(self.base_url, "api.kimi.com")
             or base_url_host_matches(self.base_url, "moonshot.ai")
             or base_url_host_matches(self.base_url, "moonshot.cn")
+            or model.startswith("moonshotai/")
+            or (
+                base_url_host_matches(self.base_url, "openrouter.ai")
+                and "kimi" in model
+            )
         )
 
     def _needs_deepseek_tool_reasoning(self) -> bool:
