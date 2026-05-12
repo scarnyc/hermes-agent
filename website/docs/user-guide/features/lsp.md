@@ -41,15 +41,20 @@ Concretely, on every successful `write_file` or `patch`:
 The agent sees output like:
 
 ```
-LSP diagnostics introduced by this edit:
-<diagnostics file="/path/to/foo.py">
-ERROR [42:5] Cannot find name 'foo' [reportUndefinedVariable] (Pyright)
-ERROR [50:1] Argument of type "str" is not assignable to "int" [reportArgumentType] (Pyright)
-</diagnostics>
+{
+  "bytes_written": 42,
+  "dirs_created": false,
+  "lint": {"status": "ok", "output": ""},
+  "lsp_diagnostics": "LSP diagnostics introduced by this edit:\n<diagnostics file=\"/path/to/foo.py\">\nERROR [42:5] Cannot find name 'foo' [reportUndefinedVariable] (Pyright)\nERROR [50:1] Argument of type \"str\" is not assignable to \"int\" [reportArgumentType] (Pyright)\n</diagnostics>"
+}
 ```
 
-Diagnostics from pre-existing errors are filtered out so the agent
-focuses on what it just changed.
+The `lint` field carries the syntax-check result (microsecond
+in-process parse via `ast.parse`, `json.loads`, etc.); the
+`lsp_diagnostics` field carries the semantic diagnostics from the
+real language server. Two channels, independent signals — the
+agent sees a syntax-clean file with semantic problems as
+``lint: ok`` plus a populated ``lsp_diagnostics``.
 
 ## Supported languages
 

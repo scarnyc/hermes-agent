@@ -120,6 +120,13 @@ class WriteResult:
     bytes_written: int = 0
     dirs_created: bool = False
     lint: Optional[Dict[str, Any]] = None
+    # Semantic diagnostics from the LSP layer, when applicable.  Kept in
+    # its own field (not folded into ``lint``) so the model and any
+    # downstream parsers can read syntax errors and semantic errors as
+    # separate signals.  ``None`` when LSP is disabled, when the file
+    # isn't in a git workspace, or when no diagnostics were introduced
+    # by this edit.
+    lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
     warning: Optional[str] = None
 
@@ -136,6 +143,8 @@ class PatchResult:
     files_created: List[str] = field(default_factory=list)
     files_deleted: List[str] = field(default_factory=list)
     lint: Optional[Dict[str, Any]] = None
+    # See :class:`WriteResult.lsp_diagnostics`.
+    lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
     
     def to_dict(self) -> dict:
@@ -150,6 +159,8 @@ class PatchResult:
             result["files_deleted"] = self.files_deleted
         if self.lint:
             result["lint"] = self.lint
+        if self.lsp_diagnostics:
+            result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
             result["error"] = self.error
         return result
@@ -904,10 +915,21 @@ class ShellFileOperations(FileOperations):
         # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
 
+        # Semantic diagnostics from the LSP layer — separate channel.
+        # Only fired when the syntax tier reported clean (no point asking
+        # an LSP for a file that won't even parse).  Best-effort:
+        # ``""`` is returned for any failure path.
+        lsp_diagnostics: Optional[str] = None
+        if lint_result.success or lint_result.skipped:
+            block = self._maybe_lsp_diagnostics(path)
+            if block:
+                lsp_diagnostics = block
+
         return WriteResult(
             bytes_written=bytes_written,
             dirs_created=dirs_created,
             lint=lint_result.to_dict() if lint_result else None,
+            lsp_diagnostics=lsp_diagnostics,
         )
     
     # =========================================================================
@@ -1003,7 +1025,14 @@ class ShellFileOperations(FileOperations):
             success=True,
             diff=diff,
             files_modified=[path],
-            lint=lint_result.to_dict() if lint_result else None
+            lint=lint_result.to_dict() if lint_result else None,
+            # Propagate the LSP diagnostics already captured by the
+            # internal ``write_file`` call.  Its baseline was the
+            # pre-patch content (taken at the start of write_file via
+            # ``_snapshot_lsp_baseline``) so the delta is correct for
+            # the patch as a whole.  Keep the field separate from the
+            # syntax-check ``lint`` so the agent can read both signals.
+            lsp_diagnostics=write_result.lsp_diagnostics,
         )
     
     def patch_v4a(self, patch_content: str) -> PatchResult:
@@ -1119,9 +1148,9 @@ class ShellFileOperations(FileOperations):
     def _check_lint_delta(self, path: str, pre_content: Optional[str],
                           post_content: Optional[str] = None) -> LintResult:
         """
-        Run post-write lint with pre-write baseline comparison.
+        Run post-write syntax lint with pre-write baseline comparison.
 
-        Three-tier strategy:
+        Two-tier strategy:
 
         1. **Syntax check** (in-process or shell-based, microseconds).
            Catches the bug class that motivated this layer: corrupt
@@ -1132,17 +1161,12 @@ class ShellFileOperations(FileOperations):
            existed pre-edit so the agent isn't distracted by inherited
            state.
 
-        3. **LSP semantic diagnostics**, when:
-            - the syntax check passes (no point asking the LSP for a
-              file that won't even parse), and
-            - LSP is enabled in config, and
-            - the cwd/file is inside a git workspace, and
-            - a registered server matches the file extension.
-           The LSP service captures a baseline at write start and
-           returns only diagnostics introduced by the edit.
-
-        Layer 3 is best-effort — failures at any point silently fall
-        back to the syntax-tier result.
+        Semantic diagnostics from the LSP layer are fetched separately
+        via :meth:`_maybe_lsp_diagnostics` and surfaced in the
+        ``lsp_diagnostics`` field on :class:`WriteResult` /
+        :class:`PatchResult`.  Keeping the two channels separate lets
+        the agent (and any downstream parsers) read syntax errors and
+        semantic errors as independent signals.
 
         Args:
             path: File path (for linter selection).
@@ -1157,17 +1181,12 @@ class ShellFileOperations(FileOperations):
         Returns:
             LintResult.  ``output`` contains either the full post-lint
             errors (no pre-state) or just the new-error lines (delta
-            refinement applied).  When LSP semantic diagnostics fire,
-            they're appended to ``output`` after the syntax-tier text.
+            refinement applied).
         """
         post = self._check_lint(path, content=post_content)
 
-        # Hot path: clean post-write syntactically — try the LSP layer
-        # for semantic diagnostics before declaring victory.
+        # Hot path: clean post-write syntactically.
         if post.success or post.skipped:
-            lsp_block = self._maybe_lsp_diagnostics(path)
-            if lsp_block:
-                return LintResult(success=False, output=lsp_block)
             return post
 
         # Post-write has syntax errors.  If we have pre-content, run the
