@@ -120,7 +120,7 @@ def test_transform_tool_result_injects_diagnostics(tmp_path):
     abs_path = str(test_file)
 
     # Pre-populate a baseline entry (simulating pre_tool_call ran)
-    lsp_plugin._baselines[("test-session", abs_path)] = []
+    lsp_plugin._baselines.add(("test-session", abs_path))
 
     # Mock service that returns a diagnostic
     mock_service = type("MockService", (), {

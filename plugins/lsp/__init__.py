@@ -6,17 +6,6 @@ issues detected by pyright, gopls, rust-analyzer, typescript-language-server,
 and ~20 more.
 
 Opt-in: add ``lsp`` to ``plugins.enabled`` in config.yaml.
-
-Architecture
-------------
-- ``on_session_start``: create LSP service (lightweight — no servers spawned yet)
-- ``pre_tool_call``: on write_file/patch, snapshot LSP baseline for the file
-- ``transform_tool_result``: after write, fetch diagnostics, inject delta into result JSON
-- ``on_session_end`` + ``atexit``: tear down all server child processes
-
-Baselines are keyed by ``(session_id, abs_path)`` to handle concurrent
-gateway sessions sharing a process.  Parallel writes to different files
-are safe because Hermes doesn't parallelize overlapping path-scoped tools.
 """
 from __future__ import annotations
 
@@ -25,37 +14,23 @@ import json
 import logging
 import os
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger("plugins.lsp")
 
-# ---------------------------------------------------------------------------
 # Module-level state
-# ---------------------------------------------------------------------------
-
-# The LSP service singleton (created on first relevant pre_tool_call).
-_service: Optional[Any] = None  # LSPService | None
+_service: Any = None  # LSPService | None
 _service_lock = threading.Lock()
-
-# Baselines keyed by (session_id, abs_path) → diagnostics list.
-# Concurrent-safe: Hermes never writes to the same path in parallel.
-_baselines: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-
-
-# ---------------------------------------------------------------------------
-# Plugin entry point
-# ---------------------------------------------------------------------------
+# Presence set: (session_id, abs_path) entries where a baseline was captured.
+_baselines: set[tuple[str, str]] = set()
 
 
 def register(ctx) -> None:
     """Plugin registration — wire hooks and CLI commands."""
-    ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("pre_tool_call", _pre_tool_call)
-    ctx.register_hook("post_tool_call", _post_tool_call)
     ctx.register_hook("transform_tool_result", _transform_tool_result)
 
-    # CLI: hermes lsp status/install/restart/list/which
     try:
         from plugins.lsp.cli import setup_lsp_parser, run_lsp_command
         ctx.register_cli_command(
@@ -67,27 +42,12 @@ def register(ctx) -> None:
     except Exception as e:
         logger.debug("LSP CLI registration failed: %s", e)
 
-    # Process-exit cleanup as a second layer beyond on_session_end.
-    atexit.register(_atexit_cleanup)
+    atexit.register(_on_session_end)
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle hooks
+# Lifecycle
 # ---------------------------------------------------------------------------
-
-
-def _on_session_start(**kwargs) -> None:
-    """Create the LSP service on session start.
-
-    We don't gate on git-workspace here — that check happens per-file
-    in ``enabled_for()``.  The service is lightweight when idle (no
-    servers spawned, no event loop until first use).
-    """
-    # Skip non-interactive scripted modes where LSP is pointless.
-    platform = kwargs.get("platform", "cli")
-    if platform in ("batch", "cron"):
-        return
-    _ensure_service()
 
 
 def _on_session_end(**kwargs) -> None:
@@ -103,28 +63,13 @@ def _on_session_end(**kwargs) -> None:
     _baselines.clear()
 
 
-def _atexit_cleanup() -> None:
-    """Process-exit fallback — catch crashes / Ctrl+C that skip on_session_end."""
-    global _service
-    if _service is not None:
-        try:
-            _service.shutdown()
-        except Exception:
-            pass
-        _service = None
-
-
 # ---------------------------------------------------------------------------
 # Tool hooks
 # ---------------------------------------------------------------------------
 
 
 def _pre_tool_call(**kwargs) -> None:
-    """Snapshot LSP baseline before a file write.
-
-    Fires for write_file and patch (single-path mode).  Skips V4A
-    multi-file patches (args has ``patch`` field, not ``path``).
-    """
+    """Snapshot LSP baseline before a file write."""
     tool_name = kwargs.get("tool_name", "")
     if tool_name not in ("write_file", "patch"):
         return
@@ -137,64 +82,39 @@ def _pre_tool_call(**kwargs) -> None:
     if args is None:
         return
 
-    # V4A multi-file patch: has "patch" key, skip for MVP
-    if "patch" in args and "path" not in args:
-        return
-
     path = args.get("path", "")
     if not path:
         return
 
     abs_path = _resolve_path(path)
 
-    # Best-effort local-only check: if the path doesn't exist on the
-    # host filesystem, we're probably in a Docker/SSH backend.
+    # Best-effort local-only check: skip if parent dir doesn't exist on host
     if not os.path.exists(os.path.dirname(abs_path) or "."):
         return
 
     if not svc.enabled_for(abs_path):
         return
 
-    session_id = kwargs.get("session_id", "") or ""
+    session_id = kwargs.get("session_id") or ""
     key = (session_id, abs_path)
 
     try:
         svc.snapshot_baseline(abs_path)
-        _baselines[key] = []  # Mark that we took a baseline
+        _baselines.add(key)
     except Exception as e:
         logger.debug("LSP baseline snapshot failed for %s: %s", abs_path, e)
 
 
-def _post_tool_call(**kwargs) -> None:
-    """Cleanup hook — clear stale baseline on failure paths.
-
-    transform_tool_result handles the success path (pops the key).
-    post_tool_call ensures the key is removed even when the tool errors
-    and transform_tool_result doesn't fire or returns early.
-    """
-    tool_name = kwargs.get("tool_name", "")
-    if tool_name not in ("write_file", "patch"):
-        return
-
-    # We don't clean up here on success — transform_tool_result handles it.
-    # On failure, the result will contain an error and transform_tool_result
-    # will return None (no injection), but the baseline entry persists.
-    # That's fine — it's a few bytes of memory per failed write, cleared
-    # in on_session_end.  Aggressive cleanup here would race with
-    # transform_tool_result which fires AFTER post_tool_call.
-
-
-def _transform_tool_result(**kwargs) -> Optional[str]:
+def _transform_tool_result(**kwargs) -> str | None:
     """Inject LSP diagnostics into the tool result JSON.
 
-    Returns the modified result string (with ``lsp_diagnostics`` field
-    added to the JSON), or None to leave the result unchanged.
+    Returns modified result string with ``lsp_diagnostics`` field,
+    or None to leave unchanged.
     """
     tool_name = kwargs.get("tool_name", "")
     if tool_name not in ("write_file", "patch"):
         return None
 
-    # Snapshot service ref to avoid TOCTOU with _on_session_end
     svc = _service
     if svc is None or not svc.is_active():
         return None
@@ -203,29 +123,19 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
     if args is None:
         return None
 
-    # V4A multi-file skip
-    if "patch" in args and "path" not in args:
-        return None
-
     path = args.get("path", "")
     if not path:
         return None
 
     abs_path = _resolve_path(path)
-    session_id = kwargs.get("session_id", "") or ""
+    session_id = kwargs.get("session_id") or ""
     key = (session_id, abs_path)
 
-    # Only proceed if we captured a baseline for this file
     if key not in _baselines:
         return None
+    _baselines.discard(key)
 
-    # Remove the baseline entry (consumed)
-    _baselines.pop(key, None)
-
-    if not svc.enabled_for(abs_path):
-        return None
-
-    # Fetch diagnostics with a short timeout (don't block long on cold start)
+    # Fetch diagnostics with short timeout
     try:
         diagnostics = svc.get_diagnostics_sync(abs_path, delta=True, timeout=3.0)
     except Exception as e:
@@ -235,7 +145,7 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
     if not diagnostics:
         return None
 
-    # Format and inject into result JSON
+    # Format
     try:
         from plugins.lsp.reporter import report_for_file, truncate
         block = report_for_file(abs_path, diagnostics)
@@ -245,11 +155,8 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
     except Exception:
         return None
 
-    # Preserve JSON shape: parse existing result, add lsp_diagnostics field.
-    # Only inject when result is a JSON object (dict). Non-dict JSON (arrays,
-    # strings, numbers) and non-JSON results are left unmodified — we cannot
-    # inject a field without corrupting the format.
-    result = kwargs.get("result") or ""
+    # Inject into result JSON (only when result is a JSON dict)
+    result = kwargs.get("result")
     if not isinstance(result, str):
         return None
     try:
@@ -263,15 +170,16 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
 def _ensure_service():
     """Lazy-initialize the LSP service singleton."""
     global _service
-    if _service is not None:
-        return _service if _service.is_active() else None
+    svc = _service
+    if svc is not None:
+        return svc if svc.is_active() else None
     with _service_lock:
         if _service is not None:
             return _service if _service.is_active() else None
@@ -281,11 +189,11 @@ def _ensure_service():
         except Exception as e:
             logger.debug("LSP service creation failed: %s", e)
             return None
-    return _service if (_service is not None and _service.is_active()) else None
+        return _service if (_service and _service.is_active()) else None
 
 
-def _parse_args(args) -> Optional[Dict[str, Any]]:
-    """Normalize args from hook kwargs (may be dict or JSON string)."""
+def _parse_args(args) -> dict[str, Any] | None:
+    """Normalize args (may be dict or JSON string)."""
     if isinstance(args, dict):
         return args
     if isinstance(args, str):
