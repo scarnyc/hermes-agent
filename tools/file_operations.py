@@ -1033,11 +1033,19 @@ class ShellFileOperations(FileOperations):
         """
         Run syntax check on a file after editing.
 
-        Prefers the in-process linter for structured formats (JSON, YAML,
-        TOML) when possible — those parse via the Python stdlib in
-        microseconds and don't require a subprocess.  Falls back to the
-        shell linter table for compiled/type-checked languages
-        (py_compile, node --check, tsc, go vet, rustfmt).
+        Resolution order:
+          1. LSP-backed lint via ``tools.lsp_lint.maybe_lint_via_lsp`` —
+             only fires when ``lint.lsp.enabled`` is true, the backend is
+             local, and a project root marker (tsconfig.json, Cargo.toml,
+             go.mod, …) is present. Returns None when any of those
+             prerequisites fail, so the cheaper paths below run untouched
+             for everyone who hasn't opted in.
+          2. In-process linter for structured formats (JSON/YAML/TOML)
+             plus Python ``ast.parse`` — microseconds per call, no
+             subprocess.
+          3. Shell linter table (py_compile, node --check, tsc, go vet,
+             rustfmt) for compiled/type-checked languages without an
+             in-process option.
 
         Args:
             path: File path (used to select the linter + for shell invocation).
@@ -1051,7 +1059,20 @@ class ShellFileOperations(FileOperations):
         """
         ext = os.path.splitext(path)[1].lower()
 
-        # Prefer in-process linter when available.
+        # 1) LSP — opt-in, local-only today. Lazily imported so the rest of
+        # the file_operations surface keeps working in environments where
+        # the LSP module's transitive imports (config loader, etc.) are
+        # unavailable, e.g. minimal sandboxes used by some unit tests.
+        if content is not None:
+            try:
+                from tools.lsp_lint import maybe_lint_via_lsp
+                lsp_result = maybe_lint_via_lsp(path, content, self.env)
+            except Exception:
+                lsp_result = None
+            if lsp_result is not None:
+                return lsp_result
+
+        # 2) In-process linter when available.
         inproc = LINTERS_INPROC.get(ext)
         if inproc is not None:
             # Need content — either passed in or read from disk.
@@ -1066,7 +1087,9 @@ class ShellFileOperations(FileOperations):
                 return LintResult(skipped=True, message=f"No linter available for {ext} (missing dependency)")
             return LintResult(success=ok, output="" if ok else err)
 
-        # Fall back to shell linter.
+        # 3) Shell linter table — last-resort fallback for compiled / type-
+        # checked languages without an in-process option (and the path the
+        # disabled LSP feature deliberately falls through to).
         if ext not in LINTERS:
             return LintResult(skipped=True, message=f"No linter for {ext} files")
 

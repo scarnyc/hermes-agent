@@ -1290,6 +1290,45 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Post-edit lint behaviour. Hermes runs a syntax check after every
+    # write/patch and surfaces only the errors that edit introduced (see
+    # ``ShellFileOperations._check_lint_delta`` in tools/file_operations.py).
+    # The defaults below leave the legacy shell linters (``npx tsc --noEmit``,
+    # ``go vet``, ``rustfmt --check``, ``py_compile``) in charge — the LSP
+    # path is opt-in until container/SSH backends grow a way to host the
+    # language server inside the sandbox.
+    "lint": {
+        "lsp": {
+            # Master switch. When false, ``_check_lint`` skips LSP entirely
+            # and the in-process / shell linter table runs as before.
+            "enabled": False,
+            # Per-language server launch command. Each value is either a
+            # whitespace-separated string or a list. Missing languages
+            # fall back to ``tools.lsp_lint._DEFAULT_SERVERS``.
+            "servers": {
+                "typescript": "typescript-language-server --stdio",
+                "typescriptreact": "typescript-language-server --stdio",
+                "javascript": "typescript-language-server --stdio",
+                "javascriptreact": "typescript-language-server --stdio",
+                "rust": "rust-analyzer",
+                "go": "gopls",
+            },
+            # Wall-clock timeout for a single ``didOpen`` → diagnostics
+            # round-trip. Servers that take longer than this on cold start
+            # (notably rust-analyzer indexing a fresh checkout) cause the
+            # caller to fall through to the shell linter.
+            "diagnostic_timeout": 10,
+            # Settle window (milliseconds). Typescript-language-server
+            # publishes an empty diagnostics batch while the program graph
+            # loads, then re-publishes once the file is fully analysed.
+            # Re-snapshotting after this delay catches the real verdict.
+            "settle_ms": 400,
+            # Shut down a long-lived server process after this many seconds
+            # of inactivity. The reaper runs in-process; no daemons.
+            "idle_shutdown": 600,
+        },
+    },
+
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
     # This section is only needed for hermes-specific overrides; everything else
     # (apiKey, workspace, peerName, sessions, enabled) comes from the global config.
