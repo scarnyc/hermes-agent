@@ -73,6 +73,7 @@ async def read_message(reader: asyncio.StreamReader) -> Optional[dict]:
     The reader is advanced to just past the JSON body on success.
     """
     headers: dict = {}
+    header_bytes = 0
     while True:
         try:
             line = await reader.readuntil(b"\r\n")
@@ -84,6 +85,14 @@ async def read_message(reader: asyncio.StreamReader) -> Optional[dict]:
             raise LSPProtocolError(
                 f"unexpected EOF while reading LSP headers (partial={e.partial!r})"
             ) from e
+        # Defensive cap against a server streaming headers without ever
+        # emitting CRLF-CRLF.  Caps total header bytes at 8 KiB — a
+        # well-behaved server fits in well under 200 bytes.
+        header_bytes += len(line)
+        if header_bytes > 8192:
+            raise LSPProtocolError(
+                f"LSP header block exceeded 8 KiB without terminator"
+            )
         line = line[:-2]  # strip CRLF
         if not line:
             break  # blank line ends header block

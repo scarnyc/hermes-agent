@@ -50,9 +50,14 @@ def find_git_worktree(start: str) -> Optional[str]:
     A ``.git`` *file* (not directory) means we're inside a git
     worktree set up via ``git worktree add`` — both forms count.
     """
-    start_path = Path(normalize_path(start))
-    if start_path.is_file():
-        start_path = start_path.parent
+    try:
+        start_path = Path(normalize_path(start))
+        if start_path.is_file():
+            start_path = start_path.parent
+    except (OSError, RuntimeError, ValueError):
+        # Pathological input (loop in symlinks, encoding error, etc.) —
+        # bail out rather than crash the lint hook.
+        return None
 
     # Cache check
     cached = _workspace_cache.get(str(start_path))
@@ -61,7 +66,10 @@ def find_git_worktree(start: str) -> Optional[str]:
         return root
 
     cur = start_path
-    while True:
+    # Defensive cap: the deepest reasonable monorepo is well under 64
+    # levels.  Caps the walk so a pathological cwd or a symlink cycle
+    # we somehow traverse can't keep us looping.
+    for _ in range(64):
         git_marker = cur / ".git"
         try:
             if git_marker.exists():
@@ -122,20 +130,29 @@ def nearest_root(
     before ``package.json``).
     """
     start_path = Path(normalize_path(start))
-    if start_path.is_file():
-        start_path = start_path.parent
+    try:
+        if start_path.is_file():
+            start_path = start_path.parent
+    except (OSError, RuntimeError, ValueError):
+        return None
     ceiling_path = Path(normalize_path(ceiling)) if ceiling else None
 
     markers_list = list(markers)
     excludes_list = list(excludes) if excludes else []
 
     cur = start_path
-    while True:
+    # Defensive cap matching ``find_git_worktree``.  Bounded walk
+    # protects against pathological inputs even though the
+    # parent-equality stop normally terminates within ~10 steps.
+    for _ in range(64):
         # Check excludes first — if an exclude is found at this level,
         # the server is gated off for this file.
         for exc in excludes_list:
-            if (cur / exc).exists():
-                return None
+            try:
+                if (cur / exc).exists():
+                    return None
+            except OSError:
+                continue
         # Then check markers.
         for marker in markers_list:
             try:
@@ -150,6 +167,7 @@ def nearest_root(
         if parent == cur:
             return None
         cur = parent
+    return None
 
 
 def resolve_workspace_for_file(

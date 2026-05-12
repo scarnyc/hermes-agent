@@ -115,6 +115,18 @@ async def test_read_message_two_messages_back_to_back():
     assert (await read_message(reader))["method"] == "b"
 
 
+@pytest.mark.asyncio
+async def test_read_message_rejects_runaway_header():
+    """A pathological server that streams headers without ever emitting
+    the CRLF-CRLF terminator must not loop forever — the 8 KiB cap kicks
+    in and surfaces a protocol error."""
+    flood = (b"X-Junk: " + b"A" * 200 + b"\r\n") * 60   # ~12 KiB worth
+    reader = await _stream_from_bytes(flood)
+    with pytest.raises(LSPProtocolError) as exc:
+        await read_message(reader)
+    assert "8 KiB" in str(exc.value)
+
+
 # ---------------------------------------------------------------------------
 # envelope helpers
 # ---------------------------------------------------------------------------

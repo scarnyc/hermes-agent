@@ -42,6 +42,7 @@ import time
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.lsp import eventlog
 from agent.lsp.client import (
     DIAGNOSTICS_DOCUMENT_WAIT,
     LSPClient,
@@ -298,10 +299,21 @@ class LSPService:
         """
         if not self.enabled_for(file_path):
             return []
+
+        # Resolve server_id eagerly so we can emit structured logs even
+        # when the request errors out below.
+        srv = find_server_for_file(file_path)
+        server_id = srv.server_id if srv else "?"
+
         try:
             t = timeout if timeout is not None else self._wait_timeout + 2.0
             diags = self._loop.run(self._open_and_wait_async(file_path), timeout=t) or []
+        except asyncio.TimeoutError as e:
+            eventlog.log_timeout(server_id, file_path)
+            logger.debug("LSP diagnostics timeout for %s: %s", file_path, e)
+            return []
         except Exception as e:  # noqa: BLE001
+            eventlog.log_server_error(server_id, file_path, e)
             logger.debug("LSP diagnostics fetch failed for %s: %s", file_path, e)
             return []
 
@@ -321,6 +333,10 @@ class LSPService:
             if fresh:
                 self._delta_baseline[abs_path] = fresh
 
+        if diags:
+            eventlog.log_diagnostics(server_id, file_path, len(diags))
+        else:
+            eventlog.log_clean(server_id, file_path)
         return diags
 
     def shutdown(self) -> None:
@@ -378,13 +394,20 @@ class LSPService:
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
         srv = find_server_for_file(file_path)
-        if srv is None or srv.server_id in self._disabled_servers:
+        if srv is None:
+            return None
+        if srv.server_id in self._disabled_servers:
+            eventlog.log_disabled(srv.server_id, file_path, "disabled in config")
             return None
         ws_root, gated = resolve_workspace_for_file(file_path)
         if not (ws_root and gated):
+            eventlog.log_no_project_root(srv.server_id, file_path)
             return None
         per_server_root = srv.resolve_root(file_path, ws_root)
         if per_server_root is None:
+            eventlog.log_disabled(
+                srv.server_id, file_path, "exclude marker hit (server gated off)"
+            )
             return None  # exclude marker hit, server gated off
 
         key = (srv.server_id, per_server_root)
@@ -393,6 +416,7 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
+                eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
         if spawning is not None:
@@ -416,6 +440,11 @@ class LSPService:
             )
             spec = srv.build_spawn(per_server_root, ctx)
             if spec is None:
+                # ``build_spawn`` returns None when the binary can't be
+                # located (auto-install disabled, manual-only server,
+                # or install attempt failed).  Surface this once via
+                # the structured logger so the user can act on it.
+                eventlog.log_server_unavailable(srv.server_id, srv.server_id)
                 self._broken.add(key)
                 spawn_future.set_result(None)
                 return None
@@ -431,13 +460,14 @@ class LSPService:
             try:
                 await client.start()
             except Exception as e:  # noqa: BLE001
-                logger.info("LSP server %s failed to start: %s", srv.server_id, e)
+                eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
                 self._broken.add(key)
                 spawn_future.set_result(None)
                 return None
             with self._state_lock:
                 self._clients[key] = client
             self._last_used[key] = time.time()
+            eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
         finally:

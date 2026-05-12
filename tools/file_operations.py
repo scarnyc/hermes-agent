@@ -1211,12 +1211,38 @@ class ShellFileOperations(FileOperations):
             )
         )
 
+    def _lsp_local_only(self) -> bool:
+        """Return True iff this FileOperations is wired to a local backend.
+
+        LSP servers run on the host process — they need access to the
+        files they're linting.  Remote/sandboxed backends (Docker,
+        Modal, SSH, Daytona) keep files inside the sandbox where the
+        host-side LSP server can't reach them, so we skip the LSP
+        path for those entirely.
+        """
+        env = getattr(self, "env", None)
+        if env is None:
+            # Defensive: some tests construct ShellFileOperations via
+            # ``__new__`` without going through ``__init__``, so
+            # ``self.env`` may be missing.  No env = no LSP path.
+            return False
+        try:
+            from tools.environments.local import LocalEnvironment
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(env, LocalEnvironment)
+
     def _snapshot_lsp_baseline(self, path: str) -> None:
         """Capture pre-edit LSP diagnostics so the post-write delta is correct.
 
         Best-effort.  Silent on every failure path — LSP is an
         enrichment layer and must never break a write.
+
+        Skipped entirely on non-local backends (Docker, Modal, SSH,
+        etc.) — the server can't see files inside the sandbox.
         """
+        if not self._lsp_local_only():
+            return
         try:
             from agent.lsp import get_service
             svc = get_service()
@@ -1239,7 +1265,12 @@ class ShellFileOperations(FileOperations):
         can't break a write.  This intentionally swallows all errors
         — the calling tier already returned a clean syntax result, so
         ``""`` here just means "no extra info to add".
+
+        Skipped entirely on non-local backends (Docker, Modal, SSH,
+        etc.) — same reasoning as ``_snapshot_lsp_baseline``.
         """
+        if not self._lsp_local_only():
+            return ""
         try:
             from agent.lsp import get_service
         except Exception:  # noqa: BLE001
