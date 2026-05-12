@@ -57,11 +57,11 @@ def register(ctx) -> None:
 
     # CLI: hermes lsp status/install/restart/list/which
     try:
-        from plugins.lsp.cli import register_subparser, run_lsp_command
+        from plugins.lsp.cli import setup_lsp_parser, run_lsp_command
         ctx.register_cli_command(
             name="lsp",
             help="Language Server Protocol management",
-            setup_fn=register_subparser,
+            setup_fn=setup_lsp_parser,
             handler_fn=run_lsp_command,
         )
     except Exception as e:

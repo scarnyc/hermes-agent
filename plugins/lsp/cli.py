@@ -67,6 +67,49 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     parser.set_defaults(func=run_lsp_command)
 
 
+def setup_lsp_parser(parser: argparse.ArgumentParser) -> None:
+    """Set up subcommands on an already-created 'lsp' parser.
+
+    Called by the plugin system's register_cli_command pathway, where
+    main.py creates the top-level ``hermes lsp`` parser and passes it
+    to us for subcommand wiring.
+    """
+    sub = parser.add_subparsers(dest="lsp_command")
+
+    sub_status = sub.add_parser("status", help="Show LSP service status")
+    sub_status.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+
+    sub_list = sub.add_parser("list", help="List supported language servers")
+    sub_list.add_argument(
+        "--installed-only",
+        action="store_true",
+        help="Only show servers whose binary is currently available",
+    )
+
+    sub_install = sub.add_parser("install", help="Install a server binary")
+    sub_install.add_argument("server", help="Server id (e.g. pyright, gopls)")
+
+    sub_install_all = sub.add_parser(
+        "install-all",
+        help="Install every server with a known auto-install recipe",
+    )
+    sub_install_all.add_argument(
+        "--include-manual",
+        action="store_true",
+        help="Even attempt servers marked manual-install (best effort)",
+    )
+
+    sub_restart = sub.add_parser(
+        "restart",
+        help="Tear down running LSP clients (next edit re-spawns)",
+    )
+
+    sub_which = sub.add_parser("which", help="Print binary path for a server")
+    sub_which.add_argument("server", help="Server id")
+
+
 def run_lsp_command(args: argparse.Namespace) -> int:
     """Top-level dispatcher for ``hermes lsp <subcommand>``."""
     sub = getattr(args, "lsp_command", None) or "status"
