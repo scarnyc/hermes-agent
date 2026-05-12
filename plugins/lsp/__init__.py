@@ -155,7 +155,7 @@ def _pre_tool_call(**kwargs) -> None:
     if not svc.enabled_for(abs_path):
         return
 
-    session_id = kwargs.get("session_id", "")
+    session_id = kwargs.get("session_id", "") or ""
     key = (session_id, abs_path)
 
     try:
@@ -194,8 +194,9 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
     if tool_name not in ("write_file", "patch"):
         return None
 
+    # Snapshot service ref to avoid TOCTOU with _on_session_end
     svc = _service
-    if svc is None:
+    if svc is None or not svc.is_active():
         return None
 
     args = _parse_args(kwargs.get("args"))
@@ -211,7 +212,7 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
         return None
 
     abs_path = _resolve_path(path)
-    session_id = kwargs.get("session_id", "")
+    session_id = kwargs.get("session_id", "") or ""
     key = (session_id, abs_path)
 
     # Only proceed if we captured a baseline for this file
@@ -244,18 +245,21 @@ def _transform_tool_result(**kwargs) -> Optional[str]:
     except Exception:
         return None
 
-    # Preserve JSON shape: parse existing result, add lsp_diagnostics field
-    result = kwargs.get("result", "")
+    # Preserve JSON shape: parse existing result, add lsp_diagnostics field.
+    # Only inject when result is a JSON object (dict). Non-dict JSON (arrays,
+    # strings, numbers) and non-JSON results are left unmodified — we cannot
+    # inject a field without corrupting the format.
+    result = kwargs.get("result") or ""
+    if not isinstance(result, str):
+        return None
     try:
         result_data = json.loads(result)
-        if isinstance(result_data, dict):
-            result_data["lsp_diagnostics"] = lsp_output
-            return json.dumps(result_data, ensure_ascii=False)
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # Fallback: if result isn't JSON, append as text
-    return result + "\n\n" + lsp_output
+        if not isinstance(result_data, dict):
+            return None
+        result_data["lsp_diagnostics"] = lsp_output
+        return json.dumps(result_data, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +313,8 @@ def _resolve_path(path: str) -> str:
 
 def get_service():
     """Return the active LSP service or None."""
-    return _service if (_service is not None and _service.is_active()) else None
+    svc = _service
+    return svc if (svc is not None and svc.is_active()) else None
 
 
 def shutdown_service() -> None:
