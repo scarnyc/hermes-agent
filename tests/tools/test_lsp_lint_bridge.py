@@ -4,14 +4,15 @@ LSP client.
 We do not spin up a real language server here. Instead we monkeypatch
 ``get_or_start_client`` with a fake that returns whatever diagnostics the
 test wants. This keeps the bridge logic — feature flag, language map,
-project-root gating, error containment — under tight unit-test control
-while leaving the real LSP wire-protocol coverage to test_lsp_client.py.
+project-root gating, error containment, observability — under tight
+unit-test control while leaving the real LSP wire-protocol coverage to
+test_lsp_client.py.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -198,3 +199,147 @@ class TestRouting:
             result = lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", local_env)
         # The lint hook is on the hot edit path — bridge must never raise.
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Observability — log levels and once-per-X dedup
+# ---------------------------------------------------------------------------
+#
+# The default agent.log threshold is INFO. These tests pin down that
+# *steady state* (1000 clean writes, 1000 feature-off writes, etc.) emits
+# zero records visible to the agent.log handler, and that *novel* events
+# get exactly one WARNING/INFO line that survives.
+
+
+@pytest.fixture(autouse=True)
+def _reset_dedup_caches():
+    """Each test sees a fresh dedup state so prior runs cannot mask
+    a missing announcement (or hide a duplicate one)."""
+    lsp_lint._reset_announce_caches()
+    yield
+    lsp_lint._reset_announce_caches()
+
+
+def _records_at(caplog, level: int) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.levelno >= level]
+
+
+class TestLogLevelsSteadyState:
+    """Anything that fires every write must stay at DEBUG so 1000 writes
+    cannot flood agent.log at the default INFO threshold."""
+
+    def test_feature_off_is_debug(self, ts_project, local_env, caplog) -> None:
+        _, src = ts_project
+        with caplog.at_level(logging.DEBUG, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": False}):
+            for _ in range(5):
+                lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", local_env)
+        assert _records_at(caplog, logging.INFO) == []
+
+    def test_unmapped_extension_is_debug(self, tmp_path: Path, local_env, caplog) -> None:
+        path = tmp_path / "x.txt"
+        path.write_text("hi")
+        with caplog.at_level(logging.DEBUG, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}):
+            for _ in range(5):
+                lsp_lint.maybe_lint_via_lsp(str(path), "hi", local_env)
+        assert _records_at(caplog, logging.INFO) == []
+
+    def test_non_local_backend_is_debug(self, ts_project, caplog) -> None:
+        _, src = ts_project
+
+        class _FakeRemote:
+            cwd = "/remote"
+
+        with caplog.at_level(logging.DEBUG, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}):
+            for _ in range(5):
+                lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", _FakeRemote())
+        assert _records_at(caplog, logging.INFO) == []
+
+    def test_clean_write_is_debug(self, ts_project, local_env, caplog) -> None:
+        _, src = ts_project
+        with caplog.at_level(logging.DEBUG, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}), \
+             patch.object(lsp_lint, "get_or_start_client", return_value=_FakeClient([])):
+            # First write produces ONE INFO ("active for ...") for the
+            # state transition. Subsequent clean writes must be DEBUG so
+            # 1000 clean writes don't carpet agent.log.
+            for _ in range(5):
+                lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", local_env)
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(infos) == 1, f"expected exactly one 'active' INFO, got {[r.getMessage() for r in infos]}"
+        assert "active for" in infos[0].getMessage()
+
+
+class TestLogLevelsNovelEvents:
+    """Things that change state or require action must escape DEBUG."""
+
+    def test_diagnostics_are_info_per_call(self, ts_project, local_env, caplog) -> None:
+        _, src = ts_project
+        diags = [Diagnostic(line=1, column=1, severity=1, message="boom")]
+        with caplog.at_level(logging.INFO, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}), \
+             patch.object(lsp_lint, "get_or_start_client", return_value=_FakeClient(diags)):
+            for _ in range(3):
+                lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", local_env)
+        # Anchor on the diagnostic message shape — temp paths can contain
+        # "diag" as a substring (e.g. test_diagnostics_are_info_per_0/), so
+        # a bare ``"diag" in msg`` filter would over-match the active line.
+        diag_lines = [r.getMessage() for r in caplog.records if "] 1 diag (" in r.getMessage()]
+        assert len(diag_lines) == 3
+
+    def test_active_announcement_fires_once_per_root(self, ts_project, local_env, caplog) -> None:
+        _, src = ts_project
+        with caplog.at_level(logging.INFO, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}), \
+             patch.object(lsp_lint, "get_or_start_client", return_value=_FakeClient([])):
+            for _ in range(10):
+                lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", local_env)
+        actives = [r for r in caplog.records if "active for" in r.getMessage()]
+        assert len(actives) == 1
+
+
+class TestLogLevelsActionRequired:
+    """First occurrence WARNING, subsequent same-event DEBUG."""
+
+    def test_server_unavailable_warns_once(self, ts_project, local_env, caplog) -> None:
+        _, src = ts_project
+        with caplog.at_level(logging.DEBUG, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}), \
+             patch.object(lsp_lint, "get_or_start_client", return_value=None):
+            for _ in range(5):
+                lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", local_env)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        # Exactly one WARNING — the other 4 calls demoted to DEBUG so
+        # errors.log (WARNING+) doesn't get the same line 1000 times.
+        assert len(warnings) == 1
+        assert "server unavailable" in warnings[0].getMessage()
+
+    def test_no_project_root_info_once_per_path(self, tmp_path: Path, local_env, caplog) -> None:
+        # Two distinct orphan files → two INFO lines. Same orphan twice → one.
+        orphan_a = tmp_path / "a.ts"
+        orphan_a.write_text("")
+        orphan_b = tmp_path / "b.ts"
+        orphan_b.write_text("")
+        with caplog.at_level(logging.DEBUG, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}):
+            lsp_lint.maybe_lint_via_lsp(str(orphan_a), "", local_env)
+            lsp_lint.maybe_lint_via_lsp(str(orphan_a), "", local_env)
+            lsp_lint.maybe_lint_via_lsp(str(orphan_b), "", local_env)
+            lsp_lint.maybe_lint_via_lsp(str(orphan_b), "", local_env)
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(infos) == 2, [r.getMessage() for r in infos]
+
+    def test_timeout_warns_every_time(self, ts_project, local_env, caplog) -> None:
+        # Timeouts are inherently novel events (a hang now isn't the same
+        # signal as a hang yesterday), so every one must escape DEBUG.
+        _, src = ts_project
+        with caplog.at_level(logging.WARNING, logger="hermes.lint.lsp"), \
+             patch.object(lsp_lint, "_load_lsp_config", return_value={"enabled": True}), \
+             patch.object(lsp_lint, "get_or_start_client",
+                          return_value=_FakeClient(TimeoutError("slow"))):
+            for _ in range(3):
+                lsp_lint.maybe_lint_via_lsp(str(src), "export {}\n", local_env)
+        timeouts = [r for r in caplog.records if "timeout" in r.getMessage()]
+        assert len(timeouts) == 3
