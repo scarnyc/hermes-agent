@@ -867,6 +867,13 @@ class ShellFileOperations(FileOperations):
             if read_result.exit_code == 0 and read_result.stdout:
                 pre_content = read_result.stdout
 
+        # Snapshot LSP diagnostics for this file (best-effort) so the
+        # post-write LSP layer can return only diagnostics introduced
+        # by this specific edit.  Mirrors claude-code's
+        # ``beforeFileEdited`` pattern but wired to the local LSP
+        # rather than an external IDE.
+        self._snapshot_lsp_baseline(path)
+
         # Create parent directories
         parent = os.path.dirname(path)
         dirs_created = False
@@ -1114,19 +1121,28 @@ class ShellFileOperations(FileOperations):
         """
         Run post-write lint with pre-write baseline comparison.
 
-        Strategy (post-first, pre-lazy):
-        1. Lint the post-write state.  If clean → return clean immediately.
-           This is the hot path and matches _check_lint() in cost.
-        2. If post-lint found errors AND we have pre-write content, lint
-           that too.  If the pre-write file was already broken, return only
-           the *new* errors introduced by this edit — errors that existed
-           before aren't the agent's problem to chase right now.
-        3. If pre_content is None (new file or unavailable), skip the delta
-           step and return all post-write errors.
+        Three-tier strategy:
 
-        This mirrors Cline's and OpenCode's post-edit LSP pattern: surface
-        only the errors this specific edit introduced, so the agent doesn't
-        get distracted by pre-existing problems.
+        1. **Syntax check** (in-process or shell-based, microseconds).
+           Catches the bug class that motivated this layer: corrupt
+           writes, mashed quotes, truncated output.  Hot path.
+
+        2. **Delta refinement against pre-write content** when the
+           syntax tier reports errors.  Filter out errors that already
+           existed pre-edit so the agent isn't distracted by inherited
+           state.
+
+        3. **LSP semantic diagnostics**, when:
+            - the syntax check passes (no point asking the LSP for a
+              file that won't even parse), and
+            - LSP is enabled in config, and
+            - the cwd/file is inside a git workspace, and
+            - a registered server matches the file extension.
+           The LSP service captures a baseline at write start and
+           returns only diagnostics introduced by the edit.
+
+        Layer 3 is best-effort — failures at any point silently fall
+        back to the syntax-tier result.
 
         Args:
             path: File path (for linter selection).
@@ -1141,16 +1157,21 @@ class ShellFileOperations(FileOperations):
         Returns:
             LintResult.  ``output`` contains either the full post-lint
             errors (no pre-state) or just the new-error lines (delta
-            refinement applied).
+            refinement applied).  When LSP semantic diagnostics fire,
+            they're appended to ``output`` after the syntax-tier text.
         """
         post = self._check_lint(path, content=post_content)
 
-        # Hot path: clean post-write, no pre-lint needed.
+        # Hot path: clean post-write syntactically — try the LSP layer
+        # for semantic diagnostics before declaring victory.
         if post.success or post.skipped:
+            lsp_block = self._maybe_lsp_diagnostics(path)
+            if lsp_block:
+                return LintResult(success=False, output=lsp_block)
             return post
 
-        # Post-write has errors.  If we have pre-content, run the delta
-        # refinement to filter out pre-existing errors.
+        # Post-write has syntax errors.  If we have pre-content, run the
+        # delta refinement to filter out pre-existing errors.
         if pre_content is None:
             return post
 
@@ -1189,6 +1210,60 @@ class ShellFileOperations(FileOperations):
                 "(pre-existing errors filtered out):\n" + "\n".join(post_lines)
             )
         )
+
+    def _snapshot_lsp_baseline(self, path: str) -> None:
+        """Capture pre-edit LSP diagnostics so the post-write delta is correct.
+
+        Best-effort.  Silent on every failure path — LSP is an
+        enrichment layer and must never break a write.
+        """
+        try:
+            from agent.lsp import get_service
+            svc = get_service()
+        except Exception:  # noqa: BLE001
+            return
+        if svc is None:
+            return
+        try:
+            svc.snapshot_baseline(path)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _maybe_lsp_diagnostics(self, path: str) -> str:
+        """Best-effort LSP semantic diagnostics for ``path``.
+
+        Returns a formatted ``<diagnostics>`` block, or empty string
+        when LSP is unavailable / disabled / produced no errors.
+
+        Wraps everything in a try/except so a misbehaving LSP server
+        can't break a write.  This intentionally swallows all errors
+        — the calling tier already returned a clean syntax result, so
+        ``""`` here just means "no extra info to add".
+        """
+        try:
+            from agent.lsp import get_service
+        except Exception:  # noqa: BLE001
+            return ""
+        try:
+            svc = get_service()
+        except Exception:  # noqa: BLE001
+            return ""
+        if svc is None or not svc.enabled_for(path):
+            return ""
+        try:
+            diagnostics = svc.get_diagnostics_sync(path, delta=True)
+        except Exception:  # noqa: BLE001
+            return ""
+        if not diagnostics:
+            return ""
+        try:
+            from agent.lsp.reporter import report_for_file, truncate
+            block = report_for_file(path, diagnostics)
+            if not block:
+                return ""
+            return truncate("LSP diagnostics introduced by this edit:\n" + block)
+        except Exception:  # noqa: BLE001
+            return ""
     
     # =========================================================================
     # SEARCH Implementation
