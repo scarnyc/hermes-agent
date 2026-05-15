@@ -5045,11 +5045,6 @@ class AIAgent:
         from agent.agent_runtime_helpers import copy_reasoning_content_for_api
         return copy_reasoning_content_for_api(self, source_msg, api_msg)
 
-        # DeepSeek: strip reasoning_content on all assistant messages so the API
-        # doesn't return 400 when the model was invoked with thinking enabled.
-        if base_url_host_matches(self.base_url, "api.deepseek.com"):
-            api_msg.pop("reasoning_content", None)
-
     # ── P25/MOL-196: reasoning_content fallback gates ────────────────────
     # The three helpers below were originally defined as AIAgent methods in
     # the pre-MOL-597 monolithic run_agent.py. They're preserved here as
