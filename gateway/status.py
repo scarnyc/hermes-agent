@@ -545,6 +545,13 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
     Used to prevent multiple local gateways from using the same external identity
     at once (e.g. the same Telegram bot token across different HERMES_HOME dirs).
+
+    P17 / sandbox-signal bug: same reasoning as ``get_running_pid``. Existence
+    checks below MUST use ``_pid_exists()`` (psutil-backed, PermissionError-safe)
+    rather than raw ``os.kill(pid, 0)`` — the hermes-local.sb sandbox profile
+    denies cross-process signals, so a raw ``os.kill`` would raise
+    PermissionError for valid same-user processes and the stale-cleanup
+    fall-through would silently unlink an active lock.
     """
     lock_path = _get_scope_lock_path(scope, identity)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -881,6 +888,17 @@ def get_running_pid(
     Checks the PID file and verifies the process is actually alive.
     Cleans up stale PID files automatically.
     """
+    # P17 / sandbox-signal bug (MOL-168): the macOS sandbox profile
+    # `config/sandbox/hermes-local.sb` denies cross-process signals — the
+    # only allow rule is `(allow signal (target self))`. That breaks the
+    # old `os.kill(other_pid, 0)` existence check: it raises PermissionError
+    # for valid same-user gateway processes, and the legacy "stale cleanup"
+    # path used to delete valid PID files in response. The fix is to gate
+    # on `_pid_exists()` (psutil-backed; treats PermissionError as "alive")
+    # AND to require a positive runtime-lock signal before any cleanup
+    # path can fire. `is_gateway_runtime_lock_active` performs a non-
+    # destructive `LOCK_EX | LOCK_NB` probe — if it fails, the holder is
+    # alive and we MUST NOT touch the PID file.
     resolved_pid_path = pid_path or _get_pid_path()
     resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
     lock_active = is_gateway_runtime_lock_active(resolved_lock_path)

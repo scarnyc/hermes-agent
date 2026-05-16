@@ -816,7 +816,22 @@ DEFAULT_CONFIG = {
             "extra_body": {},
         },
     },
-    
+
+    # MOL-30 P34: cheap-vs-strong model routing.  ``classifier`` selects the
+    # routing strategy; ``routes`` is consumed by the ``"intent"`` classifier.
+    # The two new keys here are required to defeat ``config_roundtrip_trap``:
+    # ``save_config()`` strips unknown top-level keys, so any value of
+    # ``routes`` set in ``config.yaml`` would be silently dropped on the next
+    # ``hermes config …`` write without an explicit default below.
+    "smart_model_routing": {
+        "enabled": False,
+        "classifier": "keyword",
+        "routes": {},
+        "max_simple_chars": 160,
+        "max_simple_words": 28,
+        "cheap_model": {},
+    },
+
     "display": {
         "compact": False,
         "personality": "kawaii",
@@ -4119,6 +4134,15 @@ def save_config(config: Dict[str, Any]):
 
         ensure_hermes_home()
         config_path = get_config_path()
+        # P180/MOL-557 — H1 pre-write guard catches Hermes-vs-CC/manual races (is_managed() above catches Hermes-vs-OpenShell).
+        try:
+            from tools.runtime_fingerprint import h1_pre_write_guard
+            outcome = h1_pre_write_guard(config_path, caller="save_config")
+            if outcome == "abort":
+                # Audit + (non-TTY) Telegram already emitted by the guard.
+                return
+        except ImportError:
+            pass
         current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         normalized = current_normalized
         raw_existing = _normalize_root_model_keys(_normalize_max_turns_config(read_raw_config()))
@@ -4151,6 +4175,12 @@ def save_config(config: Dict[str, Any]):
         )
         _secure_file(config_path)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        # P180/MOL-557 — H1 post-write hash record (new baseline for next call).
+        try:
+            from tools.runtime_fingerprint import h1_record_post_write
+            h1_record_post_write(config_path)
+        except ImportError:
+            pass
 
 
 def load_env() -> Dict[str, str]:
@@ -4328,6 +4358,23 @@ def _check_non_ascii_credential(key: str, value: str) -> str:
     return sanitized
 
 
+# P03/MOL-118: keep in sync with scripts/envchain-wrapper.sh ALLOWED_PREFIXES.
+# Secrets matching these prefixes belong in envchain (Keychain), not on disk in .env.
+_ENVCHAIN_MANAGED_PREFIXES = (
+    "ANTHROPIC_",
+    "OPENAI_",
+    "OPENROUTER_",
+    "GOOGLE_",
+    "TELEGRAM_",
+    "GATEWAY_",
+    "BRAVE_",
+    "TAVILY_",
+    "ATLASSIAN_",
+    "GRANOLA_",
+    "BROWSERBASE_",
+)
+
+
 def save_env_value(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
     if is_managed():
@@ -4336,6 +4383,11 @@ def save_env_value(key: str, value: str):
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     value = value.replace("\n", "").replace("\r", "")
+    # P03/MOL-118: block .env writes for envchain-managed keys (secrets belong in Keychain).
+    if any(key.startswith(p) for p in _ENVCHAIN_MANAGED_PREFIXES):
+        if value:
+            os.environ[key] = value
+        return
     # API keys / tokens must be ASCII — strip non-ASCII with a warning.
     value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()

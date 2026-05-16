@@ -9601,6 +9601,24 @@ def main():
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--skip-reflection",
+        dest="skip_reflection",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "P58/MOL-268: opt this job OUT of the reviewer-driven retry loop. "
+            "Use for bare-reminder / FYI jobs where there's no claim to verify."
+        ),
+    )
+    cron_edit.add_argument(
+        "--no-skip-reflection",
+        dest="skip_reflection",
+        action="store_const",
+        const=False,
+        help="Re-enable the reviewer retry loop on this job (reverts --skip-reflection).",
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

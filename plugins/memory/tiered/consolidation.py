@@ -4,8 +4,10 @@ Scheduled as a cron job at 0 4 * * * UTC (midnight EDT).
 Chains housekeeping after completion.
 """
 
+import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +62,7 @@ def run_consolidation(db: TieredMemoryDB, memory_dir: str | Path) -> dict:
         "entries_24h": 0,
         "entries_7d": 0,
         "updated": False,
+        "composer_failed": False,  # P169/MOL-560 review fix-pass: signal llm_compose None case
         "housekeeping": None,
         "deduped": 0,
         "telegram_sent": False,
@@ -151,6 +154,30 @@ def run_consolidation(db: TieredMemoryDB, memory_dir: str | Path) -> dict:
             tmp_path.rename(memory_path)
             result["updated"] = True
             logger.info("Consolidation: updated MEMORY.md (%d lines)", len(lines))
+        else:
+            # P169/MOL-560 review fix-pass: llm_compose returned None — surface
+            # loudly. Pre-P169 this required BOTH local Ollama AND Kimi to fail;
+            # post-P169 any single Kimi failure (rate limit, auth, network)
+            # lands here. The tripwire + ERROR log ensure the cron-failure
+            # signal pipeline (P45-P48) catches it the next morning instead of
+            # waiting until MEMORY.md staleness becomes user-visible.
+            result["composer_failed"] = True
+            logger.error(
+                "Consolidation: composer failed (llm_compose returned None) — "
+                "MEMORY.md NOT updated. Check ~/.hermes/state/composer-*.json + gateway.log."
+            )
+            try:
+                tripwire_dir = Path.home() / ".hermes" / "state"
+                tripwire_dir.mkdir(parents=True, exist_ok=True)
+                tripwire = tripwire_dir / f"consolidation-failed-{int(time.time())}.json"
+                tripwire.write_text(json.dumps({
+                    "ts": time.time(),
+                    "reason": "llm_compose returned None",
+                    "entries_24h_count": len(entries_24h),
+                    "entries_7d_count": len(entries_7d),
+                }))
+            except OSError:
+                pass  # Fail-open; primary ERROR log already surfaces the failure.
 
     # Step 6: Telegram nudge
     if len(result["patterns"]) >= 2:

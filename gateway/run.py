@@ -15694,6 +15694,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
+    # P180/MOL-557 — H2/H3/H4 gateway-lifecycle bracket. AFTER PID claim so we
+    # only fingerprint as the single live gateway. Run in executor — verifier
+    # subprocess (~30s timeout) must not block the asyncio event loop.
+    _startup_state: dict | None = None  # consumed by the H3 shutdown leg below
+    try:
+        from tools.runtime_fingerprint import gateway_startup_hook
+        _gateway_pid = os.getpid()
+        _startup_state = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: gateway_startup_hook(gateway_pid=_gateway_pid)
+        )
+    except Exception as e:  # pragma: no cover — fail-open
+        logger.debug("[H2/H3/H4 P180/MOL-557] gateway_startup_hook failed: %s", e)
+
     # MCP tool discovery — run in an executor so the asyncio event loop
     # stays responsive even when a configured MCP server is slow or
     # unreachable.  discover_mcp_tools() uses a blocking 120s wait
@@ -15739,6 +15752,25 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop cron ticker cleanly
     cron_stop.set()
     cron_thread.join(timeout=5)
+
+    # P180/MOL-557 — H3 shutdown verifier bracket. launchd ExitTimeOut=20s, so
+    # wall-clock-bound at 15s (verifier internal timeout is 30s, but we'd rather
+    # skip the bracket than get SIGKILL'd mid-JSONL-write). Fail-open.
+    try:
+        from tools.runtime_fingerprint import gateway_shutdown_hook
+        await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                None, gateway_shutdown_hook, _startup_state
+            ),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[H3 P180/MOL-557] gateway_shutdown_hook exceeded 15s wall-clock; "
+            "skipping to honor launchd ExitTimeOut=20s"
+        )
+    except Exception as e:  # pragma: no cover — fail-open
+        logger.debug("[H3 P180/MOL-557] gateway_shutdown_hook failed: %s", e)
 
     # Close MCP server connections
     try:

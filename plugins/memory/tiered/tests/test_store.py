@@ -677,3 +677,107 @@ class TestEscapeFtsQuery:
         assert _escape_fts_query("single") == '"single"'
         # Double quotes in tokens get escaped
         assert _escape_fts_query('say "hi"') == '"say" """hi"""'
+
+
+class TestMigrationAndReembed:
+    """P168/MOL-546 behavioral coverage for the 768→1024 auto-migration AND
+    the title-2x embedding text. The pr-test-analyzer flagged these as
+    load-bearing claims with zero automated coverage — these tests cover
+    the migration path + the source-vs-behavior gap on title-2x."""
+
+    def test_migrate_dims_768_to_1024(self):
+        """Seed a 768-dim vec table, run _migrate_vec_dims, assert new dim
+        + non-empty reembed. The fresh-DB schema is 1024-dim post-MOL-546,
+        so this test manually DROPs and re-CREATEs memory_vec at 768-dim
+        with one seed row before triggering the migration.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "migrate.db"
+            with patch("plugins.memory.tiered.store.scrub_content", side_effect=lambda t, **kw: t):
+                # Mock generate_embedding so insert_entry's 1024-dim write succeeds
+                # while we're still on the 1024-dim schema.
+                with patch("plugins.memory.tiered.store.generate_embedding") as mock_emb:
+                    mock_emb.return_value = [0.1] * 1024
+                    from plugins.memory.tiered.store import TieredMemoryDB
+                    store = TieredMemoryDB(db_path)
+                    store.insert_entry("Pre-migration title", "old content body", category="project")
+                    store.insert_entry("Second pre-migration", "more old content", category="project")
+
+                    # Manually downgrade memory_vec to 768-dim to simulate a pre-MOL-546 DB.
+                    store._conn.execute("DROP TABLE memory_vec")
+                    store._conn.execute("""
+                        CREATE VIRTUAL TABLE memory_vec USING vec0(
+                            entry_rowid integer primary key,
+                            embedding float[768] distance_metric=cosine,
+                            category text
+                        )
+                    """)
+                    # Seed one row at 768-dim so the migration probe finds non-empty data.
+                    store._conn.execute(
+                        "INSERT INTO memory_vec (entry_rowid, embedding, category) VALUES (?, ?, ?)",
+                        (1, serialize_float32([0.1] * 768), "project"),
+                    )
+                    store._conn.commit()
+                    store.close()
+
+                    # Reopen — _migrate_vec_dims fires in __init__, sees 768 vs DIMS=1024 mismatch.
+                    store = TieredMemoryDB(db_path)
+                    row = store._conn.execute(
+                        "SELECT length(embedding) FROM memory_vec LIMIT 1"
+                    ).fetchone()
+                    assert row is not None, "memory_vec is empty after migration"
+                    new_dims = row[0] // 4
+                    assert new_dims == 1024, f"expected 1024-dim post-migration, got {new_dims}"
+                    re_count = store._conn.execute(
+                        "SELECT COUNT(*) FROM memory_vec"
+                    ).fetchone()[0]
+                    assert re_count == 2, f"expected 2 reembedded entries, got {re_count}"
+                    store.close()
+
+    def test_embedding_text_contains_title_twice(self):
+        """Behavioral assertion that the title appears 2x in the string passed
+        to generate_embedding, at BOTH call sites (insert + reembed). Source-level
+        verifier doesn't catch a future refactor that routes through a helper;
+        this captures the actual string at runtime.
+        """
+        captured = []
+
+        def capture_emb(text):
+            captured.append(text)
+            return [0.1] * 1024
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "title.db"
+            with patch("plugins.memory.tiered.store.scrub_content", side_effect=lambda t, **kw: t):
+                with patch("plugins.memory.tiered.store.generate_embedding", side_effect=capture_emb):
+                    from plugins.memory.tiered.store import TieredMemoryDB
+                    store = TieredMemoryDB(db_path)
+                    store.insert_entry("Unique Title XYZ", "the body content goes here", category="project")
+                    assert captured, "generate_embedding was never called by insert_entry"
+                    insert_call = captured[-1]
+                    assert insert_call.count("Unique Title XYZ") == 2, (
+                        f"insert path: title appeared {insert_call.count('Unique Title XYZ')}x, "
+                        f"expected 2x. Got: {insert_call!r}"
+                    )
+
+                    # Drop + re-create memory_vec so _reembed_all can write fresh without
+                    # hitting the UNIQUE constraint on entry_rowid (production path always
+                    # drops first via _migrate_vec_dims).
+                    store._conn.execute("DROP TABLE memory_vec")
+                    store._conn.execute("""
+                        CREATE VIRTUAL TABLE memory_vec USING vec0(
+                            entry_rowid integer primary key,
+                            embedding float[1024] distance_metric=cosine,
+                            category text
+                        )
+                    """)
+                    store._conn.commit()
+                    captured.clear()
+                    store._reembed_all()
+                    assert captured, "generate_embedding was never called by _reembed_all"
+                    reembed_call = captured[-1]
+                    assert reembed_call.count("Unique Title XYZ") == 2, (
+                        f"reembed path: title appeared {reembed_call.count('Unique Title XYZ')}x, "
+                        f"expected 2x. Got: {reembed_call!r}"
+                    )
+                    store.close()

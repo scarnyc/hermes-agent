@@ -74,7 +74,10 @@ def maybe_update_hot_cache(db: TieredMemoryDB, memory_dir: str | Path) -> bool:
     result = llm_compose(prompt, context)
 
     if not result:
-        logger.info("LLM composition returned empty — preserving existing MEMORY.md")
+        # P169/MOL-560 review fix-pass: bumped from info → warning. With the
+        # Ollama primary removed, every composer failure surfaces here; INFO
+        # severity was burying the signal in routine cron logs.
+        logger.warning("LLM composition returned empty — preserving existing MEMORY.md")
         return False
 
     # Strip markdown code fences (LLM sometimes wraps output)

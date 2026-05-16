@@ -2705,6 +2705,17 @@ def _run_single_child(
                 task_id=child_task_id,
             )
 
+        # H6/P180/MOL-557: pre-spawn fingerprint snapshot for in-process child.
+        # Direct delegate_task callers bypass symphony_bridge's bracket; mirror
+        # the bracket here so the "child writes to runtime" invariant is checked
+        # on both paths. Fail-open.
+        _h6_before_child = None
+        try:
+            from tools.runtime_fingerprint import compute_default_surface_fingerprint
+            _h6_before_child = compute_default_surface_fingerprint()
+        except Exception:
+            _h6_before_child = None
+
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
@@ -2813,6 +2824,45 @@ def _run_single_child(
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
             _timeout_executor.shutdown(wait=False)
+            # H6/P180/MOL-557: post-completion fingerprint diff for in-process
+            # child. Drift here means a delegate child wrote a runtime surface
+            # against the `add_dirs: [{repo_path}]` invariant (MOL-556 Tier 2c).
+            try:
+                if _h6_before_child is not None:
+                    from tools.runtime_fingerprint import (
+                        compute_default_surface_fingerprint, compare_fingerprints,
+                        emit_audit_jsonl, telegram_alert_rate_limited,
+                        now_iso, LOG_DIR,
+                    )
+                    _h6_after_child = compute_default_surface_fingerprint()
+                    _h6_drift_child = compare_fingerprints(_h6_before_child, _h6_after_child)
+                    _h6_role = getattr(child, "_delegate_role", None)
+                    _h6_profile = getattr(child, "_delegate_profile", None)
+                    _h6_payload_child = {
+                        "ts": now_iso(),
+                        "event": "delegate_child_complete",
+                        "task_index": task_index,
+                        "role": _h6_role,
+                        "profile": _h6_profile,
+                        "drift_files": sorted(_h6_drift_child.keys()),
+                        "drift_count": len(_h6_drift_child),
+                    }
+                    emit_audit_jsonl(LOG_DIR / "delegate-fingerprint.jsonl", _h6_payload_child)
+                    if _h6_drift_child:
+                        emit_audit_jsonl(
+                            LOG_DIR / "delegate-runtime-write.jsonl",
+                            {**_h6_payload_child, "drift": _h6_drift_child},
+                        )
+                        telegram_alert_rate_limited(
+                            f"delegate_child_drift_{_h6_role or 'unknown'}",
+                            f"[H6/MOL-557] Delegate child runtime drift\n"
+                            f"role={_h6_role} profile={_h6_profile} "
+                            f"task_index={task_index}\n"
+                            f"files={len(_h6_drift_child)}: "
+                            f"{', '.join(sorted(_h6_drift_child.keys())[:5])}",
+                        )
+            except Exception:
+                pass
 
         # Flush any remaining batched progress to gateway
         if child_progress_cb and hasattr(child_progress_cb, "_flush"):

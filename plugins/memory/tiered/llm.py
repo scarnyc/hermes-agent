@@ -1,105 +1,195 @@
 """Shared LLM helper for tiered memory composition.
 
-Primary: qwen3:1.7b via local Ollama (thinking on, /think soft-switch).
-P151/MOL-502: downsized from qwen3:8b (~8.4 GB resident) to qwen3:1.7b
-(~2.5 GB) for nightly consolidation/composition. Nightly batch text — modest
-quality drop accepted. Composition dry-run gate (composition_review side
-log) wraps the first cron run before in-place rewrites are enabled.
+Composer: moonshotai/kimi-k2.6 via OpenRouter.
 
-Fallback: moonshotai/kimi-k2.6 via OpenRouter (P61/MOL-268 — cost-control
-flip 2026-04-23; was google/gemini-3.1-pro-preview, flipped after reviewer-
-feedback contagion drove 4am memory cron to 151 tool calls × Gemini pricing).
+P169/MOL-560: dropped the local Ollama qwen3:1.7b primary path entirely.
+Post-MOL-546 the embedder is in-process via fastembed, so the composer
+was the only remaining Ollama consumer. Removing it lets us stop the
+Ollama daemon permanently and reclaim ~220 MB resident + remove a
+launchd-managed background process from the stack.
 
-Ollama 0.20+ separates thinking from content — reasoning lands in
-message.reasoning (ignored by openai SDK); content comes back clean.
-No <think> tag stripping needed.
+Quality direction is UP (Kimi K2.6 ≫ qwen3:1.7b on instruction following
+and long-form summarization). Cost trade is ~$0.01-0.05 per nightly
+consolidation run — accepted as worth the operational simplification.
+
+Public API `llm_compose(prompt, context)` signature is unchanged.
+
+P169 review fix-pass (silent-failure-hunter findings on PR #200):
+- Distinct `ComposerKeyMissing` / `ComposerAuthFailure` exceptions separate
+  permanent-failure modes (missing key, expired key) from transient ones
+  (rate limit, 5xx, network blip). Both write tripwires to
+  `~/.hermes/state/composer-<reason>-<ts>.json` so cron failures surface
+  via the existing maintenance-pending scanner instead of waiting for
+  MEMORY.md staleness to become user-visible.
+- `COMPOSER_BASE_URL` resolved-value logged once per process so a stale
+  `HERMES_MOCK_LLM_URL` env var doesn't silently redirect production to
+  the mock (`Mock-First Dev Loops` memory pattern).
+- Per-process `MAX_COMPOSER_CALLS_PER_RUN` budget cap guards against
+  runaway loops in multi-session ingest paths (memory_ingest_external.py
+  calls llm_compose once per session × N sessions × cron tick).
 """
 
+import json
 import logging
 import os
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Primary: Ollama qwen3:1.7b (local, $0) ───────────────────────────
-# P151/MOL-502: was qwen3:8b (8.4 GB resident); qwen3:1.7b is ~2.5 GB and
-# cold-loads ~5× faster. keep_alive=90 (was Ollama default 5min) evicts
-# faster between cron bursts.
-PRIMARY_MODEL = "qwen3:1.7b"
-PRIMARY_BASE_URL = "http://localhost:11434/v1"
-# Ollama ignores the key; the openai SDK requires a non-empty string.
-PRIMARY_API_KEY = "ollama"
-PRIMARY_KEEP_ALIVE = 90  # seconds; passed as extra_body to OpenAI-compat endpoint
-
-# ── Fallback: OpenRouter Kimi K2.6 (P61/MOL-268) ─────────────────────
-FALLBACK_MODEL = "moonshotai/kimi-k2.6"
-# P81/MOL-294: HERMES_MOCK_LLM_URL routes FALLBACK to aimock (PRIMARY=local Ollama left untouched — free).
+# P169/MOL-560: Kimi K2.6 is now the sole composer (was fallback).
+COMPOSER_MODEL = "moonshotai/kimi-k2.6"
+# P81/MOL-294: HERMES_MOCK_LLM_URL routes COMPOSER to aimock for mock-first dev loops.
 # .strip() defends against empty-string masking.
-FALLBACK_BASE_URL = os.environ.get("HERMES_MOCK_LLM_URL", "").strip() or "https://openrouter.ai/api/v1"
-FALLBACK_API_KEY_ENV = "OPENROUTER_API_KEY"
+COMPOSER_BASE_URL = os.environ.get("HERMES_MOCK_LLM_URL", "").strip() or "https://openrouter.ai/api/v1"
+COMPOSER_API_KEY_ENV = "OPENROUTER_API_KEY"
+
+# P169 review fix-pass I1: canonical endpoint — anything else triggers the
+# "stale mock URL silent redirect" guard log.
+_CANONICAL_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 MAX_TOKENS = 4096
 TEMPERATURE = 0.3
 
-# Hard char budget — see MOL-168. Kimi K2.6 fallback has 200k context;
-# qwen3:1.7b has 32k. The 300k cap is a cost guard for fallback, not a
-# qwen overflow guard (qwen would truncate naturally before then).
+# Hard char budget — see MOL-168. Kimi K2.6 has 200k context; the 300k cap
+# is a cost guard, not an overflow guard.
 MAX_PROMPT_CHARS = 300_000
 
-# qwen3 soft-switch — belt+suspenders; thinking is on by default.
-_THINK_PREFIX = "/think\n\n"
+# P169 review fix-pass I3: per-process budget cap. Resets on gateway restart.
+# 500 covers a normal 4 AM cron (1 consolidation + up to ~100 sessions × 1
+# memory_ingest call each + headroom). Runaway loops trip it visibly.
+MAX_COMPOSER_CALLS_PER_RUN = int(os.environ.get("MEMORY_COMPOSER_MAX_CALLS_PER_RUN", "500"))
+_call_count = 0
+
+# P169 review fix-pass I1: one-shot announce gate for resolved BASE_URL.
+_base_url_announced = False
+
+# P169 review fix-pass C2/I2: tripwire dir — matches P79/P168 patterns.
+_TRIPWIRE_DIR = os.path.expanduser("~/.hermes/state")
 
 
-def _call_primary(prompt: str) -> Optional[str]:
-    """Call qwen3:1.7b via local Ollama OpenAI-compat endpoint.
+class ComposerKeyMissing(RuntimeError):
+    """OPENROUTER_API_KEY not set. Permanent failure until operator intervenes."""
 
-    P151/MOL-502: model downsized from qwen3:8b. keep_alive passed via
-    extra_body — Ollama's OpenAI-compat endpoint honors it.
 
-    Raises on any error — caller is expected to catch and fall through.
+class ComposerAuthFailure(RuntimeError):
+    """OpenRouter returned 401/403. Key expired or revoked — permanent until rotated."""
+
+
+def _write_tripwire(reason: str, detail: dict) -> None:
+    """Best-effort tripwire write to ~/.hermes/state/. Fails open (primary error
+    path already logged at ERROR; tripwire is the secondary audit trail)."""
+    try:
+        os.makedirs(_TRIPWIRE_DIR, exist_ok=True)
+        path = os.path.join(_TRIPWIRE_DIR, f"composer-{reason}-{int(time.time())}.json")
+        with open(path, "w") as f:
+            json.dump({"ts": time.time(), "reason": reason, **detail}, f)
+    except OSError:
+        pass
+
+
+def _announce_base_url_once() -> None:
+    """Log resolved COMPOSER_BASE_URL on first composer call.
+
+    P169 I1: guards against stale HERMES_MOCK_LLM_URL silently redirecting
+    production traffic to the mock. Non-canonical URLs log at WARNING so a
+    grep of gateway.log surfaces the override.
     """
-    from openai import OpenAI
-
-    client = OpenAI(base_url=PRIMARY_BASE_URL, api_key=PRIMARY_API_KEY)
-    response = client.chat.completions.create(
-        model=PRIMARY_MODEL,
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        messages=[{"role": "user", "content": _THINK_PREFIX + prompt}],
-        extra_body={"keep_alive": PRIMARY_KEEP_ALIVE},
-    )
-    return response.choices[0].message.content
-
-
-def _call_fallback(prompt: str) -> Optional[str]:
-    """Call Kimi K2.6 via OpenRouter with reasoning: high."""
-    from openai import OpenAI
-
-    api_key = os.environ.get(FALLBACK_API_KEY_ENV, "").strip()
-    if not api_key:
+    global _base_url_announced
+    if _base_url_announced:
+        return
+    _base_url_announced = True
+    if COMPOSER_BASE_URL == _CANONICAL_OPENROUTER_URL:
+        logger.info("memory LLM composer: base_url=%s (canonical)", COMPOSER_BASE_URL)
+    else:
         logger.warning(
-            "Memory LLM fallback unavailable — %s not set", FALLBACK_API_KEY_ENV
+            "memory LLM composer: base_url=%s (non-canonical — HERMES_MOCK_LLM_URL active). "
+            "Confirm this is intentional; stale env var silently redirects production to mock.",
+            COMPOSER_BASE_URL,
         )
-        return None
 
-    client = OpenAI(base_url=FALLBACK_BASE_URL, api_key=api_key)
-    response = client.chat.completions.create(
-        model=FALLBACK_MODEL,
-        max_tokens=MAX_TOKENS,
-        temperature=TEMPERATURE,
-        messages=[{"role": "user", "content": prompt}],
-        extra_body={
-            "reasoning": {"enabled": True, "effort": "high"},
-        },
-    )
+
+def _call_composer(prompt: str) -> str:
+    """Call Kimi K2.6 via OpenRouter with reasoning: high. Returns content text.
+
+    Raises:
+        ComposerKeyMissing: OPENROUTER_API_KEY not set in env. Logged at ERROR
+            + tripwire written before raise.
+        ComposerAuthFailure: 401/403 from OpenRouter (expired/revoked key).
+            Logged at ERROR + tripwire before raise.
+        Other openai.* exceptions: transient API errors (rate limit, 5xx,
+            network) — caller's `llm_compose` outer except catches at WARNING.
+    """
+    _announce_base_url_once()
+
+    from openai import OpenAI, AuthenticationError, PermissionDeniedError
+
+    api_key = os.environ.get(COMPOSER_API_KEY_ENV, "").strip()
+    if not api_key:
+        logger.error(
+            "Memory LLM composer: %s not set — composer is permanently degraded. "
+            "Re-launch gateway under envchain or check ~/.hermes/.env loader.",
+            COMPOSER_API_KEY_ENV,
+        )
+        _write_tripwire("key-missing", {"env_var": COMPOSER_API_KEY_ENV})
+        raise ComposerKeyMissing(f"{COMPOSER_API_KEY_ENV} not set")
+
+    client = OpenAI(base_url=COMPOSER_BASE_URL, api_key=api_key)
+    try:
+        response = client.chat.completions.create(
+            model=COMPOSER_MODEL,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            messages=[{"role": "user", "content": prompt}],
+            extra_body={
+                "reasoning": {"enabled": True, "effort": "high"},
+            },
+        )
+    except (AuthenticationError, PermissionDeniedError) as e:
+        # 401/403 — expired or revoked key. Permanent failure until operator
+        # rotates the credential. Distinct from transient API errors so the
+        # tripwire scanner can escalate it specifically.
+        logger.error(
+            "Memory LLM composer: AUTH FAILURE (%s: %s). Key likely expired or revoked. "
+            "Composer fails every subsequent call until rotated via envchain.",
+            type(e).__name__, str(e)[:200],
+        )
+        _write_tripwire("auth-failure", {
+            "error_class": type(e).__name__,
+            "detail": str(e)[:200],
+        })
+        raise ComposerAuthFailure(str(e)) from e
     return response.choices[0].message.content
 
 
 def llm_compose(prompt: str, context: str) -> Optional[str]:
-    """Compose memory via local Qwen primary; fall back to Kimi K2.6 on failure.
+    """Compose memory via Kimi K2.6 composer. Returns text or None on failure.
 
-    Returns text or None on total failure.
+    P169 contract change: pre-P169 the Ollama-then-Kimi chain meant `None`
+    was a rare both-failed case. Post-P169 `None` covers any single failure
+    — callers should treat `None` as a loud event and surface it (see
+    consolidation.py and hot_cache.py for the canonical patterns).
+
+    Permanent-failure paths (missing key, auth failure, budget exceeded)
+    log at ERROR + write tripwires to `~/.hermes/state/composer-*.json`.
+    Transient paths (rate limit, 5xx, empty response) log at WARNING.
+    Either way the return is `None`; distinguish via the audit trail.
     """
+    global _call_count
+
+    # I3 budget cap — runaway-loop guard. Resets on process restart.
+    if _call_count >= MAX_COMPOSER_CALLS_PER_RUN:
+        logger.error(
+            "Memory LLM composer: budget cap hit (%d calls this process). "
+            "Increase MEMORY_COMPOSER_MAX_CALLS_PER_RUN or restart gateway.",
+            MAX_COMPOSER_CALLS_PER_RUN,
+        )
+        _write_tripwire("budget-exceeded", {
+            "cap": MAX_COMPOSER_CALLS_PER_RUN,
+            "called": _call_count,
+        })
+        return None
+
     full = f"{prompt}\n\n{context}"
     if len(full) > MAX_PROMPT_CHARS:
         logger.error(
@@ -110,30 +200,24 @@ def llm_compose(prompt: str, context: str) -> Optional[str]:
         )
         full = full[:MAX_PROMPT_CHARS] + "\n\n[...truncated for size cap — see MOL-168...]"
 
-    # Try local Qwen first
+    _call_count += 1
     try:
-        result = _call_primary(full)
+        result = _call_composer(full)
         if result:
-            logger.info("memory LLM: %s (local, primary)", PRIMARY_MODEL)
+            logger.info("memory LLM: %s (composer)", COMPOSER_MODEL)
             return result
-        logger.warning("memory LLM primary returned empty content; falling back")
-    except Exception as e:
-        logger.info(
-            "memory LLM primary failed (%s: %s); falling back to %s",
-            type(e).__name__, str(e)[:200], FALLBACK_MODEL,
-        )
-
-    # Fall back to Pro 3.1
-    try:
-        result = _call_fallback(full)
-        if result:
-            logger.info("memory LLM: %s (fallback)", FALLBACK_MODEL)
-            return result
-        logger.warning("memory LLM fallback returned empty content")
+        logger.warning("memory LLM composer returned empty content")
+        return None
+    except (ComposerKeyMissing, ComposerAuthFailure):
+        # Already logged at ERROR + tripwire written inside _call_composer.
+        # Don't double-log; return None per public-API contract.
         return None
     except Exception as e:
+        # Transient API errors (rate limit, 5xx, network blip). Caller still
+        # treats None as a failure, but log severity reflects that this class
+        # of failure typically self-resolves on the next cron tick.
         logger.warning(
-            "memory LLM fallback failed (%s: %s)",
+            "memory LLM composer failed transient (%s: %s)",
             type(e).__name__, str(e)[:200],
         )
         return None

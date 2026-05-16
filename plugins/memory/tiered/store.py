@@ -1,9 +1,12 @@
 """SQLite + sqlite-vec + FTS5 database store for tiered memory."""
 
 import hashlib
+import json
 import logging
+import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -83,11 +86,15 @@ END;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
   entry_rowid integer primary key,
-  embedding float[768] distance_metric=cosine,
+  embedding float[1024] distance_metric=cosine,
   category text
 );
--- P151/MOL-502: dim was 1024 (bge-m3); now 768 (nomic-embed-text).
--- Existing DBs auto-migrate via _migrate_vec_dims() in __init__.
+-- P151/MOL-502: dim was 1024 (bge-m3); briefly 768 (nomic-embed-text).
+-- P168/MOL-546: back to 1024 (mxbai-embed-large-v1).
+-- Existing DBs auto-migrate via _migrate_vec_dims() in __init__. Fresh DBs
+-- skip the migration (no prior memory_vec data → migration probe returns
+-- empty), so the SCHEMA literal MUST match the current model's DIMS or
+-- fresh installs ship with a broken vec table.
 
 CREATE TABLE IF NOT EXISTS memory_stats (
   source      TEXT PRIMARY KEY DEFAULT 'hermes',
@@ -262,46 +269,99 @@ class TieredMemoryDB:
             self._conn.commit()
 
     def _migrate_vec_dims(self) -> None:
-        """Recreate memory_vec if embedding dimensions changed (model upgrade)."""
+        """Recreate memory_vec if embedding dimensions changed (model upgrade).
+
+        P168/MOL-546 fix-pass-2: previously swallowed all exceptions to a warning,
+        leaving a partial-state vec table (old dim) in place after a failed
+        DROP+CREATE. That made every subsequent insert into the new-dim schema
+        silently mismatch the search-path joins. Now: pre-flight read errors stay
+        soft (no prior memory_vec is OK), but a failed DROP+CREATE+_reembed_all
+        raises so the operator sees the migration failure on first gateway boot
+        instead of running with a broken vec index.
+        """
         from .embeddings import DIMS
         try:
             row = self._conn.execute(
                 "SELECT length(embedding) as emb_bytes FROM memory_vec LIMIT 1"
             ).fetchone()
-            if row and row["emb_bytes"]:
-                current_dims = row["emb_bytes"] // 4  # float32 = 4 bytes
-                if current_dims != DIMS:
-                    logger.warning(
-                        "Vec dimension mismatch: DB has %d, model expects %d — rebuilding",
-                        current_dims, DIMS,
-                    )
-                    self._conn.execute("DROP TABLE memory_vec")
-                    self._conn.execute(f"""
-                        CREATE VIRTUAL TABLE memory_vec USING vec0(
-                            entry_rowid integer primary key,
-                            embedding float[{DIMS}] distance_metric=cosine,
-                            category text
-                        )
-                    """)
-                    self._conn.commit()
-                    self._reembed_all()
         except Exception as e:
-            logger.warning("Vec migration check failed: %s", e)
+            # Reading the vec table failed (table missing on fresh DB is normal).
+            logger.warning("Vec migration probe failed (no prior vec table?): %s", e)
+            return
+        if not row or not row["emb_bytes"]:
+            return
+        current_dims = row["emb_bytes"] // 4  # float32 = 4 bytes
+        if current_dims == DIMS:
+            return
+        logger.warning(
+            "Vec dimension mismatch: DB has %d, model expects %d — rebuilding",
+            current_dims, DIMS,
+        )
+        # Fail-closed: any error in the DROP+CREATE+reembed sequence escalates
+        # to the caller instead of leaving a partial vec table.
+        self._conn.execute("DROP TABLE memory_vec")
+        self._conn.execute(f"""
+            CREATE VIRTUAL TABLE memory_vec USING vec0(
+                entry_rowid integer primary key,
+                embedding float[{DIMS}] distance_metric=cosine,
+                category text
+            )
+        """)
+        self._conn.commit()
+        self._reembed_all()
 
     def _reembed_all(self) -> None:
-        """Re-embed all non-archived entries after a dimension change."""
+        """Re-embed all non-archived entries after a dimension change.
+
+        P168/MOL-546 fix-pass-2 (silent-failure-hunter): on a fastembed model
+        load failure (HF download blocked, ONNX init crash) the prior version
+        silently logged `Re-embedded 0/N` at INFO level and the gateway booted
+        with an EMPTY memory_vec — undetectable until queries returned no
+        vector hits. Now: if rows existed but zero embedded successfully, the
+        migration writes a tripwire file (read by integrity-check on next boot)
+        and RAISES, refusing to commit the empty vec table.
+        """
         rows = self._conn.execute(
             "SELECT rowid, title, content, category FROM memory_entries WHERE archived_at IS NULL"
         ).fetchall()
         count = 0
         for r in rows:
-            emb = generate_embedding(f"{r['title']} {r['content']}")
+            # P168/MOL-546: title appears 2x so it contributes meaningfully even on long content
+            emb = generate_embedding(f"{r['title']}. {r['title']}. {r['content']}")
             if emb:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO memory_vec (entry_rowid, embedding, category) VALUES (?, ?, ?)",
                     (r["rowid"], serialize_float32(emb), r["category"]),
                 )
                 count += 1
+        if len(rows) > 0 and count == 0:
+            self._conn.rollback()
+            logger.error(
+                "P168/MOL-546: re-embed produced zero embeddings for %d non-archived rows; "
+                "fastembed init likely failed. Refusing to commit empty memory_vec.",
+                len(rows),
+            )
+            tripwire_dir = os.path.expanduser("~/.hermes/state")
+            os.makedirs(tripwire_dir, exist_ok=True)
+            tripwire = os.path.join(
+                tripwire_dir, f"reembed-failure-{int(time.time())}.json"
+            )
+            try:
+                with open(tripwire, "w") as f:
+                    json.dump(
+                        {
+                            "ts": time.time(),
+                            "rows_seen": len(rows),
+                            "embedded": count,
+                            "marker": "P168/MOL-546 re-embed produced zero embeddings",
+                        },
+                        f,
+                    )
+            except OSError as e:
+                logger.warning("Tripwire write failed: %s", e)
+            raise RuntimeError(
+                f"re-embed produced zero embeddings; vec table is empty (rows={len(rows)})"
+            )
         self._conn.commit()
         logger.info("Re-embedded %d/%d entries with new model", count, len(rows))
 
@@ -342,7 +402,8 @@ class TieredMemoryDB:
                     "SELECT id FROM memory_entries WHERE rowid = ?", (entry_rowid,)
                 ).fetchone()["id"]
 
-                embedding = generate_embedding(f"{title} {content}")
+                # P168/MOL-546: title appears 2x so it contributes meaningfully even on long content
+                embedding = generate_embedding(f"{title}. {title}. {content}")
                 if embedding:
                     self._conn.execute(
                         "INSERT INTO memory_vec (entry_rowid, embedding, category) VALUES (?, ?, ?)",

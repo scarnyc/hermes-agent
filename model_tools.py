@@ -30,6 +30,15 @@ from typing import Dict, Any, List, Optional, Tuple
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
+# P64/MOL-259: ``tools.reflection_agent`` registers the
+# ``reflect_on_output`` tool surface during ``discover_builtin_tools()``'s
+# AST-based auto-scan of ``tools/*.py``. The registration writes through
+# to ``registry``, which downstream callers (``get_tool_definitions``,
+# ``handle_function_call``) consume here. No explicit import is required —
+# discovery is name-driven — but the dependency is load-bearing for the
+# reviewer retry loop and recorded here so a future grep for "where does
+# tools.reflection_agent surface in the public tool list?" lands on this
+# file rather than only the registry internals.
 logger = logging.getLogger(__name__)
 
 

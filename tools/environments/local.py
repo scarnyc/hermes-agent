@@ -87,6 +87,7 @@ def _build_provider_env_blocklist() -> frozenset:
         "LLM_MODEL",
         "GOOGLE_API_KEY",
         "DEEPSEEK_API_KEY",
+        "KIMI_API_KEY",  # P21/MOL-196 — prevent stale Kimi token leaking to delegate subprocesses
         "MISTRAL_API_KEY",
         "GROQ_API_KEY",
         "TOGETHER_API_KEY",
@@ -253,10 +254,9 @@ def _find_bash() -> str:
 _find_shell = _find_bash
 
 
-# Standard PATH entries for environments with minimal PATH.
+# P09/MOL-120: sbin directories removed — minimize attack surface in subprocess env.
 _SANE_PATH = (
-    "/opt/homebrew/bin:/opt/homebrew/sbin:"
-    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 )
 
 

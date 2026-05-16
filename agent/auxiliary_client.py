@@ -196,6 +196,34 @@ def _is_kimi_model(model: Optional[str]) -> bool:
     return bare.startswith("kimi-") or bare == "kimi"
 
 
+def has_image_payload(messages: Optional[list]) -> bool:
+    """P66/MOL-273: True if any message in ``messages`` carries an image payload.
+
+    Detects the OpenAI Chat-Completions multimodal shape — a content list
+    where any item is ``{"type": "image_url", ...}`` or ``{"type": "image",
+    ...}``. Used by callers (trajectory_compressor, session_search_tool) to
+    decide whether ``prefer_local=True`` is safe: text-only payloads can be
+    routed to the local Kimi K2.6 path even when an upstream caller passed
+    an explicit cloud provider, but vision payloads must keep their original
+    routing because the local path doesn't speak the multimodal format.
+    """
+    if not messages:
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = (part.get("type") or "").lower()
+            if part_type in ("image_url", "image"):
+                return True
+    return False
+
+
 def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
@@ -259,7 +287,7 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
 # plus providers we intentionally keep pinned here (e.g. Anthropic predates
 # profiles). New providers should set default_aux_model on their profile instead.
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
-    "gemini": "gemini-3-flash-preview",
+    "gemini": "gemini-3.1-pro-preview",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash",
@@ -269,10 +297,10 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "minimax-oauth": "MiniMax-M2.7-highspeed",
     "minimax-cn": "MiniMax-M2.7",
     "anthropic": "claude-haiku-4-5-20251001",
-    "ai-gateway": "google/gemini-3-flash",
-    "opencode-zen": "gemini-3-flash",
+    "ai-gateway": "google/gemini-3.1-pro-preview",
+    "opencode-zen": "gemini-3.1-pro-preview",
     "opencode-go": "glm-5",
-    "kilocode": "google/gemini-3-flash-preview",
+    "kilocode": "google/gemini-3.1-pro-preview",
     "ollama-cloud": "nemotron-3-nano:30b",
     "tencent-tokenhub": "hy3-preview",
 }
@@ -388,8 +416,12 @@ NOUS_EXTRA_BODY = {"tags": ["product=hermes-agent"]}
 auxiliary_is_nous: bool = False
 
 # Default auxiliary models per provider
-_OPENROUTER_MODEL = "google/gemini-3-flash-preview"
-_NOUS_MODEL = "google/gemini-3-flash-preview"
+# P62/MOL-268 (2026-04-23): _OPENROUTER_MODEL flipped from "google/gemini-3.1-pro-preview"
+# (P35) to "moonshotai/kimi-k2.6" — Kimi K2.6 is a frontier reasoning model (NOT Flash, so
+# the no-Flash directive holds) and cuts session_search / trajectory_compressor aux costs
+# ~2.5× vs Pro 3.1. _NOUS_MODEL is unchanged because it's hit rarely.
+_OPENROUTER_MODEL = "moonshotai/kimi-k2.6"
+_NOUS_MODEL = "google/gemini-3.1-pro-preview"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
@@ -2180,6 +2212,7 @@ def resolve_provider_client(
     api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
+    prefer_local: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -2207,11 +2240,28 @@ def resolve_provider_client(
             "codex_responses", or None (auto-detect).  When set to
             "codex_responses", the client is wrapped in
             CodexAuxiliaryClient to route through the Responses API.
+        prefer_local: P66/MOL-273. When True and the caller hasn't pinned
+            ``is_vision``, override ``provider`` to ``openrouter`` so the
+            local Kimi K2.6 default carries the call. Callers use this for
+            text-only auxiliary work (trajectory compression, session
+            search) where the cheaper local-default path is preferred
+            over the explicit cloud provider an upstream argument may
+            have specified. Vision routing is preserved.
 
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
     _validate_proxy_env_urls()
+    # P66/MOL-273: prefer_local short-circuit. Reroute non-vision callers
+    # to the OpenRouter (Kimi K2.6) auxiliary path before alias
+    # normalisation so the rest of the resolver picks up the local
+    # default. Vision payloads keep their original provider — the local
+    # path is text-only.
+    if prefer_local and not is_vision:
+        provider = "openrouter"
+        # The local-preferred path uses the OpenRouter Kimi default; if
+        # the caller passed an explicit model that's text-compatible we
+        # keep it, otherwise let the OpenRouter branch pick its default.
     # Preserve the original provider name before alias normalization so a
     # user-declared ``custom_providers`` entry whose name coincidentally
     # matches a built-in alias (e.g. user names their custom provider "kimi"
@@ -4014,11 +4064,29 @@ async def async_call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    prefer_local: bool = False,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
+
+    P66/MOL-273: ``prefer_local`` (default False). When True and
+    ``task != "vision"`` *and* the payload has no image (verified via
+    :func:`has_image_payload`), the call is routed to the local Kimi K2.6
+    OpenRouter default instead of any explicit ``provider`` the caller
+    passed. Use this for auxiliary text-only work (trajectory compression,
+    session search) where the cheaper local path is preferred. Vision
+    payloads and ``task == "vision"`` always keep the original routing.
     """
+    # P66/MOL-273: prefer_local short-circuit. Bypass the caller's
+    # explicit provider only when the payload is text-only. ``task ==
+    # "vision"`` is the explicit opt-out (vision providers can't be
+    # rerouted); ``has_image_payload`` guards the implicit case where
+    # an upstream caller forgot to set ``task="vision"`` but still
+    # passed an image. Both gates must pass before we override provider.
+    if prefer_local and task != "vision" and not has_image_payload(messages):
+        provider = "openrouter"
+        model = None  # let the OpenRouter branch pick its Kimi default
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)

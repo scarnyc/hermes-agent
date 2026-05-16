@@ -2312,7 +2312,19 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
-        
+
+        # P59/MOL-268: dollar cost-cap circuit-breaker.
+        # ``_cost_cap_usd`` is read from config (``cost_caps.<platform>``)
+        # at session start; ``None`` = uncapped. ``_cost_cap_triggered``
+        # latches True once we exit the tool loop because the cap was
+        # exceeded, so callers (run_conversation / gateway) can surface
+        # a distinct end_reason instead of conflating with the iteration
+        # budget. The 2026-04-23 $60 incident showed runaway reviewer-
+        # feedback loops can burn budget faster than max_iterations bites;
+        # this is the dollar-denominated guard for that class of failure.
+        self._cost_cap_usd = None
+        self._cost_cap_triggered = False
+
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
         # When running against an Ollama server, detect the model's max context
@@ -2453,7 +2465,12 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
-        
+
+        # P59/MOL-268: reset cost-cap latch on session reset. Cap value
+        # (``_cost_cap_usd``) is preserved across resets — it's a config-
+        # driven ceiling, not a per-session counter.
+        self._cost_cap_triggered = False
+
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
 
@@ -3195,6 +3212,45 @@ class AIAgent:
             return True, False
 
         return False, False
+
+    def _use_anthropic_cache_markers(self) -> bool:
+        """P21/MOL-196: thin accessor reporting whether Anthropic-style cache_control
+        markers should be applied for the current request.  Wraps
+        ``_anthropic_prompt_cache_policy`` so callers (and the verifier) have a
+        single, named entry point distinct from ``_use_native_cache_layout``
+        (which only describes WHERE the markers sit, not WHETHER to emit them).
+        """
+        should_cache, _native_layout = self._anthropic_prompt_cache_policy()
+        return bool(should_cache)
+
+    def _log_cache_stats(self, usage: Any) -> None:
+        """P21/MOL-196: provider-agnostic cache-hit/miss logging.
+
+        Reads cache token counters from the response ``usage`` payload across
+        the three direct providers we care about — Anthropic
+        (``cache_read_input_tokens`` / ``cache_creation_input_tokens``), Gemini
+        direct (``cached_content_token_count``), and Kimi direct
+        (``prompt_cache_hit_tokens``) — and emits a single structured log line.
+        Fail-open: malformed/missing usage payloads are tolerated silently so
+        cache stats never break the request path.
+        """
+        try:
+            getter = getattr(usage, "get", None)
+            if callable(getter):
+                pull = lambda key: getter(key)  # type: ignore[no-redef]
+            else:
+                pull = lambda key: getattr(usage, key, None)  # type: ignore[no-redef]
+            anthropic_read = pull("cache_read_input_tokens") or 0
+            anthropic_create = pull("cache_creation_input_tokens") or 0
+            gemini_cached = pull("cached_content_token_count") or 0
+            kimi_hit = pull("prompt_cache_hit_tokens") or 0
+            if any((anthropic_read, anthropic_create, gemini_cached, kimi_hit)):
+                logger.debug(
+                    "cache_stats anthropic_read=%s anthropic_create=%s gemini_cached=%s kimi_hit=%s",
+                    anthropic_read, anthropic_create, gemini_cached, kimi_hit,
+                )
+        except Exception:
+            pass
 
     @staticmethod
     def _model_requires_responses_api(model: str) -> bool:
@@ -9122,6 +9178,12 @@ class AIAgent:
             opts = self._lmstudio_reasoning_options_cached()
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in opts)
+        # P21/MOL-196: Gemini direct (generativelanguage.googleapis.com) supports reasoning extra_body
+        if base_url_host_matches(self._base_url_lower, "generativelanguage.googleapis.com"):
+            return True
+        # P21/MOL-196: Kimi direct (api.moonshot.ai) supports reasoning extra_body
+        if base_url_host_matches(self._base_url_lower, "api.moonshot.ai"):
+            return True
         if "openrouter" not in self._base_url_lower:
             return False
         if "api.mistral.ai" in self._base_url_lower:
@@ -9132,8 +9194,9 @@ class AIAgent:
             "deepseek/",
             "anthropic/",
             "openai/",
-            "x-ai/",
             "google/gemini-2",
+            "google/gemini-3",
+            "moonshotai/",
             "qwen/qwen3",
             "tencent/hy3-preview",
             "xiaomi/",
@@ -11463,7 +11526,33 @@ class AIAgent:
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
                 break
-            
+
+            # P59/MOL-268: dollar cost-cap circuit-breaker. When the
+            # configured ``cost_caps.<platform>`` ceiling is hit we exit
+            # the tool loop before another API call lands. The 2026-04-23
+            # $60 incident (reviewer-feedback contagion thrashed 151
+            # turns) was the case study: max_iterations alone is not a
+            # tight enough leash on long-context Sonnet runs. ``None``
+            # cap = uncapped (pre-P59 behaviour). The latch flag is
+            # checked first so re-entry into the loop after the cap fires
+            # (e.g. memory-flush sub-loop) bails out idempotently.
+            if self._cost_cap_triggered:
+                _turn_exit_reason = "cost_cap_exceeded"
+                break
+            if (
+                self._cost_cap_usd is not None
+                and self.session_estimated_cost_usd >= self._cost_cap_usd
+            ):
+                self._cost_cap_triggered = True
+                _turn_exit_reason = "cost_cap_exceeded"
+                if not self.quiet_mode:
+                    self._safe_print(
+                        f"\n⚠️  Cost cap exceeded "
+                        f"(${self.session_estimated_cost_usd:.4f} ≥ "
+                        f"${self._cost_cap_usd:.4f}) — halting tool loop."
+                    )
+                break
+
             api_call_count += 1
             self._api_call_count = api_call_count
             self._touch_activity(f"starting API call #{api_call_count}")

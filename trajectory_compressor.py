@@ -98,7 +98,7 @@ class CompressionConfig:
     protect_last_n_turns: int = 4
     
     # Summarization (OpenRouter)
-    summarization_model: str = "google/gemini-3-flash-preview"
+    summarization_model: str = "google/gemini-3.1-pro-preview"
     base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = "OPENROUTER_API_KEY"
     temperature: float = 0.3
@@ -607,12 +607,18 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 
                 if getattr(self, '_use_call_llm', False):
                     from agent.auxiliary_client import call_llm
+                    # P66/MOL-273: trajectory summarisation is text-only and
+                    # tolerant of a smaller-than-main-loop model. ``prefer_local``
+                    # routes the call to the local Kimi K2.6 default instead of
+                    # whatever ``self._llm_provider`` resolved to upstream, so
+                    # compression doesn't burn cloud tokens.
                     response = call_llm(
                         provider=self._llm_provider,
                         model=self.config.summarization_model,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=summary_temperature,
                         max_tokens=self.config.summary_target_tokens * 2,
+                        prefer_local=True,
                     )
                 else:
                     _create_kwargs = {
@@ -676,12 +682,17 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 
                 if getattr(self, '_use_call_llm', False):
                     from agent.auxiliary_client import async_call_llm
+                    # P66/MOL-273: async path mirrors the sync ``prefer_local``
+                    # override above — trajectory summarisation is text-only,
+                    # cheap to satisfy with the local Kimi K2.6 default, and
+                    # has no reason to consume cloud-provider tokens.
                     response = await async_call_llm(
                         provider=self._llm_provider,
                         model=self.config.summarization_model,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=summary_temperature,
                         max_tokens=self.config.summary_target_tokens * 2,
+                        prefer_local=True,
                     )
                 else:
                     _create_kwargs = {

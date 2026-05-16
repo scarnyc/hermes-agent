@@ -430,6 +430,15 @@ def load_jobs() -> List[Dict[str, Any]]:
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
     ensure_dirs()
+    # P180/MOL-557 — H1 pre-write guard catches manual edits / cross-session cron CLI races.
+    try:
+        from tools.runtime_fingerprint import h1_pre_write_guard
+        outcome = h1_pre_write_guard(JOBS_FILE, caller="save_jobs")
+        if outcome == "abort":
+            return
+    except ImportError:
+        pass
+
     fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -444,6 +453,12 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         except OSError:
             pass
         raise
+    # P180/MOL-557 — H1 post-write hash record (new baseline for next call).
+    try:
+        from tools.runtime_fingerprint import h1_record_post_write
+        h1_record_post_write(JOBS_FILE)
+    except ImportError:
+        pass
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
