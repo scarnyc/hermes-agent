@@ -1041,6 +1041,10 @@ DEFAULT_CONFIG = {
         # Shape: {"provider": "openrouter", "model": "google/gemini-3.1-pro-preview"}.
         # Empty dict = inherit parent's _fallback_chain (no tier-3 override).
         "fallback_model": {},
+        "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
+                           # "codex_responses", or "anthropic_messages". Empty = auto-detect
+                           # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
+                           # explicitly for non-standard endpoints the heuristic can't detect.
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
