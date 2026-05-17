@@ -139,7 +139,9 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
             continue
 
         if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
+            # Check if it's an MCP tool from a server that opted into parallel calls.
+            if not _is_mcp_tool_parallel_safe(tool_name):
+                return False
 
     return True
 
