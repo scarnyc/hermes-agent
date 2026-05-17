@@ -1471,12 +1471,39 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     )
 
 
+# Process-local override set by AIAgent at session/turn start. Single-threaded
+# per turn — no lock needed. Cleared by ``clear_runtime_main()``.
+# Backported from upstream 3800972dd (vision pixel routing) — required by
+# agent.conversation_loop import at MOL-597 absorption time.
+_RUNTIME_MAIN_PROVIDER: str = ""
+_RUNTIME_MAIN_MODEL: str = ""
+
+
+def set_runtime_main(provider: str, model: str) -> None:
+    """Record the live runtime provider/model for the current AIAgent."""
+    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+    _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
+    _RUNTIME_MAIN_MODEL = (model or "").strip()
+
+
+def clear_runtime_main() -> None:
+    """Clear the runtime override (e.g. on session end)."""
+    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+    _RUNTIME_MAIN_PROVIDER = ""
+    _RUNTIME_MAIN_MODEL = ""
+
+
 def _read_main_model() -> str:
     """Read the user's configured main model from config.yaml.
 
     config.yaml model.default is the single source of truth for the active
-    model. Environment variables are no longer consulted.
+    model. Environment variables are no longer consulted. Runtime override
+    via ``set_runtime_main`` takes precedence so tools gating on the live
+    main model see CLI/gateway overrides.
     """
+    override = _RUNTIME_MAIN_MODEL
+    if isinstance(override, str) and override.strip():
+        return override.strip()
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -1496,8 +1523,11 @@ def _read_main_provider() -> str:
     """Read the user's configured main provider from config.yaml.
 
     Returns the lowercase provider id (e.g. "alibaba", "openrouter") or ""
-    if not configured.
+    if not configured. Runtime override consulted first (see ``_read_main_model``).
     """
+    override = _RUNTIME_MAIN_PROVIDER
+    if isinstance(override, str) and override.strip():
+        return override.strip().lower()
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
