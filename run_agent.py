@@ -2225,6 +2225,62 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
 
+    # Stream-diagnostic class header preserved for backward compat —
+    # actual list lives in ``agent.stream_diag.STREAM_DIAG_HEADERS``.
+    from agent.stream_diag import STREAM_DIAG_HEADERS as _STREAM_DIAG_HEADERS  # noqa: E402
+
+    @staticmethod
+    def _stream_diag_init() -> Dict[str, Any]:
+        """Forwarder — see ``agent.stream_diag.stream_diag_init``."""
+        from agent.stream_diag import stream_diag_init
+        return stream_diag_init()
+
+    def _stream_diag_capture_response(
+        self, diag: Dict[str, Any], http_response: Any
+    ) -> None:
+        """Forwarder — see ``agent.stream_diag.stream_diag_capture_response``."""
+        from agent.stream_diag import stream_diag_capture_response
+        stream_diag_capture_response(self, diag, http_response)
+
+    @staticmethod
+    def _flatten_exception_chain(error: BaseException) -> str:
+        """Forwarder — see ``agent.stream_diag.flatten_exception_chain``."""
+        from agent.stream_diag import flatten_exception_chain
+        return flatten_exception_chain(error)
+
+    def _log_stream_retry(
+        self,
+        *,
+        kind: str,
+        error: BaseException,
+        attempt: int,
+        max_attempts: int,
+        mid_tool_call: bool,
+        diag: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Forwarder — see ``agent.stream_diag.log_stream_retry``."""
+        from agent.stream_diag import log_stream_retry
+        log_stream_retry(
+            self, kind=kind, error=error, attempt=attempt,
+            max_attempts=max_attempts, mid_tool_call=mid_tool_call, diag=diag,
+        )
+
+    def _emit_stream_drop(
+        self,
+        *,
+        error: BaseException,
+        attempt: int,
+        max_attempts: int,
+        mid_tool_call: bool,
+        diag: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Forwarder — see ``agent.stream_diag.emit_stream_drop``."""
+        from agent.stream_diag import emit_stream_drop
+        emit_stream_drop(
+            self, error=error, attempt=attempt, max_attempts=max_attempts,
+            mid_tool_call=mid_tool_call, diag=diag,
+        )
+
     def _emit_auxiliary_failure(self, task: str, exc: BaseException) -> None:
         """Surface a compact warning for failed auxiliary work."""
         try:
