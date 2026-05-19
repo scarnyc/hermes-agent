@@ -133,8 +133,19 @@ _CREDENTIAL_FILES = (
     r'(?:~|\$home|\$\{home\})/\.'
     r'(?:netrc|pgpass|npmrc|pypirc)\b'
 )
+# macOS: /etc, /var, /tmp, /home are symlinks to /private/{etc,var,tmp,home}.
+# A command written to target /private/etc/sudoers works identically to
+# /etc/sudoers on macOS but bypasses a plain "/etc/" pattern check. Match
+# both forms. Inspired by Claude Code 2.1.113's "dangerous path protection".
+_MACOS_PRIVATE_SYSTEM_PATH = r'/private/(?:etc|var|tmp|home)/'
+# System-config paths that should trigger approval for any write/edit,
+# collapsing /etc, its macOS /private/etc mirror, and /etc/sudoers.d/ into
+# one shared fragment so new DANGEROUS_PATTERNS stay consistent.
+_SYSTEM_CONFIG_PATH = (
+    rf'(?:/etc/|{_MACOS_PRIVATE_SYSTEM_PATH})'
+)
 _SENSITIVE_WRITE_TARGET = (
-    r'(?:/etc/|/dev/sd|'
+    rf'(?:{_SYSTEM_CONFIG_PATH}|/dev/sd|'
     rf'{_SSH_SENSITIVE_PATH}|'
     rf'{_HERMES_ENV_PATH}|'
     rf'{_SHELL_RC_FILES}|'
@@ -251,6 +262,186 @@ def _hardline_block_result(description: str) -> dict:
 
 
 # =========================================================================
+# Terminal coding-elevation profile (P185 / MOL-636)
+# Module-cached load of ~/.hermes/config/terminal-profiles/coding.yaml.
+# Fast-path runs AFTER hardline block, BEFORE yolo / Tirith / dangerous-cmd
+# dispatch. Only fires when caller == "terminal_tool" (delegate-subprocess
+# path unaffected). Rollback: rename YAML + `launchctl kickstart -k`.
+# =========================================================================
+
+_TERMINAL_CODING_PROFILE_CACHE = None  # type: ignore[var-annotated]
+_TERMINAL_CODING_PROFILE_LOADED = False
+_TERMINAL_CODING_AUDIT_FAILURES = 0  # monotonic counter — observability for fail-open audit
+
+# Command-chain operators that would let a command sneak destructive variants
+# past the per-verb pattern match (e.g. `pytest && rm -rf /`). Rejecting these
+# forces the whole command back through Rampart + Tirith + HARDLINE.
+_CODING_CHAIN_OPERATORS = ("&&", "||", ";", "|", ">", "<", "$(", "`", "&")
+
+# Credential redaction for audit command_head. Conservative — only catches
+# obvious provider tokens; sandbox-exec + Rampart response scanning are the
+# real boundary, this just keeps elevation-audit JSONL clean for log review.
+_CODING_REDACT_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"),                # OpenAI/Anthropic-style
+    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{16,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                       # AWS access key id
+    re.compile(r"\bASIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bya29\.[A-Za-z0-9_\-]+\b"),                  # Google OAuth
+    re.compile(r"\bghp_[A-Za-z0-9]{30,}\b"),                   # GitHub PAT
+    re.compile(r"\bgho_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"\bghs_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"\bxox[bpoa]-[A-Za-z0-9\-]+\b"),               # Slack
+    re.compile(r"\b[0-9]{6,12}:AAF[A-Za-z0-9_\-]{30,}\b"),     # Telegram bot
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]+\b"),  # JWT
+    re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*\S{8,}"),
+)
+
+
+def _redact_for_audit(text: str) -> str:
+    """Strip obvious credential shapes before persisting to audit JSONL."""
+    out = text
+    for pat in _CODING_REDACT_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    return out
+
+
+def _load_terminal_coding_profile():
+    """Lazy module-cached load of the terminal coding-elevation profile."""
+    global _TERMINAL_CODING_PROFILE_CACHE, _TERMINAL_CODING_PROFILE_LOADED
+    if _TERMINAL_CODING_PROFILE_LOADED:
+        return _TERMINAL_CODING_PROFILE_CACHE
+    path = os.path.expanduser("~/.hermes/config/terminal-profiles/coding.yaml")
+    if not os.path.isfile(path):
+        # Mark loaded so we don't retry the stat on every command. Cache stays None.
+        _TERMINAL_CODING_PROFILE_LOADED = True
+        return None
+    try:
+        import yaml  # type: ignore
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+        if not isinstance(data, dict):
+            _TERMINAL_CODING_PROFILE_LOADED = True
+            return None
+        # Only flip the loaded flag AFTER a successful parse — otherwise a
+        # transient parse error would poison the cache for the gateway's
+        # remaining lifetime.
+        _TERMINAL_CODING_PROFILE_CACHE = data
+        _TERMINAL_CODING_PROFILE_LOADED = True
+        return data
+    except Exception as exc:  # noqa: BLE001 — fail-open (do NOT mark loaded — retry next call)
+        logger.warning("terminal-coding-profile load failed: %s", exc)
+        return None
+
+
+def _terminal_coding_audit(command: str, decision: str, pattern_matched,
+                           profile, tirith_skipped=False, timeout_override=None):
+    """Append-line audit JSONL. Fail-open — but log + count failures instead of swallowing."""
+    global _TERMINAL_CODING_AUDIT_FAILURES
+    try:
+        import json
+        audit_cfg = profile.get("audit", {}) if isinstance(profile, dict) else {}
+        path = os.path.expanduser(audit_cfg.get(
+            "jsonl", "~/.hermes/logs/terminal-coding-elevation.jsonl"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        entry = {
+            "ts": time.time(),
+            "decision": decision,
+            "pattern_matched": pattern_matched,
+            "command_head": _redact_for_audit(command[:200]),
+            "tirith_skipped": tirith_skipped,
+            "timeout_override": timeout_override,
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception as exc:  # noqa: BLE001 — audit failure is fail-open BUT visible
+        _TERMINAL_CODING_AUDIT_FAILURES += 1
+        logger.warning(
+            "terminal-coding-elevation audit write failed (count=%d): %s",
+            _TERMINAL_CODING_AUDIT_FAILURES, exc,
+        )
+
+
+def _coding_timeout_for_pattern(profile, pattern):
+    """Look up per-pattern wall-clock override from profile.timeouts."""
+    if not isinstance(profile, dict):
+        return None
+    timeouts = profile.get("timeouts")
+    if not isinstance(timeouts, dict):
+        return None
+    val = timeouts.get(pattern)
+    if isinstance(val, (int, float)) and val > 0:
+        return int(val)
+    return None
+
+
+def _terminal_coding_fast_path(command: str, caller):
+    """Return decision dict if profile elevates this command, else None.
+
+    Pattern engine: case-insensitive fnmatch.fnmatchcase against the FULL
+    lowercased command string, matching Rampart's command_matches semantics
+    plus a defense against `KILL -9 1` / `Pytest && rm -rf /`-style bypass.
+
+    Pre-reject order (BEFORE any pattern match):
+      1. caller != "terminal_tool"        → None (delegate-subprocess path)
+      2. \\n or \\r in command            → None (multi-line falls through)
+      3. shell chain operator in command  → None (no `pytest && rm -rf /`)
+
+    Only fires for caller == "terminal_tool".
+    """
+    if caller != "terminal_tool":
+        return None
+    if "\n" in command or "\r" in command:
+        return None
+    if any(op in command for op in _CODING_CHAIN_OPERATORS):
+        return None
+    profile = _load_terminal_coding_profile()
+    if not profile:
+        return None
+    import fnmatch
+    # Case-insensitive match: lowercase the command BEFORE fnmatch. Patterns
+    # in the YAML are already lowercase by convention; if any uppercase slips
+    # in we still want to match — so lowercase the pattern too.
+    lowered = command.lower()
+    for pat in profile.get("denied_bash_patterns") or []:
+        if not isinstance(pat, str):
+            continue
+        if fnmatch.fnmatchcase(lowered, pat.lower()):
+            logger.warning("terminal-coding-profile deny: %s (pattern: %s)",
+                           _redact_for_audit(command[:200]), pat)
+            _terminal_coding_audit(command, "deny", pat, profile)
+            return {
+                "approved": False,
+                "elevated": False,
+                "tirith_skipped": False,
+                "timeout_override": None,
+                "pattern_matched": pat,
+                "message": (
+                    f"BLOCKED (coding-profile): command matches denied pattern "
+                    f"'{pat}'. Additive Hermes-side deny on top of Rampart + "
+                    "HARDLINE — find an alternative or run in a native terminal."
+                ),
+            }
+    for pat in profile.get("allowed_bash_patterns") or []:
+        if not isinstance(pat, str):
+            continue
+        if fnmatch.fnmatchcase(lowered, pat.lower()):
+            timeout_override = _coding_timeout_for_pattern(profile, pat)
+            _terminal_coding_audit(
+                command, "allow", pat, profile,
+                tirith_skipped=True, timeout_override=timeout_override,
+            )
+            return {
+                "approved": True,
+                "message": None,
+                "elevated": True,
+                "tirith_skipped": True,
+                "timeout_override": timeout_override,
+                "pattern_matched": pat,
+            }
+    return None
+
+
+# =========================================================================
 # Dangerous command patterns
 # =========================================================================
 
@@ -268,10 +459,17 @@ DANGEROUS_PATTERNS = [
     (r'\bDROP\s+(TABLE|DATABASE)\b', "SQL DROP"),
     (r'\bDELETE\s+FROM\b(?!.*\bWHERE\b)', "SQL DELETE without WHERE"),
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
-    (r'>\s*/etc/', "overwrite system config"),
+    (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
+    # killall with SIGKILL (parallel to pkill -9). Catches -9 / -KILL /
+    # -s KILL / -SIGKILL forms, and also `killall -r <regex>` broad sweeps
+    # that can wipe out unrelated processes by accident.
+    # Inspired by Claude Code 2.1.113 expanded deny rules.
+    (r'\bkillall\s+(-[^\s]*\s+)*-(9|KILL|SIGKILL)\b', "force kill processes (killall -KILL)"),
+    (r'\bkillall\s+(-[^\s]*\s+)*-s\s+(KILL|SIGKILL|9)\b', "force kill processes (killall -s KILL)"),
+    (r'\bkillall\s+(-[^\s]*\s+)*-r\b', "kill processes by regex (killall -r)"),
     (r':\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:', "fork bomb"),
     # Any shell invocation via -c or combined flags like -lc, -ic, etc.
     (r'\b(bash|sh|zsh|ksh)\s+-[^\s]*c(\s+|$)', "shell command via -c/-lc flag"),
@@ -283,7 +481,11 @@ DANGEROUS_PATTERNS = [
     (rf'\btee\b.*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via tee"),
     (rf'>>?\s*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via redirection"),
     (r'\bxargs\s+.*\brm\b', "xargs with rm"),
-    (r'\bfind\b.*-exec\s+(/\S*/)?rm\b', "find -exec rm"),
+    # find -exec rm / -execdir rm — the -execdir variant (same semantics,
+    # runs in the directory of each match) was previously missed. Claude
+    # Code 2.1.113 tightened their equivalent find rule to stop auto-
+    # approving -exec / -delete flags.
+    (r'\bfind\b.*-exec(?:dir)?\s+(/\S*/)?rm\b', "find -exec/-execdir rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
     # Gateway lifecycle protection: prevent the agent from killing its own
     # gateway process.  These commands trigger a gateway restart/stop that
@@ -301,11 +503,12 @@ DANGEROUS_PATTERNS = [
     # to regex at detection time. Catch the structural pattern instead.
     (r'\bkill\b.*\$\(\s*pgrep\b', "kill process via pgrep expansion (self-termination)"),
     (r'\bkill\b.*`\s*pgrep\b', "kill process via backtick pgrep expansion (self-termination)"),
-    # File copy/move/edit into sensitive system paths
-    (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
+    # File copy/move/edit into sensitive system paths (/etc/ and macOS
+    # /private/etc/ mirror).
+    (rf'\b(cp|mv|install)\b.*\s{_SYSTEM_CONFIG_PATH}', "copy/move file into system config path"),
     (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
-    (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
-    (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+    (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
+    (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
@@ -949,13 +1152,18 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def check_all_command_guards(command: str, env_type: str,
-                             approval_callback=None) -> dict:
+                             approval_callback=None,
+                             caller: Optional[str] = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
     presents them as a single combined approval request. This prevents
     a gateway force=True replay from bypassing one check when only the
     other was shown to the user.
+
+    `caller` identifies the dispatch site (e.g. "terminal_tool"). Used
+    to gate the P185 / MOL-636 coding-elevation fast-path so the
+    delegate-subprocess path remains unaffected.
     """
     # Skip containers for both checks
     if env_type in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):
@@ -969,6 +1177,15 @@ def check_all_command_guards(command: str, env_type: str,
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
+
+    # P185 / MOL-636: coding-elevation profile fast-path. Runs AFTER
+    # hardline (so kill -9 1 / rm -rf are already blocked) and BEFORE
+    # the yolo / mode=off short-circuit + Tirith dispatch. Fires only
+    # for caller == "terminal_tool" — synthetic commands from the
+    # delegate-subprocess path fall through unchanged.
+    coding_result = _terminal_coding_fast_path(command, caller)
+    if coding_result is not None:
+        return coding_result
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.

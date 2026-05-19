@@ -196,9 +196,15 @@ def cron_create(args):
 
 
 def cron_edit(args):
-    from cron.jobs import get_job
+    from cron.jobs import AmbiguousJobReference, resolve_job_ref
 
-    job = get_job(args.job_id)
+    try:
+        job = resolve_job_ref(args.job_id)
+    except AmbiguousJobReference as exc:
+        print(color(str(exc), Colors.RED))
+        for m in exc.matches:
+            print(f"  {m['id']}  (name: {m.get('name')!r})")
+        return 1
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
@@ -219,6 +225,10 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    # P58/MOL-268: --skip-reflection passes through to cronjob_tools.cronjob()
+    # which writes ``skip_reflection`` onto the job dict. cron/scheduler.py
+    # reads ``bool(job.get("skip_reflection"))`` at run_job time to bypass the
+    # reviewer retry loop.
     result = _cron_api(
         action="update",
         job_id=args.job_id,
@@ -231,6 +241,7 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        skip_reflection=getattr(args, "skip_reflection", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -267,8 +278,8 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     return 0
 
 
-def cron_command(args):
-    """Handle cron subcommands."""
+def _cron_dispatch(args):
+    """Handle cron subcommands (inner — wrapped by cron_command for H5 audit)."""
     subcmd = getattr(args, 'cron_command', None)
 
     if subcmd is None or subcmd == "list":
@@ -305,3 +316,45 @@ def cron_command(args):
     print(f"Unknown cron command: {subcmd}")
     print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|tick]")
     sys.exit(1)
+
+
+def cron_command(args):
+    """Handle cron subcommands. H5/P180/MOL-557: pre/post-hash jobs.json for audit JSONL."""
+    import os as _os
+
+    subcmd = getattr(args, 'cron_command', None)
+    job_id = getattr(args, 'job_id', None)
+
+    # P180/MOL-557 — H5 cron CRUD audit. try/finally so audit emits even if dispatch raises.
+    pre_hash: str | None = None
+    jobs_file = None
+    rf = None
+    try:
+        import tools.runtime_fingerprint as rf  # noqa: F401
+        jobs_file = rf.HERMES_HOME / "cron" / "jobs.json"
+        pre_hash = rf.compute_fingerprint([jobs_file]).get(str(jobs_file.resolve()))
+    except Exception:
+        pass
+
+    try:
+        return _cron_dispatch(args)
+    finally:
+        try:
+            if rf is not None and jobs_file is not None:
+                post_hash = rf.compute_fingerprint([jobs_file]).get(str(jobs_file.resolve()))
+                if pre_hash != post_hash:
+                    rf.emit_audit_jsonl(
+                        rf.LOG_DIR / "cron-crud.jsonl",
+                        {
+                            "ts": rf.now_iso(),
+                            "event": "cron_crud",
+                            "subcommand": subcmd,
+                            "job_id": job_id,
+                            "pre_hash": pre_hash,
+                            "post_hash": post_hash,
+                            "tty": sys.stdout.isatty(),
+                            "pid": _os.getpid(),
+                        },
+                    )
+        except Exception:
+            pass

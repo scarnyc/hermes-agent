@@ -1882,6 +1882,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        exclude_reviewer_contagion: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1894,6 +1895,26 @@ class SessionDB:
 
         Returns matching messages with session metadata, content snippet,
         and surrounding context (1 message before and after the match).
+
+        P65/MOL-271: ``exclude_reviewer_contagion`` (default True) filters
+        out rows whose ``content`` contains a reviewer-banner sentinel
+        substring. The 2026-04-23 $60 incident
+        (``reviewer_feedback_contagion`` memory) traced a 151-turn agent
+        thrash back to reviewer banners that had leaked into state.db's
+        ``messages`` table; the next session's ``session_search`` hit
+        re-fed those banners to the agent, which treated them as
+        operator-issued critiques and looped. Filtering the patterns
+        here closes the propagation path at the SQL boundary. Three
+        patterns are matched (any one substring excludes the row):
+
+            * ``[REVIEWER FEEDBACK`` — P65 banner prefix from
+              reflect_and_annotate fail-open path
+            * ``🔍 REVIEWER:`` — emoji-prefixed reviewer narration line
+            * ``REVIEWER: <N> concern`` — concern-count summary (GLOB
+              ``REVIEWER: [0-9]* concern``)
+
+        Set ``exclude_reviewer_contagion=False`` to surface the banners
+        explicitly (e.g. for incident triage).
         """
         if not query or not query.strip():
             return []
@@ -1920,6 +1941,17 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+
+        if exclude_reviewer_contagion:
+            # P65/MOL-271: filter reviewer-banner contagion. LIKE handles
+            # the two literal-prefix patterns; GLOB handles the
+            # variable-digit concern-count line. All three are joined
+            # with AND-NOT so any single match excludes the row.
+            where_clauses.append(
+                "m.content NOT LIKE '%[REVIEWER FEEDBACK%' "
+                "AND m.content NOT LIKE '%🔍 REVIEWER:%' "
+                "AND m.content NOT GLOB '*REVIEWER: [0-9]* concern*'"
+            )
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])

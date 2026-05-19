@@ -2649,6 +2649,14 @@ def generate_launchd_plist() -> str:
         "<string>run</string>",
         "<string>--replace</string>",
     ])
+    # If envchain-wrapper.sh exists at HERMES_HOME/scripts/, route the gateway
+    # through it so the launchd-managed process inherits Keychain-stored secrets
+    # (TAVILY_API_KEY, GRANOLA_*, etc.). Without this, cron jobs can't access
+    # envchain namespaces because launchd only injects PATH/VIRTUAL_ENV/HERMES_HOME.
+    envchain_wrapper = Path(hermes_home) / "scripts" / "envchain-wrapper.sh"
+    if envchain_wrapper.is_file() and os.access(str(envchain_wrapper), os.X_OK):
+        prog_args.insert(0, f"<string>{envchain_wrapper}</string>")
+
     prog_args_xml = "\n        ".join(prog_args)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>

@@ -1884,21 +1884,21 @@ class GatewayRunner:
             await self.stop()
         elif not self.adapters and self._failed_platforms:
             # All platforms are down and queued for background reconnection.
-            # If the error is retryable, exit with failure so systemd Restart=on-failure
-            # can restart the process. Otherwise stay alive and keep retrying in background.
-            if adapter.fatal_error_retryable:
-                self._exit_reason = adapter.fatal_error_message or "All messaging platforms failed with retryable errors"
-                self._exit_with_failure = True
-                logger.error(
-                    "All messaging platforms failed with retryable errors. "
-                    "Shutting down gateway for service restart (systemd will retry)."
-                )
-                await self.stop()
-            else:
-                logger.warning(
-                    "No connected messaging platforms remain, but %d platform(s) queued for reconnection",
-                    len(self._failed_platforms),
-                )
+            # Keep the gateway alive so:
+            #   • cron jobs still run
+            #   • the reconnect watcher can recover platforms when the
+            #     underlying problem clears (proxy comes back, user runs
+            #     `hermes whatsapp`, etc.)
+            # We used to exit-with-failure here to trigger systemd restart,
+            # but that converted a transient outage into a restart loop and
+            # killed in-process state every time. The reconnect watcher
+            # already handles long-running recovery — let it do its job.
+            logger.warning(
+                "No connected messaging platforms remain, but %d platform(s) "
+                "queued for reconnection — gateway staying alive, watcher will "
+                "retry in background.",
+                len(self._failed_platforms),
+            )
 
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True
@@ -2073,6 +2073,73 @@ class GatewayRunner:
             )
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Per-platform circuit breaker (pause/resume) — used by the reconnect
+    # watcher when a retryable failure recurs past a threshold, and by the
+    # /platform pause|resume slash command for manual control.
+    # ------------------------------------------------------------------
+    def _pause_failed_platform(self, platform, *, reason: str = "") -> None:
+        """Mark a queued platform as paused — keep it in ``_failed_platforms``
+        but stop the reconnect watcher from hammering it.
+
+        Used by the circuit breaker after ``_PAUSE_AFTER_FAILURES`` consecutive
+        retryable failures, and by ``/platform pause <name>`` for manual
+        intervention.  Paused platforms are surfaced in ``/platform list``
+        and resumed with ``/platform resume <name>``.
+        """
+        info = getattr(self, "_failed_platforms", {}).get(platform)
+        if info is None:
+            return
+        if info.get("paused"):
+            return
+        info["paused"] = True
+        info["pause_reason"] = reason or "auto-paused after repeated failures"
+        # Push next_retry far enough out that even if "paused" is missed
+        # by a stale code path, the watcher won't fire on it.
+        info["next_retry"] = float("inf")
+        try:
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="paused",
+                error_code=None,
+                error_message=info["pause_reason"],
+            )
+        except Exception:
+            pass
+        logger.warning(
+            "%s paused after %d consecutive failures (%s) — "
+            "fix the underlying issue then run `/platform resume %s` "
+            "to retry, or `hermes gateway restart` to restart the gateway.",
+            platform.value, info.get("attempts", 0),
+            info["pause_reason"], platform.value,
+        )
+
+    def _resume_paused_platform(self, platform) -> bool:
+        """Unpause a platform — reset its attempt counter and schedule an
+        immediate retry.  Returns True if the platform was paused and is
+        now queued; False if it wasn't paused (or wasn't in the queue).
+        """
+        info = getattr(self, "_failed_platforms", {}).get(platform)
+        if info is None:
+            return False
+        if not info.get("paused"):
+            return False
+        info["paused"] = False
+        info.pop("pause_reason", None)
+        info["attempts"] = 0
+        info["next_retry"] = time.monotonic()  # retry on next watcher tick
+        try:
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="retrying",
+                error_code=None,
+                error_message=None,
+            )
+        except Exception:
+            pass
+        logger.info("%s resumed — retrying on next watcher tick", platform.value)
+        return True
 
     @staticmethod
     def _load_prefill_messages() -> List[Dict[str, Any]]:
@@ -3460,16 +3527,46 @@ class GatewayRunner:
                 self._request_clean_exit(reason)
                 return True
             if enabled_platform_count > 0:
-                reason = "; ".join(startup_retryable_errors) or "all configured messaging platforms failed to connect"
-                logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
-                try:
-                    from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                except Exception:
-                    pass
-                return False
-            logger.warning("No messaging platforms enabled.")
-            logger.info("Gateway will continue running for cron job execution.")
+                if startup_retryable_errors:
+                    # All enabled platforms hit retryable failures (network
+                    # blip, bridge not paired, npm install timeout, etc.).
+                    # Keep the gateway alive so:
+                    #   • cron jobs still run
+                    #   • the reconnect watcher gets a chance to recover the
+                    #     failing platforms once the underlying problem is
+                    #     fixed (e.g. user runs `hermes whatsapp`, fixes
+                    #     proxy, etc.)
+                    # Exiting here used to convert a single misconfigured
+                    # platform into an infinite systemd restart loop.
+                    reason = "; ".join(startup_retryable_errors)
+                    logger.warning(
+                        "Gateway started with no connected platforms — "
+                        "%d platform(s) queued for retry: %s",
+                        len(self._failed_platforms), reason,
+                    )
+                    try:
+                        from gateway.status import write_runtime_status
+                        write_runtime_status(
+                            gateway_state="degraded",
+                            exit_reason=None,
+                        )
+                    except Exception:
+                        pass
+                    # Fall through to the normal "running" state — reconnect
+                    # watcher takes it from here.
+                # All enabled platforms had no adapter (missing library or credentials).
+                # In fleet deployments the same config.yaml is shared across nodes that
+                # may only have credentials for a subset of platforms.  Rather than
+                # failing hard, degrade gracefully and allow cron jobs to run (#5196).
+                logger.warning(
+                    "No adapter could be created for any of the %d configured platform(s). "
+                    "Check that required dependencies are installed and credentials are set. "
+                    "Gateway will continue for cron job execution.",
+                    enabled_platform_count,
+                )
+            else:
+                logger.warning("No messaging platforms enabled.")
+                logger.info("Gateway will continue running for cron job execution.")
         
         # Update delivery router with adapters
         self.delivery_router.adapters = self.adapters
@@ -4226,11 +4323,15 @@ class GatewayRunner:
         """Background task that periodically retries connecting failed platforms.
 
         Uses exponential backoff: 30s → 60s → 120s → 240s → 300s (cap).
-        Stops retrying a platform after 20 failed attempts or if the error
-        is non-retryable (e.g. bad auth token).
+        Retryable failures keep retrying at the backoff cap indefinitely
+        — but if a platform fails ``_PAUSE_AFTER_FAILURES`` times in a row
+        without ever succeeding, it is *paused*: kept in the retry queue
+        but no longer hammered.  The user surfaces it with ``/platform list``
+        and resumes it with ``/platform resume <name>``.  Non-retryable
+        failures (bad auth, etc.) still drop out of the queue immediately.
         """
-        _MAX_ATTEMPTS = 20
         _BACKOFF_CAP = 300  # 5 minutes max between retries
+        _PAUSE_AFTER_FAILURES = 10  # circuit-breaker threshold
 
         await asyncio.sleep(10)  # initial delay — let startup finish
         while self._running:
@@ -4247,22 +4348,18 @@ class GatewayRunner:
                 if not self._running:
                     return
                 info = self._failed_platforms[platform]
+                # Skip paused platforms entirely — they need explicit
+                # /platform resume to come back.
+                if info.get("paused"):
+                    continue
                 if now < info["next_retry"]:
                     continue  # not time yet
-
-                if info["attempts"] >= _MAX_ATTEMPTS:
-                    logger.warning(
-                        "Giving up reconnecting %s after %d attempts",
-                        platform.value, info["attempts"],
-                    )
-                    del self._failed_platforms[platform]
-                    continue
 
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
                 logger.info(
-                    "Reconnecting %s (attempt %d/%d)...",
-                    platform.value, attempt, _MAX_ATTEMPTS,
+                    "Reconnecting %s (attempt %d)...",
+                    platform.value, attempt,
                 )
 
                 try:
@@ -4301,32 +4398,26 @@ class GatewayRunner:
                         except Exception:
                             pass
                     else:
-                        # Check if the failure is non-retryable
-                        if adapter.has_fatal_error and not adapter.fatal_error_retryable:
-                            self._update_platform_runtime_status(
-                                platform.value,
-                                platform_state="fatal",
-                                error_code=adapter.fatal_error_code,
-                                error_message=adapter.fatal_error_message,
-                            )
-                            logger.warning(
-                                "Reconnect %s: non-retryable error (%s), removing from retry queue",
-                                platform.value, adapter.fatal_error_message,
-                            )
-                            del self._failed_platforms[platform]
-                        else:
-                            self._update_platform_runtime_status(
-                                platform.value,
-                                platform_state="retrying",
-                                error_code=adapter.fatal_error_code,
-                                error_message=adapter.fatal_error_message or "failed to reconnect",
-                            )
-                            backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
-                            info["attempts"] = attempt
-                            info["next_retry"] = time.monotonic() + backoff
-                            logger.info(
-                                "Reconnect %s failed, next retry in %ds",
-                                platform.value, backoff,
+                        self._update_platform_runtime_status(
+                            platform.value,
+                            platform_state="retrying",
+                            error_code=adapter.fatal_error_code,
+                            error_message=adapter.fatal_error_message or "failed to reconnect",
+                        )
+                        backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
+                        info["attempts"] = attempt
+                        info["next_retry"] = time.monotonic() + backoff
+                        logger.info(
+                            "Reconnect %s failed, next retry in %ds",
+                            platform.value, backoff,
+                        )
+                        if attempt >= _PAUSE_AFTER_FAILURES:
+                            self._pause_failed_platform(
+                                platform,
+                                reason=(
+                                    adapter.fatal_error_message
+                                    or "failed to reconnect"
+                                ),
                             )
                 except Exception as e:
                     self._update_platform_runtime_status(
@@ -4342,6 +4433,8 @@ class GatewayRunner:
                         "Reconnect %s error: %s, next retry in %ds",
                         platform.value, e, backoff,
                     )
+                    if attempt >= _PAUSE_AFTER_FAILURES:
+                        self._pause_failed_platform(platform, reason=str(e))
 
             # Check every 10 seconds for platforms that need reconnection
             for _ in range(10):
@@ -5795,6 +5888,9 @@ class GatewayRunner:
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
+
+        if canonical == "platform":
+            return await self._handle_platform_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -7306,6 +7402,8 @@ class GatewayRunner:
                 try:
                     if _err_body is not None:
                         _err_json = _err_body.json().get("error", {})
+                        if not isinstance(_err_json, dict):
+                            _err_json = {}
                 except Exception:
                     pass
                 if _err_json.get("type") == "usage_limit_reached":
@@ -7893,6 +7991,99 @@ class GatewayRunner:
             return EphemeralReply("⚡ Stopped. You can continue this session.")
         else:
             return "No active task to stop."
+
+    async def _handle_platform_command(self, event: MessageEvent) -> str:
+        """Handle ``/platform list|pause|resume [name]`` — surface and
+        manually control failed/paused gateway adapters.
+
+        Examples:
+            ``/platform list``           — show connected + failed/paused platforms
+            ``/platform pause whatsapp`` — stop the reconnect watcher hammering whatsapp
+            ``/platform resume whatsapp`` — re-queue a paused platform for retry
+        """
+        text = (getattr(event, "content", "") or "").strip()
+        # Strip the leading "/platform" (or "/PLATFORM") token if present
+        parts = text.split(maxsplit=2)
+        if parts and parts[0].lower().lstrip("/").startswith("platform"):
+            parts = parts[1:]
+        action = (parts[0] if parts else "list").lower()
+        target = parts[1].lower() if len(parts) > 1 else ""
+
+        # Resolve platform name (case-insensitive, value match)
+        def _resolve_platform(name: str):
+            if not name:
+                return None
+            for p in Platform.__members__.values():
+                if p.value.lower() == name:
+                    return p
+            return None
+
+        if action == "list":
+            lines = ["**Gateway platforms**"]
+            connected = sorted(p.value for p in self.adapters.keys())
+            if connected:
+                lines.append("Connected: " + ", ".join(connected))
+            else:
+                lines.append("Connected: (none)")
+            failed = getattr(self, "_failed_platforms", {}) or {}
+            if failed:
+                for p, info in failed.items():
+                    if info.get("paused"):
+                        reason = info.get("pause_reason") or "paused"
+                        lines.append(
+                            f"  · {p.value} — PAUSED ({reason}). "
+                            f"Resume with `/platform resume {p.value}`."
+                        )
+                    else:
+                        attempts = info.get("attempts", 0)
+                        lines.append(
+                            f"  · {p.value} — retrying (attempt {attempts})"
+                        )
+            else:
+                lines.append("Failed/paused: (none)")
+            return "\n".join(lines)
+
+        if action in ("pause", "resume"):
+            if not target:
+                return f"Usage: /platform {action} <name>"
+            platform = _resolve_platform(target)
+            if platform is None:
+                return f"Unknown platform: {target}"
+            failed = getattr(self, "_failed_platforms", {}) or {}
+            if action == "pause":
+                if platform not in failed:
+                    return (
+                        f"{platform.value} is not in the retry queue "
+                        f"(it's either connected or not enabled)."
+                    )
+                if failed[platform].get("paused"):
+                    return f"{platform.value} is already paused."
+                self._pause_failed_platform(platform, reason="paused via /platform pause")
+                return (
+                    f"✓ {platform.value} paused. "
+                    f"Resume with `/platform resume {platform.value}` or "
+                    f"`hermes gateway restart` to reset."
+                )
+            # action == "resume"
+            if platform not in failed:
+                return (
+                    f"{platform.value} is not in the retry queue — "
+                    f"nothing to resume."
+                )
+            if not failed[platform].get("paused"):
+                return (
+                    f"{platform.value} is already retrying — "
+                    f"no resume needed."
+                )
+            self._resume_paused_platform(platform)
+            return f"✓ {platform.value} resumed — retrying on next watcher tick."
+
+        return (
+            "Usage: /platform <list|pause|resume> [name]\n"
+            "  /platform list — show platform status\n"
+            "  /platform pause <name> — stop retrying a failing platform\n"
+            "  /platform resume <name> — re-queue a paused platform"
+        )
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""
@@ -9486,6 +9677,10 @@ class GatewayRunner:
 
         event_message_id = self._reply_anchor_for_event(event)
 
+        # Forward image/audio attachments so the background agent can see them.
+        media_urls = list(event.media_urls) if event.media_urls else []
+        media_types = list(event.media_types) if event.media_types else []
+
         # Fire-and-forget the background task
         _task = asyncio.create_task(
             self._run_background_task(
@@ -9493,6 +9688,8 @@ class GatewayRunner:
                 source,
                 task_id,
                 event_message_id=event_message_id,
+                media_urls=media_urls,
+                media_types=media_types,
             )
         )
         self._background_tasks.add(_task)
@@ -9507,9 +9704,14 @@ class GatewayRunner:
         source: "SessionSource",
         task_id: str,
         event_message_id: Optional[str] = None,
+        media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
+
+        media_urls = media_urls or []
+        media_types = media_types or []
 
         adapter = self.adapters.get(source.platform)
         if not adapter:
@@ -9546,6 +9748,23 @@ class GatewayRunner:
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
+            # Enrich the prompt with image descriptions so the background
+            # agent can see user-attached images (same as the main flow).
+            enriched_prompt = prompt
+            if media_urls:
+                image_paths = []
+                for i, path in enumerate(media_urls):
+                    mtype = media_types[i] if i < len(media_types) else ""
+                    if mtype.startswith("image/"):
+                        image_paths.append(path)
+                if image_paths:
+                    try:
+                        enriched_prompt = await self._enrich_message_with_vision(
+                            prompt, image_paths,
+                        )
+                    except Exception as e:
+                        logger.warning("Background task vision enrichment failed: %s", e)
+
             def run_sync():
                 agent = AIAgent(
                     model=turn_route["model"],
@@ -9577,7 +9796,7 @@ class GatewayRunner:
                 )
                 try:
                     return agent.run_conversation(
-                        user_message=prompt,
+                        user_message=enriched_prompt,
                         task_id=task_id,
                     )
                 finally:
@@ -15694,6 +15913,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
+    # P180/MOL-557 — H2/H3/H4 gateway-lifecycle bracket. AFTER PID claim so we
+    # only fingerprint as the single live gateway. Run in executor — verifier
+    # subprocess (~30s timeout) must not block the asyncio event loop.
+    _startup_state: dict | None = None  # consumed by the H3 shutdown leg below
+    try:
+        from tools.runtime_fingerprint import gateway_startup_hook
+        _gateway_pid = os.getpid()
+        _startup_state = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: gateway_startup_hook(gateway_pid=_gateway_pid)
+        )
+    except Exception as e:  # pragma: no cover — fail-open
+        logger.debug("[H2/H3/H4 P180/MOL-557] gateway_startup_hook failed: %s", e)
+
     # MCP tool discovery — run in an executor so the asyncio event loop
     # stays responsive even when a configured MCP server is slow or
     # unreachable.  discover_mcp_tools() uses a blocking 120s wait
@@ -15739,6 +15971,25 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop cron ticker cleanly
     cron_stop.set()
     cron_thread.join(timeout=5)
+
+    # P180/MOL-557 — H3 shutdown verifier bracket. launchd ExitTimeOut=20s, so
+    # wall-clock-bound at 15s (verifier internal timeout is 30s, but we'd rather
+    # skip the bracket than get SIGKILL'd mid-JSONL-write). Fail-open.
+    try:
+        from tools.runtime_fingerprint import gateway_shutdown_hook
+        await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                None, gateway_shutdown_hook, _startup_state
+            ),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[H3 P180/MOL-557] gateway_shutdown_hook exceeded 15s wall-clock; "
+            "skipping to honor launchd ExitTimeOut=20s"
+        )
+    except Exception as e:  # pragma: no cover — fail-open
+        logger.debug("[H3 P180/MOL-557] gateway_shutdown_hook failed: %s", e)
 
     # Close MCP server connections
     try:

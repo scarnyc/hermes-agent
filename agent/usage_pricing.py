@@ -717,10 +717,20 @@ def normalize_usage(
             )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
+    # P32 (MOL-30): Reasoning tokens live in different nested locations by API shape:
+    #   - Codex Responses API:              output_tokens_details.reasoning_tokens
+    #   - OpenAI-compat / OpenRouter:       completion_tokens_details.reasoning_tokens
+    # Checking both, first non-zero wins. Without this, Gemini/Kimi reasoning via
+    # OpenRouter silently recorded reasoning_tokens=0 even when the model was
+    # thinking (confirmed via direct curl: gemini-3 returned reasoning_tokens=476
+    # in completion_tokens_details, not output_tokens_details).
     reasoning_tokens = 0
-    output_details = getattr(response_usage, "output_tokens_details", None)
-    if output_details:
-        reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
+    for _attr in ("completion_tokens_details", "output_tokens_details"):
+        _details = getattr(response_usage, _attr, None)
+        if _details:
+            reasoning_tokens = _to_int(getattr(_details, "reasoning_tokens", 0))
+            if reasoning_tokens:
+                break
 
     return CanonicalUsage(
         input_tokens=input_tokens,

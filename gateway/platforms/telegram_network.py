@@ -100,13 +100,20 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 if not _is_retryable_connect_error(exc):
                     raise
                 if ip is None:
+                    # P11/MOL-118: surface type(exc).__name__ + "no message" fallback
                     logger.warning(
-                        "[Telegram] Primary api.telegram.org connection failed (%s); trying fallback IPs %s",
-                        exc,
+                        "[Telegram] Primary api.telegram.org connection failed (%s: %s); trying fallback IPs %s",
+                        type(exc).__name__,
+                        str(exc) or "no message",
                         ", ".join(self._fallback_ips),
                     )
                     continue
-                logger.warning("[Telegram] Fallback IP %s failed: %s", ip, exc)
+                logger.warning(
+                    "[Telegram] Fallback IP %s failed (%s: %s)",
+                    ip,
+                    type(exc).__name__,
+                    str(exc) or "no message",
+                )
                 continue
 
         if last_error is None:

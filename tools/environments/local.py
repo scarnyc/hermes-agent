@@ -81,11 +81,13 @@ def _build_provider_env_blocklist() -> frozenset:
         "OPENAI_ORGANIZATION",
         "OPENROUTER_API_KEY",
         "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",  # P144/MOL-493 review — prevents stale DS token leaking to T1
         "ANTHROPIC_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "LLM_MODEL",
         "GOOGLE_API_KEY",
         "DEEPSEEK_API_KEY",
+        "KIMI_API_KEY",  # P21/MOL-196 — prevent stale Kimi token leaking to delegate subprocesses
         "MISTRAL_API_KEY",
         "GROQ_API_KEY",
         "TOGETHER_API_KEY",
@@ -144,26 +146,46 @@ def _build_provider_env_blocklist() -> frozenset:
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+def _sanitize_subprocess_env(
+    base_env: dict | None,
+    extra_env: dict | None = None,
+    profile_passthrough: set[str] | None = None,  # P103/MOL-410
+) -> dict:
+    """Filter Hermes-managed secrets from a subprocess environment.
+
+    P103/MOL-410: ``profile_passthrough`` is a per-call set of env var names
+    that the caller's profile YAML elevated for passthrough (e.g. coding
+    profile needs ``GH_TOKEN``, ``JIRA_API_TOKEN``). Merged into the global
+    ``is_env_passthrough`` check WITHOUT mutating the global blocklist —
+    additive-only semantics.
+    """
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+
+    # P103/MOL-410: per-call passthrough predicate that combines the global
+    # is_env_passthrough with the profile's elevated set. Profile entries
+    # union with the global allowlist — they cannot remove from the
+    # blocklist (additive-only).
+    profile_set = profile_passthrough or set()
+
+    def _is_passthrough_with_profile(key: str) -> bool:
+        return key in profile_set or _is_passthrough(key)
 
     sanitized: dict[str, str] = {}
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough_with_profile(key):
             sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             sanitized[real_key] = value
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough_with_profile(key):
             sanitized[key] = value
 
     # Per-profile HOME isolation for background processes (same as _make_run_env).
@@ -232,10 +254,9 @@ def _find_bash() -> str:
 _find_shell = _find_bash
 
 
-# Standard PATH entries for environments with minimal PATH.
+# P09/MOL-120: sbin directories removed — minimize attack surface in subprocess env.
 _SANE_PATH = (
-    "/opt/homebrew/bin:/opt/homebrew/sbin:"
-    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 )
 
 
@@ -413,14 +434,15 @@ class LocalEnvironment(BaseEnvironment):
             if candidate and candidate.startswith("/"):
                 return candidate.rstrip("/") or "/"
 
-        if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK | os.X_OK):
-            return "/tmp"
+        tmpdir = tempfile.gettempdir()
+        if os.path.isdir(tmpdir) and os.access(tmpdir, os.W_OK | os.X_OK):
+            return tmpdir
 
         candidate = tempfile.gettempdir()
         if candidate.startswith("/"):
             return candidate.rstrip("/") or "/"
 
-        return "/tmp"
+        return "/tmp"  # nosec B108 — last-resort fallback after tempfile.gettempdir() exhausted
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,

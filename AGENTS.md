@@ -1,6 +1,53 @@
+<!-- THEAUDITOR:START -->
+# TheAuditor Agent System
+
+**Start every task with:** `/theauditor:start` or `aud blueprint --structure`
+
+## Quick Route
+| Intent | Slash Command |
+|--------|---------------|
+| Any task (orchestrator) | `/theauditor:start` |
+| Plan changes | `/theauditor:planning` |
+| Refactor code | `/theauditor:refactor` |
+| Security audit | `/theauditor:security` |
+| Trace dataflow | `/theauditor:dataflow` |
+| Assess impact | `/theauditor:impact` |
+
+## Command Cheat Sheet
+| Need | Command |
+|------|---------|
+| Architecture overview | `aud blueprint --structure` (ALWAYS FIRST) |
+| List symbols in file | `aud query --file X --list all` |
+| Who calls this? | `aud query --symbol X --show-callers` |
+| Validation boundaries | `aud boundaries` |
+| Dead code | `aud deadcode` |
+| Blast radius | `aud impact --symbol X` |
+| Full context | `aud explain path/to/file.py` |
+
+## The Rules
+1. **Database First** - Query before reading files
+2. **Check flags** - Run `aud <cmd> --help` before guessing
+3. **Cite evidence** - Every claim backed by query result
+4. **Autonomous** - Execute commands, don't ask permission
+
+**Full docs:** @/.auditor_venv/.theauditor_tools/agents/AGENTS.md
+**Reinstall:** `aud setup-ai --target . --sync`
+<!-- THEAUDITOR:END -->
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
+
+## Coding Principles (cross-referenced with ~/.claude/CLAUDE.md)
+
+1. **Think Before Coding** — State assumptions explicitly. Surface tradeoffs when multiple interpretations exist. Push back when a simpler approach exists. Stop and name what's unclear — don't guess.
+2. **Simplicity First** — Minimum code that solves the problem. No abstractions for single-use code. No configurability that wasn't requested. If 200 lines could be 50, rewrite.
+3. **Surgical Changes** — Touch only what's needed. Don't improve adjacent code, comments, or formatting. Match existing style. Every changed line traces to the request.
+4. **Goal-Driven Execution** — Transform tasks into verifiable goals with explicit checkpoints. Write tests for invalid inputs first, then make them pass. For multi-step tasks, state a brief plan with verification checkpoints.
+5. **Verbalized Sampling** — Consider 2-3 distinct candidate approaches before selecting one. Sample from the distribution rather than defaulting to the most typical response. Present tradeoffs with probability-weighted reasoning.
+6. **Verify Before Done** — Prove it works: tests, logs, diffs. Ask "would a staff engineer approve this?" Never mark complete without demonstrated correctness.
+7. **Demand Elegance** — For non-trivial changes, pause and ask "is there a more elegant way?" Skip for simple fixes — don't over-engineer. Challenge your own work before presenting it.
+8. **Close Eagerly** — When work lands in a merged PR, transition the ticket Done in the same chain. Consolidate overlapping tickets instead of proliferating. Don't leave cleanup for "later."
 
 ## Development Environment
 

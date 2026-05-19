@@ -254,8 +254,15 @@ class PluginContext:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
+        override: bool = False,
     ) -> None:
-        """Register a tool in the global registry **and** track it as plugin-provided."""
+        """Register a tool in the global registry **and** track it as plugin-provided.
+
+        Pass ``override=True`` to replace an existing built-in tool with the
+        same name (e.g. swap the default ``browser_navigate`` for a custom
+        CDP-backed implementation). Without it, attempting to register a name
+        already claimed by a different toolset is rejected.
+        """
         from tools.registry import registry
 
         registry.register(
@@ -268,9 +275,13 @@ class PluginContext:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            override=override,
         )
         self._manager._plugin_tool_names.add(name)
-        logger.debug("Plugin %s registered tool: %s", self.manifest.name, name)
+        logger.debug(
+            "Plugin %s registered tool: %s%s",
+            self.manifest.name, name, " (override)" if override else "",
+        )
 
     # -- message injection --------------------------------------------------
 
@@ -1203,6 +1214,30 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 
 
+# P187/MOL-641 — per-thread tool whitelist. Restricts pre-tool-call gate to
+# a caller-defined allowed set for THIS thread only. Used by the background
+# review path so a self-review pass cannot accidentally call mutating tools.
+_thread_tool_whitelist = threading.local()
+
+
+def set_thread_tool_whitelist(allowed: set, deny_msg_fmt: str) -> None:
+    """Restrict pre-tool-call gate to ``allowed`` tool names for THIS thread.
+
+    ``deny_msg_fmt`` is a ``str.format`` template with ``{tool_name}``
+    substitution that is returned as the block message when a non-allowed
+    tool is invoked on this thread.
+    """
+    _thread_tool_whitelist.allowed = set(allowed)
+    _thread_tool_whitelist.deny_msg_fmt = deny_msg_fmt
+
+
+def clear_thread_tool_whitelist() -> None:
+    """Lift the per-thread whitelist (no-op if never set)."""
+    for attr in ("allowed", "deny_msg_fmt"):
+        if hasattr(_thread_tool_whitelist, attr):
+            delattr(_thread_tool_whitelist, attr)
+
+
 def get_pre_tool_call_block_message(
     tool_name: str,
     args: Optional[Dict[str, Any]],
@@ -1221,6 +1256,14 @@ def get_pre_tool_call_block_message(
     directive wins.  Invalid or irrelevant hook return values are
     silently ignored so existing observer-only hooks are unaffected.
     """
+    # P187/MOL-641 — per-thread whitelist. When set by the background review
+    # path, denies any tool not in the allowed set before evaluating plugin
+    # hooks. Falls through to normal hook evaluation when not set.
+    allowed = getattr(_thread_tool_whitelist, "allowed", None)
+    if allowed is not None and tool_name not in allowed:
+        fmt = getattr(_thread_tool_whitelist, "deny_msg_fmt", "Tool {tool_name} denied")
+        return fmt.format(tool_name=tool_name)
+
     hook_results = invoke_hook(
         "pre_tool_call",
         tool_name=tool_name,

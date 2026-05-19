@@ -21,12 +21,14 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
+    AmbiguousJobReference,
     create_job,
     get_job,
     list_jobs,
     parse_schedule,
     pause_job,
     remove_job,
+    resolve_job_ref,
     resume_job,
     trigger_job,
     update_job,
@@ -276,9 +278,19 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    skip_reflection: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
-    """Unified cron job management tool."""
+    """Unified cron job management tool.
+
+    P58/MOL-268: ``skip_reflection`` opts a job OUT of the reviewer-driven
+    retry loop in cron/scheduler.py. Use it for non-claim-producing jobs
+    (bare reminders / FYI / briefings) where the reviewer's EVIDENCE check
+    would never find anything to flag and the extra reviewer turn just burns
+    budget. Default ``None`` = inherit job's stored value, which defaults to
+    False (reviewer ENABLED). Tracked here as well as via ``hermes cron edit
+    --skip-reflection`` so MCP / tool callers have the same opt-out.
+    """
     del task_id  # unused but kept for handler signature compatibility
 
     try:
@@ -368,12 +380,32 @@ def cronjob(
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
 
-        job = get_job(job_id)
-        if not job:
+        try:
+            job = resolve_job_ref(job_id)
+        except AmbiguousJobReference as exc:
             return json.dumps(
-                {"success": False, "error": f"Job with ID '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
+                {
+                    "success": False,
+                    "error": str(exc),
+                    "matches": [
+                        {
+                            "id": m["id"],
+                            "name": m.get("name"),
+                            "schedule": m.get("schedule_display"),
+                            "next_run_at": m.get("next_run_at"),
+                        }
+                        for m in exc.matches
+                    ],
+                },
                 indent=2,
             )
+        if not job:
+            return json.dumps(
+                {"success": False, "error": f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
+                indent=2,
+            )
+        # Resolve to canonical ID (supports name-based lookup)
+        job_id = job["id"]
 
         if normalized == "remove":
             removed = remove_job(job_id)
@@ -470,6 +502,12 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if skip_reflection is not None:
+                # P58/MOL-268: opt the job in/out of the reviewer-driven retry
+                # loop in cron/scheduler.py::run_job. Stored as a plain bool so
+                # the scheduler can read it with ``bool(job.get("skip_reflection"))``
+                # without needing a 3-state nullable.
+                updates["skip_reflection"] = bool(skip_reflection)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -609,6 +647,17 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "skip_reflection": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "P58/MOL-268: opt the job OUT of the reviewer-driven retry loop. "
+                    "Default False (reviewer enabled). Set True for jobs whose final "
+                    "response is a non-claim payload — bare reminders, FYI / briefing "
+                    "messages, raw data dumps — where the EVIDENCE-checker has nothing "
+                    "to flag and the extra reviewer turn is pure budget burn."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -657,6 +706,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        skip_reflection=args.get("skip_reflection"),  # P58/MOL-268
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

@@ -322,7 +322,8 @@ from tools.approval import (
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback())
+                                  approval_callback=_get_approval_callback(),
+                                  caller="terminal_tool")
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -1128,6 +1129,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     volumes = cc.get("docker_volumes", [])
     docker_forward_env = cc.get("docker_forward_env", [])
     docker_env = cc.get("docker_env", {})
+    expiry_seconds = cc.get("container_expiry_seconds", 7200)
+    max_concurrent = cc.get("max_concurrent_containers", 2)
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1143,6 +1146,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             forward_env=docker_forward_env,
             env=docker_env,
             run_as_host_user=cc.get("docker_run_as_host_user", False),
+            expiry_seconds=expiry_seconds,
+            max_concurrent_containers=max_concurrent,
         )
     
     elif env_type == "singularity":
@@ -1539,9 +1544,29 @@ def _command_requires_pipe_stdin(command: str) -> bool:
     )
 
 
-_SHELL_LEVEL_BACKGROUND_RE = re.compile(r"\b(?:nohup|disown|setsid)\b", re.IGNORECASE)
+_SHELL_LEVEL_BACKGROUND_RE = re.compile(
+    r"(?:^|[;&|]\s*|&&\s*|\|\|\s*|\$\(\s*)(?:nohup|disown|setsid)\b", re.IGNORECASE | re.MULTILINE
+)
 _INLINE_BACKGROUND_AMP_RE = re.compile(r"\s&\s")
 _TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
+
+
+def _strip_quotes(command: str) -> str:
+    """Remove single- and double-quoted content so regex checks don't match inside strings.
+
+    This prevents false positives when keywords like 'nohup' or 'setsid' appear
+    in commit messages, Python -c code, echo arguments, or PR body text.
+    Also strips backtick-quoted content and heredoc-style inline text.
+    """
+    # Remove single-quoted strings (no escaping inside single quotes in shell)
+    result = re.sub(r"'[^']*'", "''", command)
+    # Remove double-quoted strings (handle escaped quotes)
+    result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
+    # Remove backtick-quoted strings
+    result = re.sub(r"`[^`]*`", "``", result)
+    return result
+
+
 _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b", re.IGNORECASE),
     re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE),
@@ -1574,21 +1599,25 @@ def _foreground_background_guidance(command: str) -> str | None:
     if _looks_like_help_or_version_command(command):
         return None
 
-    if _SHELL_LEVEL_BACKGROUND_RE.search(command):
+    # Strip quoted content so keywords inside strings/arguments don't trigger
+    # false positives (e.g., git commit -m "... setsid ...", python3 -c "os.setsid").
+    unquoted = _strip_quotes(command)
+
+    if _SHELL_LEVEL_BACKGROUND_RE.search(unquoted):
         return (
             "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
             "Use terminal(background=true) so Hermes can track the process, then run "
             "readiness checks and tests in separate commands."
         )
 
-    if _INLINE_BACKGROUND_AMP_RE.search(command) or _TRAILING_BACKGROUND_AMP_RE.search(command):
+    if _INLINE_BACKGROUND_AMP_RE.search(unquoted) or _TRAILING_BACKGROUND_AMP_RE.search(unquoted):
         return (
             "Foreground command uses '&' backgrounding. Use terminal(background=true) for long-lived "
             "processes, then run health checks and tests in follow-up terminal calls."
         )
 
     for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
-        if pattern.search(command):
+        if pattern.search(unquoted):
             return (
                 "This foreground command appears to start a long-lived server/watch process. "
                 "Run it with background=true, verify readiness (health endpoint/log signal), "
@@ -1787,10 +1816,13 @@ def terminal_tool(
                                 "modal_mode": config.get("modal_mode", "auto"),
                                 "vercel_runtime": config.get("vercel_runtime", ""),
                                 "docker_volumes": config.get("docker_volumes", []),
-                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                                 "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_env": config.get("docker_env", {}),
+                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                                "docker_forward_env": config.get("docker_forward_env", []),
                                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+                                "container_expiry_seconds": config.get("container_expiry_seconds", 7200),
+                                "max_concurrent_containers": config.get("max_concurrent_containers", 2),
                             }
 
                         local_config = None

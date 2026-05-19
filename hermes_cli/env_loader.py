@@ -165,7 +165,9 @@ def load_hermes_dotenv(
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
+        # P04/MOL-118: override=False — only fill MISSING env vars from .env
+        # Prevents stale .env values from clobbering envchain-injected secrets.
+        _load_dotenv_with_fallback(user_env, override=False)
         loaded.append(user_env)
 
     if project_env_path and project_env_path.exists():

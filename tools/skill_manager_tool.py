@@ -337,16 +337,27 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
     Atomically write text content to a file.
-    
+
     Uses a temporary file in the same directory and os.replace() to ensure
     the target file is never left in a partially-written state if the process
     crashes or is interrupted.
-    
+
     Args:
         file_path: Target file path
         content: Content to write
         encoding: Text encoding (default: utf-8)
     """
+    # P180/MOL-557 — H1 guard only the tracked SKILL.md surface (CC-side fingerprint scope); supporting docs bypass.
+    is_tracked_skill_md = file_path.name == "SKILL.md"
+    if is_tracked_skill_md:
+        try:
+            from tools.runtime_fingerprint import h1_pre_write_guard
+            outcome = h1_pre_write_guard(file_path, caller="_atomic_write_text")
+            if outcome == "abort":
+                return
+        except ImportError:
+            pass
+
     file_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
         dir=str(file_path.parent),
@@ -364,6 +375,13 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         except OSError:
             logger.error("Failed to remove temporary file %s during atomic write", temp_path, exc_info=True)
         raise
+    # P180/MOL-557 — H1 post-write hash record (only for tracked SKILL.md).
+    if is_tracked_skill_md:
+        try:
+            from tools.runtime_fingerprint import h1_record_post_write
+            h1_record_post_write(file_path)
+        except ImportError:
+            pass
 
 
 # =============================================================================

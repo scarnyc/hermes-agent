@@ -128,6 +128,25 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+# P58/MOL-268: retry-feedback prompt for the reviewer-driven retry loop.
+# When the semantic reviewer (tools.reflection_agent.reflect_and_annotate)
+# flags fabricated EVIDENCE / fabricated checkmark lists in the agent's
+# response, this prompt tells the agent to REVISE — not defend — the
+# offending claims. Anti-fabrication wording is load-bearing: tells the
+# agent to DELETE the unsubstantiated claim rather than invent supporting
+# detail, and explicitly forbids fabricating checkmark lists / status
+# banners / summaries for work that was not performed. {concerns_block} is
+# filled in by the retry-loop call site below.
+_RETRY_FEEDBACK_PROMPT = (
+    "The reviewer flagged concerns with your previous response. "
+    "If a concern says you claimed an action you did not perform, "
+    "DELETE the unsubstantiated claim from the response — do not "
+    "invent supporting details. Never fabricate checkmark lists, "
+    "status banners, or summaries for work you did not do. "
+    "Re-emit the response with the offending claims removed.\n\n"
+    "Concerns:\n{concerns_block}"
+)
+
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
 
@@ -1009,12 +1028,19 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict) -> str:
     return assembled
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
     """
     Execute a single cron job.
-    
+
     Returns:
-        Tuple of (success, full_output_doc, final_response, error_message)
+        Tuple of (success, full_output_doc, final_response, error_message,
+        review_banner).
+
+    P65/MOL-271: ``review_banner`` carries reviewer concerns out-of-band so
+    _process_job can PREPEND it to the delivered payload without leaking
+    into ``final_response`` (which session_search and downstream tools
+    consume — see reviewer_feedback_contagion memory). Empty string when
+    the reviewer found no concerns / reflection was skipped.
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
@@ -1042,7 +1068,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         if not script_path:
             err = "no_agent=True but no script is set for this job"
             logger.error("Job '%s': %s", job_id, err)
-            return False, "", "", err
+            return False, "", "", err, ""
 
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is just the subprocess cwd (not an
@@ -1084,7 +1110,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Status:** script failed\n\n"
                 f"{output}\n"
             )
-            return False, doc, alert, output
+            return False, doc, alert, output, ""
 
         # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
         # means "nothing to report this tick", same as empty stdout.
@@ -1099,7 +1125,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (wakeAgent=false)\n"
             )
-            return True, silent_doc, SILENT_MARKER, None
+            return True, silent_doc, SILENT_MARKER, None, ""
 
         if not output.strip():
             logger.info("Job '%s' (no_agent): empty stdout — silent run", job_id)
@@ -1110,7 +1136,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (empty output)\n"
             )
-            return True, silent_doc, SILENT_MARKER, None
+            return True, silent_doc, SILENT_MARKER, None, ""
 
         doc = (
             f"# Cron Job: {job_name}\n\n"
@@ -1120,7 +1146,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             f"---\n\n"
             f"{output}\n"
         )
-        return True, doc, output, None
+        return True, doc, output, None, ""
 
     # ---------------------------------------------------------------
     # Default (LLM) path — import and construct the agent machinery now
@@ -1159,7 +1185,27 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
-            return True, silent_doc, SILENT_MARKER, None
+            return True, silent_doc, SILENT_MARKER, None, ""
+
+    # P63/MOL-268 Phase 2: script-only memory consolidation.
+    # When ``job.get("script_only") is True`` the prerun script does the
+    # work entirely and we skip the agent invocation. final_response is ""
+    # so _deliver_result short-circuits (no chat delivery for memory
+    # ingestion crons). Keeps run_session_consolidation() out of the cost
+    # budget while still surfacing script success/failure via last_status.
+    if job.get("script_only") is True:
+        _sc_ok, _sc_out = prerun_script if prerun_script else (False, "no script configured")
+        sc_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Schedule:** {job.get('schedule_display', 'N/A')}\n"
+            f"**Mode:** script-only (P63/MOL-268)\n\n"
+            f"## Script Output\n\n```\n{_sc_out}\n```\n"
+        )
+        if _sc_ok:
+            return True, sc_doc, "", None, ""
+        return False, sc_doc, "", f"script-only job failed: {_sc_out[:300]}", ""
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
@@ -1185,17 +1231,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             "and the match is a false positive, rephrase the content to avoid "
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
-        return False, blocked_doc, "", str(block_exc)
+        return False, blocked_doc, "", str(block_exc), ""
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
-        return True, "", SILENT_MARKER, None
+        return True, "", SILENT_MARKER, None, ""
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
-    agent = None
+    agent = None  # P06/MOL-141: defined before try so finally block can reach it
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -1269,9 +1315,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
         try:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="utf-8")
+            # P06/MOL-118: override=False — only fill MISSING env vars from .env
+            load_dotenv(str(_get_hermes_home() / ".env"), override=False, encoding="utf-8")
         except UnicodeDecodeError:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
+            load_dotenv(str(_get_hermes_home() / ".env"), override=False, encoding="latin-1")
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -1334,8 +1381,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations.
+        # P60/MOL-268: cron defaults lower (40) than interactive (150/90).
+        # ``max_turns_cron`` lets operators dial cron headroom independently
+        # of interactive `max_turns`; cron jobs that drift past 40 turns are
+        # almost always stuck in a loop and should fail loud, not burn budget.
+        max_iterations = (
+            _cfg.get("agent", {}).get("max_turns_cron")
+            or _cfg.get("max_turns_cron")
+            or _cfg.get("agent", {}).get("max_turns")
+            or _cfg.get("max_turns")
+            or 40
+        )
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
@@ -1440,7 +1497,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=["cronjob", "messaging", "clarify"],
+            # P06/MOL-141: disable builtin memory toolset for cron (tiered-memory via skip_memory)
+            disabled_toolsets=["cronjob", "messaging", "clarify", "memory"],
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -1448,7 +1506,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_memory=job.get("skip_memory", True),  # Per-job override; default True — cron system prompts would corrupt user representations
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
@@ -1567,10 +1625,98 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
+
+        # P58/MOL-268 + P59/MOL-268 + P65/MOL-271: reviewer-driven retry loop.
+        #
+        # Plumb the reviewer banner OUT of run_job via the 5th tuple slot
+        # (``_review_banner``) so _process_job can prepend it to the
+        # delivered Telegram/CLI payload without contaminating
+        # ``final_response`` (which is what session_search and downstream
+        # tools see — see MOL-271 / reviewer_feedback_contagion memory).
+        #
+        # Fail-OPEN reviewer: if reflect_and_annotate raises or the
+        # composer is unavailable, we proceed with the original response
+        # and skip the retry. The fail-CLOSED counterpart is the
+        # ``reflect_on_output`` tool surface (P64/MOL-259) which agents
+        # call explicitly.
+        #
+        # P59 guard: if the prior agent run hit the cost-cap circuit
+        # breaker (``end_reason == "cost_cap_exceeded"``), do NOT retry —
+        # the retry would just re-trip the same cap and burn another
+        # round-trip on a doomed run.
+        _review_banner = ""
+        _prior_cost_capped = result.get("end_reason") == "cost_cap_exceeded"
+        _skip_reflection = bool(job.get("skip_reflection"))
+        if (
+            final_response
+            and not _skip_reflection
+            and not _prior_cost_capped
+        ):
+            try:
+                from tools.reflection_agent import (
+                    reflect_and_annotate,
+                    ReviewStatus,
+                )
+                _max_retries = int(
+                    _cfg.get("agent", {}).get("max_reflection_retries", 1)
+                )
+                _retry_n = 0
+                while _retry_n < _max_retries and final_response:
+                    _concerns, _status, _banner = reflect_and_annotate(
+                        prompt=prompt,
+                        response=final_response,
+                    )
+                    if _banner:
+                        _review_banner = _banner
+                    if _status != ReviewStatus.CONCERNS or not _concerns:
+                        break
+                    # P59 inline guard: a retry that would push the next
+                    # iteration over the cost cap is pointless — bail.
+                    if getattr(agent, "_cost_cap_triggered", False):
+                        logger.warning(
+                            "Job '%s': cost-cap tripped mid-reflection — skipping retry",
+                            job_id,
+                        )
+                        break
+                    _concerns_block = "\n".join(
+                        f"- {c.message}" if hasattr(c, "message") else f"- {c!r}"
+                        for c in _concerns
+                    )
+                    _retry_prompt = _RETRY_FEEDBACK_PROMPT.format(
+                        concerns_block=_concerns_block
+                    )
+                    logger.info(
+                        "Job '%s': reviewer flagged %d concern(s); retry %d/%d",
+                        job_name, len(_concerns), _retry_n + 1, _max_retries,
+                    )
+                    try:
+                        _retry_result = agent.run_conversation(_retry_prompt)
+                    except Exception as e:
+                        logger.warning(
+                            "Job '%s': retry invocation failed (%s); keeping prior response",
+                            job_id, e,
+                        )
+                        break
+                    if isinstance(_retry_result, dict):
+                        _new_resp = (_retry_result.get("final_response") or "").strip()
+                        if _new_resp and _new_resp != "(No response generated)":
+                            final_response = _new_resp
+                        if _retry_result.get("end_reason") == "cost_cap_exceeded":
+                            # Same as _prior_cost_capped — stop retrying.
+                            break
+                    _retry_n += 1
+            except Exception as e:
+                # Fail-OPEN: reviewer errors must not block delivery of
+                # the agent's actual work. Swallow + log + carry on.
+                logger.warning(
+                    "Job '%s': reviewer fail-open (%s: %s)",
+                    job_id, type(e).__name__, str(e)[:200],
+                )
+
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
@@ -1587,7 +1733,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        return True, output, final_response, None, _review_banner
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
@@ -1609,7 +1755,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {error_msg}
 ```
 """
-        return False, output, "", error_msg
+        return False, output, "", error_msg, ""
 
     finally:
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
@@ -1633,6 +1779,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+        # P06/MOL-141: shut down memory provider to close SQLite connections.
+        if agent is not None:
+            try:
+                agent.shutdown_memory_provider()
+            except Exception:
+                pass
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -1730,7 +1882,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
-                success, output, final_response, error = run_job(job)
+                # P65/MOL-271: run_job now returns a 5-tuple; the 5th slot
+                # carries the reviewer banner OUT-OF-BAND so we can PREPEND it
+                # to the delivered payload without contaminating
+                # ``final_response`` — that field flows through to state.db's
+                # ``messages`` table, where prior incidents (2026-04-23 $60
+                # bill, reviewer_feedback_contagion memory) showed banner text
+                # gets re-fed to the agent on the next session_search hit and
+                # amplifies into a 151-turn thrash.
+                success, output, final_response, error, _review_banner = run_job(job)
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -1739,7 +1899,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                deliver_content = (
+                    f"{_review_banner}\n\n{final_response}"
+                    if success and _review_banner
+                    else (final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}")
+                )
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)

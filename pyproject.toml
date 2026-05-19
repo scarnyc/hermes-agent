@@ -48,6 +48,9 @@ dependencies = [
   # (which is a silent killer on Windows — see CONTRIBUTING.md) and
   # `os.killpg` (which doesn't exist on Windows).
   "psutil>=5.9.0,<8",
+  # Tiered memory embedder (P168/MOL-546 — in-process via fastembed; was Ollama HTTP)
+  "fastembed>=0.4,<1",
+  "onnxruntime>=1.17,<2",  # transitive of fastembed; pin explicitly so a fastembed bump can't silently drop it
 ]
 
 [project.optional-dependencies]

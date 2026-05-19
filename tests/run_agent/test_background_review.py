@@ -15,6 +15,7 @@ def _bare_agent() -> AIAgent:
     agent.api_key = ""
     agent.api_mode = ""
     agent.session_id = "test-session"
+    agent.session_start = "2026-05-19T00:00:00Z"
     agent._parent_session_id = ""
     agent._credential_pool = None
     agent._memory_store = object()
@@ -26,6 +27,17 @@ def _bare_agent() -> AIAgent:
     agent.background_review_callback = None
     agent.status_callback = None
     agent._safe_print = lambda *_args, **_kwargs: None
+    # MOL-597: upstream's agent/background_review.py references these on the
+    # parent agent. _current_main_runtime() inherits live HTTP creds onto the
+    # fork; _cached_system_prompt pins the prefix-cache key; _emit_auxiliary_failure
+    # absorbs background-thread exceptions.
+    agent._current_main_runtime = lambda: {
+        "base_url": "",
+        "api_key": "",
+        "api_mode": "",
+    }
+    agent._cached_system_prompt = None
+    agent._emit_auxiliary_failure = lambda *_a, **_k: None
     return agent
 
 

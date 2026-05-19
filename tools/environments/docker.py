@@ -1,8 +1,8 @@
 """Docker execution environment for sandboxed command execution.
 
-Security hardened (cap-drop ALL, no-new-privileges, PID limits),
-configurable resource limits (CPU, memory, disk), and optional filesystem
-persistence via bind mounts.
+Security hardened (cap-drop ALL, no-new-privileges, PID limits, read-only
+rootfs), configurable resource limits (CPU, memory, disk), and optional
+filesystem persistence via bind mounts.
 """
 
 import logging
@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from typing import Optional
 
@@ -94,7 +95,8 @@ def _load_hermes_env_vars() -> dict[str, str]:
         from hermes_cli.config import load_env
 
         return load_env() or {}
-    except Exception:
+    except Exception as exc:
+        logger.debug("Could not load hermes env vars: %s", exc)
         return {}
 
 
@@ -143,6 +145,234 @@ def find_docker() -> Optional[str]:
     return None
 
 
+def _cleanup_stale_hermes_containers(docker_exe: str, expiry_seconds: int = 7200) -> int:
+    """Remove stale hermes-* containers before starting a new one.
+
+    Removes ``exited`` and ``dead`` containers unconditionally.
+    Removes ``created`` containers only if older than 60 seconds to avoid
+    racing with a concurrent session that is mid-launch (docker run -d
+    briefly puts the container in ``created`` before transitioning to
+    ``running``).
+
+    Returns the number of containers removed.
+    """
+    from datetime import datetime
+    removed = 0
+    try:
+        # Clean exited and dead containers unconditionally
+        for status in ("exited", "dead"):
+            result = subprocess.run(
+                [docker_exe, "ps", "-aq", "--filter", "name=hermes-",
+                 "--filter", f"status={status}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "docker ps failed for status=%s (exit %d) — skipping",
+                    status, result.returncode,
+                )
+                continue
+            for cid in result.stdout.strip().split():
+                if not cid:
+                    continue
+                rm = subprocess.run(
+                    [docker_exe, "rm", "-f", cid],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if rm.returncode == 0:
+                    removed += 1
+                else:
+                    logger.warning(
+                        "Failed to remove %s container %s (exit %d): %s",
+                        status, cid, rm.returncode, rm.stderr.strip(),
+                    )
+
+        # Clean created containers only if older than 60s (age gate)
+        result = subprocess.run(
+            [docker_exe, "ps", "-aq", "--filter", "name=hermes-",
+             "--filter", "status=created"],
+            capture_output=True, text=True, timeout=10,
+        )
+        now = time.time()
+        created_ids = []
+        if result.returncode != 0:
+            logger.warning(
+                "docker ps failed for status=created (exit %d) — skipping",
+                result.returncode,
+            )
+        else:
+            created_ids = result.stdout.strip().split()
+        for cid in created_ids:
+            if not cid:
+                continue
+            inspect = subprocess.run(
+                [docker_exe, "inspect", "--format", "{{.Created}}", cid],
+                capture_output=True, text=True, timeout=10,
+            )
+            created_str = inspect.stdout.strip()
+            try:
+                # Docker timestamps: 2026-04-08T07:02:32.123456789Z
+                # Truncate nanoseconds to microseconds for Python parsing
+                if "." in created_str:
+                    parts = created_str.split(".")
+                    frac = parts[1].rstrip("Z")[:6]
+                    created_str = f"{parts[0]}.{frac}+00:00"
+                else:
+                    created_str = created_str.rstrip("Z") + "+00:00"
+                created_dt = datetime.fromisoformat(created_str)
+                age_seconds = now - created_dt.timestamp()
+                if age_seconds < 60:
+                    continue  # Too young — may be a concurrent launch
+            except (ValueError, OSError):
+                continue  # Can't parse age — leave it alone
+            rm = subprocess.run(
+                [docker_exe, "rm", "-f", cid],
+                capture_output=True, text=True, timeout=10,
+            )
+            if rm.returncode == 0:
+                removed += 1
+            else:
+                logger.warning(
+                    "Failed to remove created container %s (exit %d): %s",
+                    cid, rm.returncode, rm.stderr.strip(),
+                )
+
+        # Kill orphaned running containers past their expiry (MOL-147).
+        # Catches the case where a session crashed without calling cleanup().
+        result = subprocess.run(
+            [docker_exe, "ps", "-q", "--filter", "name=hermes-",
+             "--filter", "status=running"],
+            capture_output=True, text=True, timeout=10,
+        )
+        running_ids = []
+        if result.returncode != 0:
+            logger.warning(
+                "docker ps failed for status=running (exit %d) — skipping orphan check",
+                result.returncode,
+            )
+        else:
+            running_ids = result.stdout.strip().split()
+        for cid in running_ids:
+            if not cid:
+                continue
+            inspect = subprocess.run(
+                [docker_exe, "inspect", "--format", "{{.Created}}", cid],
+                capture_output=True, text=True, timeout=10,
+            )
+            created_str = inspect.stdout.strip()
+            try:
+                if "." in created_str:
+                    parts = created_str.split(".")
+                    frac = parts[1].rstrip("Z")[:6]
+                    created_str = f"{parts[0]}.{frac}+00:00"
+                else:
+                    created_str = created_str.rstrip("Z") + "+00:00"
+                created_dt = datetime.fromisoformat(created_str)
+                age_seconds = now - created_dt.timestamp()
+                if age_seconds <= expiry_seconds:
+                    continue  # Still within its legitimate lifetime
+            except (ValueError, OSError) as exc:
+                logger.warning(
+                    "Could not parse creation time for running container %s "
+                    "(raw=%r): %s — skipping orphan check",
+                    cid, inspect.stdout.strip(), exc,
+                )
+                continue
+            logger.info(
+                "Stopping orphaned running container %s (age %.0fs > expiry %ds)",
+                cid, age_seconds, expiry_seconds,
+            )
+            try:
+                stop = subprocess.run(
+                    [docker_exe, "stop", "-t", "10", cid],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if stop.returncode == 0:
+                    rm = subprocess.run(
+                        [docker_exe, "rm", "-f", cid],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if rm.returncode != 0:
+                        logger.warning(
+                            "Container %s stopped but removal failed (exit %d): %s",
+                            cid, rm.returncode, rm.stderr.strip(),
+                        )
+                    removed += 1
+                else:
+                    logger.warning(
+                        "Failed to stop orphaned container %s (exit %d): %s",
+                        cid, stop.returncode, stop.stderr.strip(),
+                    )
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "Timed out stopping orphaned container %s — skipping", cid,
+                )
+
+        if removed:
+            logger.info("Cleaned up %d stale hermes container(s)", removed)
+    except subprocess.TimeoutExpired as exc:
+        logger.warning("Docker command timed out during stale container cleanup: %s", exc)
+    except subprocess.SubprocessError as exc:
+        logger.warning("Docker subprocess error during stale container cleanup: %s", exc)
+    except Exception as exc:
+        logger.error("Unexpected error cleaning stale containers: %s", exc, exc_info=True)
+    return removed
+
+
+def _count_running_hermes_containers(docker_exe: str) -> int:
+    """Count currently running hermes-* containers."""
+    try:
+        result = subprocess.run(
+            [docker_exe, "ps", "-q", "--filter", "name=hermes-",
+             "--filter", "status=running"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "docker ps failed (exit %d): %s — assuming 0 running containers",
+                result.returncode, result.stderr.strip(),
+            )
+            return 0
+        return len([c for c in result.stdout.strip().split() if c])
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as exc:
+        logger.warning("Failed to count running hermes containers: %s", exc)
+        return 0  # Fail open — don't block on transient Docker errors
+
+
+def _log_docker_diagnostics(docker_exe: str, stderr: str, context: str) -> None:
+    """Log Docker state for debugging exit 125 failures."""
+    logger.error("Docker container startup failed (%s). stderr: %s", context, stderr)
+    try:
+        ps_result = subprocess.run(
+            [docker_exe, "ps", "-a", "--filter", "name=hermes-",
+             "--format", "{{.Names}}\t{{.Status}}\t{{.Size}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        logger.error("Docker hermes containers:\n%s",
+                      ps_result.stdout.strip() or "(none)")
+        info_result = subprocess.run(
+            [docker_exe, "system", "df", "--format",
+             "{{.Type}}\t{{.TotalCount}}\t{{.Size}}\t{{.Reclaimable}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        logger.error("Docker system df:\n%s", info_result.stdout.strip())
+    except Exception as exc:
+        logger.warning("Could not collect Docker diagnostics: %s", exc)
+
+
+def _docker_daemon_healthy(docker_exe: str) -> bool:
+    """Quick check that the Docker daemon is responsive."""
+    try:
+        result = subprocess.run(
+            [docker_exe, "info"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception as exc:
+        logger.debug("Docker daemon health check failed: %s", exc)
+        return False
+
+
 # Security flags applied to every container.
 # The container itself is the security boundary (isolated from host).
 # We drop all capabilities then add back the minimum needed:
@@ -154,7 +384,8 @@ def find_docker() -> Optional[str]:
 #       the drop, so the security posture is preserved. Omitted entirely
 #       when the container starts as a non-root user via --user, since
 #       no gosu drop is needed in that mode.
-# Block privilege escalation and limit PIDs.
+# Block privilege escalation, limit PIDs, and make root FS read-only.
+# Bind mounts and tmpfs remain writable; only the container image layer is immutable.
 # /tmp is size-limited and nosuid but allows exec (needed by pip/npm builds).
 _BASE_SECURITY_ARGS = [
     "--cap-drop", "ALL",
@@ -163,6 +394,7 @@ _BASE_SECURITY_ARGS = [
     "--cap-add", "FOWNER",
     "--security-opt", "no-new-privileges",
     "--pids-limit", "256",
+    "--read-only",
     "--tmpfs", "/tmp:rw,nosuid,size=512m",
     "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",
     "--tmpfs", "/run:rw,noexec,nosuid,size=64m",
@@ -275,9 +507,10 @@ class DockerEnvironment(BaseEnvironment):
     """Hardened Docker container execution with resource limits and persistence.
 
     Security: all capabilities dropped, no privilege escalation, PID limits,
-    size-limited tmpfs for scratch dirs. The container itself is the security
-    boundary — the filesystem inside is writable so agents can install packages
-    (pip, npm, apt) as needed. Writable workspace via tmpfs or bind mounts.
+    read-only root filesystem, size-limited tmpfs for scratch dirs. Bind mounts
+    (/root, /workspace) and tmpfs (/tmp, /var/tmp, /run) remain writable.
+    System package installation (apt, pip system-wide, npm -g) is blocked by
+    read-only root FS — use the pre-built image.
 
     Persistence: when enabled, bind mounts preserve /workspace and /root
     across container restarts.
@@ -300,6 +533,8 @@ class DockerEnvironment(BaseEnvironment):
         host_cwd: str = None,
         auto_mount_cwd: bool = False,
         run_as_host_user: bool = False,
+        expiry_seconds: int = 7200,
+        max_concurrent_containers: int = 2,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -309,6 +544,8 @@ class DockerEnvironment(BaseEnvironment):
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
         self._container_id: Optional[str] = None
+        self._expiry_seconds = max(expiry_seconds, 60)  # Floor: 60s minimum
+        self._max_concurrent = max_concurrent_containers
         logger.info(f"DockerEnvironment volumes: {volumes}")
         # Ensure volumes is a list (config.yaml could be malformed)
         if volumes is not None and not isinstance(volumes, list):
@@ -374,6 +611,72 @@ class DockerEnvironment(BaseEnvironment):
             sandbox = get_sandbox_dir() / "docker" / task_id
             self._home_dir = str(sandbox / "home")
             os.makedirs(self._home_dir, exist_ok=True)
+
+            # Pre-populate files that would need nested mounts under /root.
+            # VirtioFS on macOS can't create mountpoints inside a VirtioFS-backed
+            # bind mount (runc "outside of rootfs" error, MOL-139). Copy sources
+            # into the persistent home dir instead so Docker sees one bind mount.
+            # NOTE: gws volume was read-write — token_cache.json writes go to
+            # persistent home, not back to host ~/.config/gws/. If host re-auths,
+            # container has stale creds until restart (token_cache is regenerable).
+            remaining_volumes = []
+            for vol in (volumes or []):
+                if not isinstance(vol, str) or ":" not in vol.strip():
+                    remaining_volumes.append(vol)
+                    continue
+                parts = vol.strip().split(":")
+                source = parts[0]
+                container_path = parts[1]
+                if container_path.startswith("/root/"):
+                    relative = container_path[len("/root/"):]
+                    dest = os.path.join(self._home_dir, relative)
+                    try:
+                        if os.path.isdir(source):
+                            os.makedirs(dest, exist_ok=True)
+                            for item in os.listdir(source):
+                                s = os.path.join(source, item)
+                                d = os.path.join(dest, item)
+                                if os.path.isdir(s):
+                                    shutil.copytree(s, d, dirs_exist_ok=True)
+                                else:
+                                    shutil.copy2(s, d)
+                        elif os.path.isfile(source):
+                            os.makedirs(os.path.dirname(dest), exist_ok=True)
+                            shutil.copy2(source, dest)
+                        else:
+                            logger.warning(
+                                "Docker: volume source %s not found, "
+                                "skipping pre-populate", source,
+                            )
+                            remaining_volumes.append(vol)
+                            continue
+                        logger.info(
+                            "Docker: pre-populated %s into persistent home "
+                            "(avoids nested VirtioFS mount)", container_path,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Docker: failed to pre-populate %s: %s, "
+                            "falling back to volume mount",
+                            container_path, exc,
+                        )
+                        remaining_volumes.append(vol)
+                else:
+                    remaining_volumes.append(vol)
+            volumes = remaining_volumes
+
+            # Rebuild volume_args from filtered list — the original was built
+            # before pre-populate removed /root/ entries. Without this, Docker
+            # still receives the nested -v flags (which happen to work because
+            # the mountpoint files now exist, but are redundant and fragile).
+            volume_args = []
+            for vol in remaining_volumes:
+                vol_s = vol.strip() if isinstance(vol, str) else ""
+                if vol_s and ":" in vol_s:
+                    volume_args.extend(["-v", vol_s])
+                    if ":/workspace" in vol_s:
+                        workspace_explicitly_mounted = True
+
             writable_args.extend([
                 "-v", f"{self._home_dir}:/root",
             ])
@@ -447,7 +750,7 @@ class DockerEnvironment(BaseEnvironment):
                     cache_mount["container_path"],
                 )
         except Exception as e:
-            logger.debug("Docker: could not load credential file mounts: %s", e)
+            logger.warning("Docker: could not load credential/skill/cache mounts: %s", e)
 
         # Explicit environment variables (docker_env config) — set at container
         # creation so they're available to all processes (including entrypoint).
@@ -490,6 +793,25 @@ class DockerEnvironment(BaseEnvironment):
         # /usr/local/bin is not in PATH (common on macOS gateway/service).
         self._docker_exe = find_docker() or "docker"
 
+        # Clean stale hermes containers (including orphaned running ones past
+        # expiry) before attempting docker run. Prevents accumulation of dead
+        # containers and reclaims slots from crashed sessions (MOL-139, MOL-147).
+        _cleanup_stale_hermes_containers(self._docker_exe, self._expiry_seconds)
+
+        # Guard: refuse to start if max concurrent containers reached (MOL-147).
+        # Note: TOCTOU race between count and docker run — another session could
+        # start a container between our check and our run. This is a soft guard;
+        # one extra container briefly is acceptable on the 7.65 GiB Docker VM.
+        if self._max_concurrent > 0:
+            running = _count_running_hermes_containers(self._docker_exe)
+            if running >= self._max_concurrent:
+                raise RuntimeError(
+                    f"Max concurrent hermes containers reached "
+                    f"({running}/{self._max_concurrent}). "
+                    f"Stop an existing container or increase "
+                    f"terminal.max_concurrent_containers in config.yaml."
+                )
+
         # Start the container directly via `docker run -d`.
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
         run_cmd = [
@@ -507,8 +829,66 @@ class DockerEnvironment(BaseEnvironment):
             capture_output=True,
             text=True,
             timeout=120,  # image pull may take a while
-            check=True,
         )
+
+        if result.returncode == 125:
+            # Docker daemon error — transient resource/state issue.
+            _log_docker_diagnostics(
+                self._docker_exe, result.stderr.strip(), "first attempt")
+
+            # Remove the failed container.
+            try:
+                subprocess.run(
+                    [self._docker_exe, "rm", "-f", container_name],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to remove container %s after exit 125: %s",
+                    container_name, exc,
+                )
+
+            # Health gate: fail fast if the daemon itself is down.
+            if not _docker_daemon_healthy(self._docker_exe):
+                raise RuntimeError(
+                    f"Docker daemon unresponsive after exit 125. "
+                    f"stderr: {result.stderr.strip()}"
+                )
+
+            # Retry once with a completely rebuilt command.
+            container_name = f"hermes-{uuid.uuid4().hex[:8]}"
+            run_cmd = [
+                self._docker_exe, "run", "-d",
+                "--name", container_name,
+                "-w", cwd,
+                *all_run_args,
+                image,
+                "sleep", "infinity",  # match main path — idle reaper handles cleanup
+            ]
+            logger.info(
+                "Retrying container startup as %s after exit-125 cleanup",
+                container_name,
+            )
+            result = subprocess.run(
+                run_cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                _log_docker_diagnostics(
+                    self._docker_exe, result.stderr.strip(), "retry attempt")
+                raise RuntimeError(
+                    f"Docker container startup failed after retry "
+                    f"(exit {result.returncode}): {result.stderr.strip()}"
+                )
+        elif result.returncode != 0:
+            # Non-125 error: preserve original check=True behavior.
+            raise subprocess.CalledProcessError(
+                result.returncode, run_cmd,
+                output=result.stdout, stderr=result.stderr,
+            )
+
         self._container_id = result.stdout.strip()
         logger.info(f"Started container {container_name} ({self._container_id[:12]})")
 
@@ -635,8 +1015,11 @@ class DockerEnvironment(BaseEnvironment):
                         f"sleep 3 && {self._docker_exe} rm -f {self._container_id} >/dev/null 2>&1 &",
                         shell=True,
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to schedule container removal for %s: %s",
+                        self._container_id, exc,
+                    )
             self._container_id = None
 
         if not self._persistent:

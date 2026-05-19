@@ -26,7 +26,8 @@ from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
-MAX_SUMMARY_TOKENS = 10000
+# P12/MOL-168: clamp to match llm.py:MAX_TOKENS — reduces payload surface area.
+MAX_SUMMARY_TOKENS = 4096
 
 
 def _get_session_search_max_concurrency(default: int = 3) -> int:
@@ -77,20 +78,23 @@ def _format_timestamp(ts: Union[int, float, str, None]) -> str:
 
 
 def _format_conversation(messages: List[Dict[str, Any]]) -> str:
-    """Format session messages into a readable transcript for summarization."""
+    """Format session messages into a readable transcript for summarization.
+
+    P14/MOL-168: prose-style ``### user`` / ``### assistant`` / ``### tool output``
+    headings — the prior bracketed all-caps role markers tripped Anthropic's
+    Claude Code OAuth role-marker content filter and produced opaque 400 errors.
+    """
     parts = []
     for msg in messages:
-        role = msg.get("role", "unknown").upper()
+        role = (msg.get("role") or "unknown").lower()
         content = msg.get("content") or ""
         tool_name = msg.get("tool_name")
 
-        if role == "TOOL" and tool_name:
-            # Truncate long tool outputs
+        if role == "tool" and tool_name:
             if len(content) > 500:
                 content = content[:250] + "\n...[truncated]...\n" + content[-250:]
-            parts.append(f"[TOOL:{tool_name}]: {content}")
-        elif role == "ASSISTANT":
-            # Include tool call names if present
+            parts.append(f"### tool output ({tool_name})\n{content}")
+        elif role == "assistant":
             tool_calls = msg.get("tool_calls")
             if tool_calls and isinstance(tool_calls, list):
                 tc_names = []
@@ -99,13 +103,13 @@ def _format_conversation(messages: List[Dict[str, Any]]) -> str:
                         name = tc.get("name") or tc.get("function", {}).get("name", "?")
                         tc_names.append(name)
                 if tc_names:
-                    parts.append(f"[ASSISTANT]: [Called: {', '.join(tc_names)}]")
+                    parts.append(f"### assistant tool call\nCalled: {', '.join(tc_names)}")
                 if content:
-                    parts.append(f"[ASSISTANT]: {content}")
+                    parts.append(f"### assistant\n{content}")
             else:
-                parts.append(f"[ASSISTANT]: {content}")
+                parts.append(f"### assistant\n{content}")
         else:
-            parts.append(f"[{role}]: {content}")
+            parts.append(f"### {role}\n{content}")
 
     return "\n\n".join(parts)
 
@@ -198,8 +202,28 @@ def _truncate_around_matches(
 async def _summarize_session(
     conversation_text: str, query: str, session_meta: Dict[str, Any]
 ) -> Optional[str]:
-    """Summarize a single session conversation focused on the search query."""
-    system_prompt = (
+    """Summarize a single session conversation focused on the search query.
+
+    P14b / MOL-168: system instructions are inlined into the user message
+    because Claude Code OAuth prepends its own system block and Anthropic
+    rejects requests with two system blocks (400 Invalid request data).
+    """
+    source = session_meta.get("source", "unknown")
+    started = _format_timestamp(session_meta.get("started_at"))
+
+    # P12/MOL-168: empty-transcript guard — sessions with only tool-output
+    # messages produce empty conversation_text after filtering. Skip rather
+    # than send an empty payload that produces opaque 400 errors.
+    if not conversation_text or not conversation_text.strip():
+        logging.info(
+            "Session summarization skipped: empty conversation_text (source=%s, started=%s)",
+            source,
+            started,
+        )
+        return None
+
+    # P14b / MOL-168: inline what used to be a system block into the user message.
+    user_prompt = (
         "You are reviewing a past conversation transcript to help recall what happened. "
         "Summarize the conversation with a focus on the search topic. Include:\n"
         "1. What the user asked about or wanted to accomplish\n"
@@ -208,13 +232,7 @@ async def _summarize_session(
         "4. Any specific commands, files, URLs, or technical details that were important\n"
         "5. Anything left unresolved or notable\n\n"
         "Be thorough but concise. Preserve specific details (commands, paths, error messages) "
-        "that would be useful to recall. Write in past tense as a factual recap."
-    )
-
-    source = session_meta.get("source", "unknown")
-    started = _format_timestamp(session_meta.get("started_at"))
-
-    user_prompt = (
+        "that would be useful to recall. Write in past tense as a factual recap.\n\n"
         f"Search topic: {query}\n"
         f"Session source: {source}\n"
         f"Session date: {started}\n\n"
@@ -225,14 +243,30 @@ async def _summarize_session(
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            if attempt == 0:
+                # P12/MOL-168: diagnostic — once per call.
+                _head = conversation_text[:80].replace("\n", " ")
+                _tail = conversation_text[-80:].replace("\n", " ")
+                logging.info(
+                    "session_search call: task=session_search max_tokens=%d user_len=%d head=%r tail=%r",
+                    MAX_SUMMARY_TOKENS,
+                    len(user_prompt),
+                    _head,
+                    _tail,
+                )
+            # P66/MOL-273: session search summarises past-message text. There's
+            # no vision payload and the work is cheap — ``prefer_local`` lets
+            # the call land on the local Kimi K2.6 default rather than the
+            # current main-loop provider (e.g. DeepSeek/Sonnet) the caller's
+            # auxiliary chain would otherwise resolve to.
             response = await async_call_llm(
                 task="session_search",
                 messages=[
-                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.1,
                 max_tokens=MAX_SUMMARY_TOKENS,
+                prefer_local=True,
             )
             content = extract_content_or_reasoning(response)
             if content:
@@ -247,6 +281,14 @@ async def _summarize_session(
             logging.warning("No auxiliary model available for session summarization")
             return None
         except Exception as e:
+            # P12/MOL-168: per-attempt failure telemetry (not just terminal).
+            logging.warning(
+                "session_search attempt %d/%d failed: type=%s msg=%s",
+                attempt + 1,
+                max_retries,
+                type(e).__name__,
+                str(e) or "no message",
+            )
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
             else:

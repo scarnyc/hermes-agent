@@ -1,0 +1,13 @@
+name: kanban
+version: 1.0.0
+description: "Multi-agent collaboration board — drag-drop cards across columns, read comment threads, see which profile is running what. Includes a dashboard plugin tab, 7 worker tools (show/complete/block/heartbeat/comment/create/link), CLI subcommand with 30+ verbs, and a gateway-embedded dispatcher."
+author: NousResearch
+kind: standalone
+provides_tools:
+  - kanban_show
+  - kanban_complete
+  - kanban_block
+  - kanban_heartbeat
+  - kanban_comment
+  - kanban_create
+  - kanban_link

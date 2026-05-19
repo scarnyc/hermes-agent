@@ -839,11 +839,11 @@ def _run_post_setup(post_setup_key: str):
                     _print_success("    tinker-atropos installed")
                 else:
                     _print_warning("    tinker-atropos install failed - run manually:")
-                    _print_info('      uv pip install -e "./tinker-atropos"')
+                    _print_info('      uv pip install -e \"./tinker-atropos\"')
             else:
                 _print_warning("    tinker-atropos submodule not found - run:")
                 _print_info("      git submodule update --init --recursive")
-                _print_info('      uv pip install -e "./tinker-atropos"')
+                _print_info('      uv pip install -e \"./tinker-atropos\"')
 
     elif post_setup_key == "langfuse":
         # Install the langfuse SDK.
@@ -862,8 +862,6 @@ def _run_post_setup(post_setup_key: str):
             else:
                 _print_warning("    langfuse SDK install failed — run manually: pip install langfuse")
         # Opt the bundled observability/langfuse plugin into plugins.enabled.
-        # The plugin ships in the repo but doesn't load until the user enables
-        # it (standalone plugins are opt-in).
         try:
             from hermes_cli.plugins_cmd import _get_enabled_set, _save_enabled_set
             enabled = _get_enabled_set()

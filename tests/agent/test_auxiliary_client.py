@@ -2041,6 +2041,51 @@ class TestBuildCallKwargsToolDedup:
         assert "tools" not in kwargs
 
 
+class TestBuildCallKwargsReasoningContentFill:
+    """_build_call_kwargs must pad reasoning_content for thinking-mode providers."""
+
+    @pytest.mark.parametrize(
+        "provider,model,base_url",
+        [
+            ("kimi-coding", "kimi-k2.6", ""),
+            ("custom", "kimi-k2.6", "https://api.moonshot.ai/v1"),
+            ("openrouter", "moonshotai/kimi-k2.6", "https://openrouter.ai/api/v1"),
+            ("deepseek", "deepseek-v4-pro", ""),
+            ("custom", "deepseek-v4", "https://api.deepseek.com/v1"),
+        ],
+    )
+    def test_thinking_mode_assistant_tool_call_gets_space_pad(
+        self, provider: str, model: str, base_url: str
+    ) -> None:
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        ]
+        kwargs = _build_call_kwargs(provider, model, messages, base_url=base_url)
+        assert kwargs["messages"][1].get("reasoning_content") == " "
+
+    def test_non_thinking_provider_skips_pad(self) -> None:
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        ]
+        kwargs = _build_call_kwargs("openrouter", "anthropic/claude-sonnet-4", messages)
+        assert "reasoning_content" not in kwargs["messages"][0]
+
+    def test_existing_reasoning_content_preserved(self) -> None:
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "x", "arguments": "{}"}}], "reasoning_content": "existing"},
+        ]
+        kwargs = _build_call_kwargs("kimi-coding", "kimi-k2.6", messages)
+        assert kwargs["messages"][0]["reasoning_content"] == "existing"
+
+    def test_empty_string_upgraded_to_space(self) -> None:
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "x", "arguments": "{}"}}], "reasoning_content": ""},
+        ]
+        kwargs = _build_call_kwargs("kimi-coding", "kimi-k2.6", messages)
+        assert kwargs["messages"][0]["reasoning_content"] == " "
+
+
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """Strip provider env vars so each test starts clean."""

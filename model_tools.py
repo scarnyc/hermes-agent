@@ -21,6 +21,7 @@ Public API (signatures preserved from the original 2,400-line version):
 """
 
 import json
+import re
 import asyncio
 import logging
 import threading
@@ -30,6 +31,15 @@ from typing import Dict, Any, List, Optional, Tuple
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
+# P64/MOL-259: ``tools.reflection_agent`` registers the
+# ``reflect_on_output`` tool surface during ``discover_builtin_tools()``'s
+# AST-based auto-scan of ``tools/*.py``. The registration writes through
+# to ``registry``, which downstream callers (``get_tool_definitions``,
+# ``handle_function_call``) consume here. No explicit import is required —
+# discovery is name-driven — but the dependency is load-bearing for the
+# reviewer retry loop and recorded here so a future grep for "where does
+# tools.reflection_agent surface in the public tool list?" lands on this
+# file rather than only the registry internals.
 logger = logging.getLogger(__name__)
 
 
@@ -497,6 +507,48 @@ _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
 # =========================================================================
+# Tool error sanitization
+# =========================================================================
+#
+# Tool exceptions can carry arbitrary text into the model's context as the
+# `tool` message content. json.dumps() handles quote/backslash escaping so a
+# raw injection of `</tool_call>` won't break message framing, but the model
+# still *reads* those tokens and they can confuse downstream tool-call
+# parsing or, in adversarial cases, nudge it toward role-confusion framing.
+#
+# This helper strips structural framing tokens (XML role tags, CDATA,
+# markdown code fences) and caps the message at a sane upper bound before it
+# becomes part of the conversation. It's defense-in-depth — the json layer
+# already prevents framing escape — but cheap and worth having.
+#
+# Ported from ironclaw#1639.
+_TOOL_ERROR_ROLE_TAG_RE = re.compile(
+    r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>',
+    re.IGNORECASE,
+)
+_TOOL_ERROR_FENCE_OPEN_RE = re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE)
+_TOOL_ERROR_FENCE_CLOSE_RE = re.compile(r'\s*```\s*$', re.MULTILINE)
+_TOOL_ERROR_CDATA_RE = re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL)
+_TOOL_ERROR_MAX_LEN = 2000
+
+
+def _sanitize_tool_error(error_msg: str) -> str:
+    """Strip structural framing tokens from a tool error before showing it to the model.
+
+    See _TOOL_ERROR_ROLE_TAG_RE docstring above for rationale.
+    """
+    if not error_msg:
+        return "[TOOL_ERROR] "
+    sanitized = _TOOL_ERROR_ROLE_TAG_RE.sub("", error_msg)
+    sanitized = _TOOL_ERROR_FENCE_OPEN_RE.sub("", sanitized)
+    sanitized = _TOOL_ERROR_FENCE_CLOSE_RE.sub("", sanitized)
+    sanitized = _TOOL_ERROR_CDATA_RE.sub("", sanitized)
+    if len(sanitized) > _TOOL_ERROR_MAX_LEN:
+        sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
+    return f"[TOOL_ERROR] {sanitized}"
+
+
+# =========================================================================
 # Tool argument type coercion
 # =========================================================================
 
@@ -835,7 +887,7 @@ def handle_function_call(
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
-        return json.dumps({"error": error_msg}, ensure_ascii=False)
+        return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
 
 
 # =============================================================================
