@@ -41,22 +41,22 @@ def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
 
 
 @patch("agent.model_metadata.get_model_context_length", return_value=131_072)
-def test_switch_model_preserves_config_context_length(mock_ctx_len):
-    """When switching models, config_context_length should be passed to get_model_context_length."""
+def test_switch_model_clears_stale_config_context_length(mock_ctx_len):
+    """Upstream 8ac351407 (absorbed via MOL-597) clears the per-config
+    context_length override on /model switch so the new model's window is
+    auto-detected via get_model_context_length() instead of inheriting the
+    previous model's value."""
     agent = _make_agent_with_compressor(config_context_length=32_768)
 
     assert agent.context_compressor.model == "primary-model"
-    assert agent.context_compressor.context_length == 32_768  # From config override
+    assert agent.context_compressor.context_length == 32_768
 
-    # Switch model
     agent.switch_model("new-model", "openrouter", api_key="sk-new", base_url="https://openrouter.ai/api/v1")
 
-    # Verify get_model_context_length was called with config_context_length
     mock_ctx_len.assert_called_once()
     call_kwargs = mock_ctx_len.call_args.kwargs
-    assert call_kwargs.get("config_context_length") == 32_768
-
-    # Verify compressor was updated
+    assert call_kwargs.get("config_context_length") is None
+    assert agent._config_context_length is None
     assert agent.context_compressor.model == "new-model"
 
 
