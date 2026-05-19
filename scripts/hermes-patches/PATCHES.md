@@ -11,7 +11,7 @@ Use `git cherry-pick <sha>` for future upstream integration.
 ### P176 — Kimi K2.6 fallback for transient composer failures
 - **Cherry-picked:** N/A (local patch — MOL-660)
 - **Upstream:** N/A
-- **Local:** (pending commit)
+- **Local:** `782a46508`
 - **Files:** plugins/memory/tiered/llm.py
 - **Why:** Composer was the only cron-invoked production LLM site missing fallback symmetry with primary turn-loop (config.yaml:463 fallback_model). On transient errors (rate limit, 5xx, network) retry once via Kimi K2.6 before returning None. Permanent paths (ComposerKeyMissing, ComposerAuthFailure) skip fallback.
 - **Conflict:** None — new function `_try_kimi_fallback`, surgical change to `except Exception` block.
