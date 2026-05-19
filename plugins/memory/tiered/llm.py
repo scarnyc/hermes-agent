@@ -29,6 +29,14 @@ P169 review fix-pass (silent-failure-hunter findings on PR #200):
 - Per-process `MAX_COMPOSER_CALLS_PER_RUN` budget cap guards against
   runaway loops in multi-session ingest paths (memory_ingest_external.py
   calls llm_compose once per session × N sessions × cron tick).
+
+MOL-660: Kimi K2.6 fallback for transient errors — on rate limit, 5xx,
+or network blip the composer retries once via Kimi K2.6
+(``KIMI_API_KEY`` from envchain ``hermes-llm``).  Permanent-failure
+paths (``ComposerKeyMissing``, ``ComposerAuthFailure``) skip fallback
+entirely.  This closes the last cron-invoked production LLM site
+missing fallback symmetry with the primary turn-loop
+(``config.yaml:463 fallback_model``).
 """
 
 import json
@@ -64,6 +72,12 @@ MAX_PROMPT_CHARS = 300_000
 MAX_COMPOSER_CALLS_PER_RUN = int(os.environ.get("MEMORY_COMPOSER_MAX_CALLS_PER_RUN", "500"))
 _call_count = 0
 
+# MOL-660: Kimi K2.6 fallback for transient composer failures.
+# Uses KIMI_API_KEY from hermes-llm envchain namespace (KIMI_ prefix in wrapper).
+KIMI_FALLBACK_MODEL = "kimi-k2.6"
+KIMI_FALLBACK_BASE_URL = "https://api.moonshot.ai/v1"
+KIMI_FALLBACK_API_KEY_ENV = "KIMI_API_KEY"
+
 # P169 review fix-pass I1: one-shot announce gate for resolved BASE_URL.
 _base_url_announced = False
 
@@ -72,11 +86,11 @@ _TRIPWIRE_DIR = os.path.expanduser("~/.hermes/state")
 
 
 class ComposerKeyMissing(RuntimeError):
-    """OPENROUTER_API_KEY not set. Permanent failure until operator intervenes."""
+    """DEEPSEEK_API_KEY not set. Permanent failure until operator intervenes."""
 
 
 class ComposerAuthFailure(RuntimeError):
-    """OpenRouter returned 401/403. Key expired or revoked — permanent until rotated."""
+    """DeepSeek returned 401/403. Key expired or revoked — permanent until rotated."""
 
 
 def _write_tripwire(reason: str, detail: dict) -> None:
@@ -159,7 +173,56 @@ def _call_composer(prompt: str) -> str:
             "detail": str(e)[:200],
         })
         raise ComposerAuthFailure(str(e)) from e
-    return response.choices[0].message.content
+    content = response.choices[0].message.content
+    if not content:
+        content = getattr(response.choices[0].message, "reasoning_content", None)
+    return content or ""
+
+
+def _try_kimi_fallback(prompt: str) -> Optional[str]:
+    """Retry the composer call via Kimi K2.6 after a transient primary failure.
+
+    MOL-660: Only invoked from the transient ``except Exception`` path in
+    ``llm_compose``.  Permanent-failure paths (``ComposerKeyMissing``,
+    ``ComposerAuthFailure``) skip fallback entirely — those are operator-
+    intervention conditions, not network blips.
+
+    Returns content string on success, ``None`` on any failure (missing key,
+    API error, empty response).  Caller logs the outcome at INFO (success) or
+    the fallback itself logs at WARNING (failure).
+    """
+    global _call_count
+
+    kimi_key = os.environ.get(KIMI_FALLBACK_API_KEY_ENV, "").strip()
+    if not kimi_key:
+        logger.warning(
+            "memory LLM: kimi-k2.6 fallback unavailable (%s not set)",
+            KIMI_FALLBACK_API_KEY_ENV,
+        )
+        return None
+
+    _call_count += 1
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=KIMI_FALLBACK_BASE_URL, api_key=kimi_key)
+        response = client.chat.completions.create(
+            model=KIMI_FALLBACK_MODEL,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        logger.warning(
+            "memory LLM: kimi-k2.6 fallback failed (%s: %s)",
+            type(e).__name__, str(e)[:200],
+        )
+        return None
+    content = response.choices[0].message.content
+    if not content:
+        content = getattr(response.choices[0].message, "reasoning_content", None)
+    if content:
+        logger.info("memory LLM: kimi-k2.6 (composer fallback)")
+    return content or ""
 
 
 def llm_compose(prompt: str, context: str) -> Optional[str]:
@@ -172,8 +235,9 @@ def llm_compose(prompt: str, context: str) -> Optional[str]:
 
     Permanent-failure paths (missing key, auth failure, budget exceeded)
     log at ERROR + write tripwires to `~/.hermes/state/composer-*.json`.
-    Transient paths (rate limit, 5xx, empty response) log at WARNING.
-    Either way the return is `None`; distinguish via the audit trail.
+    Transient paths (rate limit, 5xx, network blip) retry once via Kimi
+    K2.6 (MOL-660 fallback); if the fallback also fails the return is
+    ``None``.  Distinguish permanent vs transient via the audit trail.
     """
     global _call_count
 
@@ -213,11 +277,14 @@ def llm_compose(prompt: str, context: str) -> Optional[str]:
         # Don't double-log; return None per public-API contract.
         return None
     except Exception as e:
-        # Transient API errors (rate limit, 5xx, network blip). Caller still
-        # treats None as a failure, but log severity reflects that this class
-        # of failure typically self-resolves on the next cron tick.
+        # MOL-660: transient error → retry once via Kimi K2.6 before
+        # returning None.  Permanent paths above (ComposerKeyMissing,
+        # ComposerAuthFailure) skip fallback — those need operator action.
         logger.warning(
             "memory LLM composer failed transient (%s: %s)",
             type(e).__name__, str(e)[:200],
         )
+        result = _try_kimi_fallback(full)
+        if result:
+            return result
         return None
