@@ -160,7 +160,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, build_maintenance_marker_prompt, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -977,6 +977,23 @@ class AIAgent:
             # Envelope layout (native_anthropic=False): markers on inner
             # content parts, not top-level tool messages.  Matches
             # pi-mono's "alibaba" cacheControlFormat.
+            return True, False
+
+        # P187/MOL-641 — DeepSeek V4 series on OpenAI-wire chat.completions
+        # accepts Anthropic-style cache_control markers and serves real
+        # cache hits per provider docs. Without this branch the composer +
+        # provider re-bills the full system prompt on every turn.
+        if provider_lower == "deepseek" and "deepseek" in model_lower:
+            return True, False
+
+        # P187/MOL-641 — Kimi K2.6 (Moonshot) on OpenAI-wire chat.completions
+        # honours the same cache_control envelope layout. Hermes canonical
+        # provider names are "kimi-coding" (api.moonshot.ai) and
+        # "kimi-coding-cn" (api.moonshot.cn) — see auth.py:1367 alias map
+        # which rewrites bare "moonshot" → "kimi-coding" at config-load time.
+        # Without this branch Kimi traffic sees zero cached tokens despite
+        # documented cache discount on the Moonshot platform.
+        if provider_lower in {"kimi-coding", "kimi-coding-cn"} and "kimi" in model_lower:
             return True, False
 
         return False, False

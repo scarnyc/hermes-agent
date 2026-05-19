@@ -1214,19 +1214,28 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 
 
+# P187/MOL-641 — per-thread tool whitelist. Restricts pre-tool-call gate to
+# a caller-defined allowed set for THIS thread only. Used by the background
+# review path so a self-review pass cannot accidentally call mutating tools.
 _thread_tool_whitelist = threading.local()
 
 
-def set_thread_tool_whitelist(
-    allowed: Optional[Set[str]],
-    deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
-) -> None:
-    _thread_tool_whitelist.allowed = allowed
-    _thread_tool_whitelist.fmt = deny_msg_fmt
+def set_thread_tool_whitelist(allowed: set, deny_msg_fmt: str) -> None:
+    """Restrict pre-tool-call gate to ``allowed`` tool names for THIS thread.
+
+    ``deny_msg_fmt`` is a ``str.format`` template with ``{tool_name}``
+    substitution that is returned as the block message when a non-allowed
+    tool is invoked on this thread.
+    """
+    _thread_tool_whitelist.allowed = set(allowed)
+    _thread_tool_whitelist.deny_msg_fmt = deny_msg_fmt
 
 
 def clear_thread_tool_whitelist() -> None:
-    _thread_tool_whitelist.allowed = None
+    """Lift the per-thread whitelist (no-op if never set)."""
+    for attr in ("allowed", "deny_msg_fmt"):
+        if hasattr(_thread_tool_whitelist, attr):
+            delattr(_thread_tool_whitelist, attr)
 
 
 def get_pre_tool_call_block_message(
@@ -1247,9 +1256,12 @@ def get_pre_tool_call_block_message(
     directive wins.  Invalid or irrelevant hook return values are
     silently ignored so existing observer-only hooks are unaffected.
     """
+    # P187/MOL-641 — per-thread whitelist. When set by the background review
+    # path, denies any tool not in the allowed set before evaluating plugin
+    # hooks. Falls through to normal hook evaluation when not set.
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
+        fmt = getattr(_thread_tool_whitelist, "deny_msg_fmt", "Tool {tool_name} denied")
         return fmt.format(tool_name=tool_name)
 
     hook_results = invoke_hook(

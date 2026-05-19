@@ -230,6 +230,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
+        # P189/MOL-330: surface pending session-maintenance markers so the
+        # agent runs diary → revise-context → remember on the backlog at
+        # session start (closes the consumer-side gap — see plugins/
+        # session-maintenance/__init__.py for the producer side).
+        maintenance_prompt = _r.build_maintenance_marker_prompt()
+        if maintenance_prompt:
+            context_parts.append(maintenance_prompt)
+
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
