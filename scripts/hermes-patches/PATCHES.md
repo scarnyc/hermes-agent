@@ -8,6 +8,102 @@ Use `git cherry-pick <sha>` for future upstream integration.
 
 ## Active Patches
 
+### P177 — Upstream absorption: extract message sanitization to agent/message_sanitization.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 modular refactor batch — 1/12)
+- **Upstream:** `885d1242a` refactor(run_agent): extract message sanitization to agent/message_sanitization.py
+- **Local:** `3c95c8810`
+- **Files:** run_agent.py, agent/message_sanitization.py (NEW, 444 LOC)
+- **Why:** Begins porting upstream's modular refactor of run_agent.py (was 15,195 lines). Extracts `_sanitize_surrogates` + sibling helpers into a dedicated module so future cherry-picks no longer fight against the monolith.
+- **Conflict:** Resolved by accepting upstream forwarder; no local-patch overlap on this range.
+
+### P178 — Upstream absorption: extract tool-dispatch helpers to agent/tool_dispatch_helpers.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 2/12)
+- **Upstream:** `59f1c0f0b` refactor(run_agent): extract tool-dispatch helpers to agent/tool_dispatch_helpers.py
+- **Local:** `b7883e425`
+- **Files:** run_agent.py, agent/tool_dispatch_helpers.py (NEW, 336 LOC)
+- **Why:** Extracts `_is_multimodal_tool_result`, `_should_parallelize_tool_batch`, `_extract_file_mutation_targets`, `_trajectory_normalize_msg`, etc. Re-exported from run_agent for compatibility with tests + cli imports.
+- **Conflict:** None.
+
+### P179 — Upstream absorption: extract background memory/skill review to agent/background_review.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 3/12)
+- **Upstream:** `1f6eb1738` refactor(run_agent): extract background memory/skill review to agent/background_review.py
+- **Local:** `326a0feb3`
+- **Files:** run_agent.py, agent/background_review.py (NEW, 582 LOC)
+- **Why:** Moves the background-review subprocess driver — preserves P154 review_whitelist fingerprint (moved from run_agent.py to agent/background_review.py:231).
+- **Conflict:** None — fingerprint pre/post snap confirmed clean move.
+
+### P180 — Upstream absorption: extract context compression to agent/conversation_compression.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 4/12)
+- **Upstream:** `5311d9959` refactor(run_agent): extract context compression to agent/conversation_compression.py
+- **Local:** `aa1ded289`
+- **Files:** run_agent.py, agent/conversation_compression.py (NEW, 592 LOC)
+- **Why:** Extracts trajectory-compressor + sliding-window context management.
+- **Conflict:** None.
+
+### P181 — Upstream absorption: extract system-prompt builder to agent/system_prompt.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 5/12)
+- **Upstream:** `2d2cd5e90` refactor(run_agent): extract system-prompt builder to agent/system_prompt.py
+- **Local:** `3211a5dad`
+- **Files:** run_agent.py, agent/system_prompt.py (NEW, 346 LOC)
+- **Why:** Extracts system-prompt construction (SOUL/persona/skills assembly).
+- **Conflict:** None.
+
+### P182 — Upstream absorption: extract tool execution to agent/tool_executor.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 6/12)
+- **Upstream:** `79559214a` refactor(run_agent): extract tool execution to agent/tool_executor.py
+- **Local:** `a9c45ed4c`
+- **Files:** run_agent.py, agent/tool_executor.py (NEW, 924 LOC)
+- **Why:** Extracts concurrent + sequential tool-dispatch loop bodies.
+- **Conflict:** None.
+
+### P183 — Upstream absorption: extract stream diagnostics to agent/stream_diag.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 7/12)
+- **Upstream:** `57f6762ca` refactor(run_agent): extract stream diagnostics to agent/stream_diag.py
+- **Local:** `106718205`
+- **Files:** run_agent.py, agent/stream_diag.py (NEW, 280 LOC)
+- **Why:** Extracts stream-event diagnostics + token-usage normalization helpers.
+- **Conflict:** None.
+
+### P184 — Upstream absorption: extract chat-completion helpers to agent/chat_completion_helpers.py (part 1)
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 8/12)
+- **Upstream:** `4b25619bc` refactor(run_agent): extract chat-completion helpers to agent/chat_completion_helpers.py
+- **Local:** `6341c6782`
+- **Files:** run_agent.py, agent/chat_completion_helpers.py (NEW)
+- **Why:** Initial extraction of chat-completion helper functions (provider-specific request shaping, response normalization). Preserves P157 fingerprint `_is_deepseek = base_url_host_matches(agent.base_url, "api.deepseek.com")` at agent/chat_completion_helpers.py:322.
+- **Conflict:** None — fingerprint snap confirmed clean move.
+
+### P185 — Upstream absorption: extract streaming API caller to agent/chat_completion_helpers.py (part 2)
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 9/12)
+- **Upstream:** `0430e71ec` refactor(run_agent): extract streaming API caller (893 LOC) to agent/chat_completion_helpers.py
+- **Local:** `230e32697`
+- **Files:** run_agent.py, agent/chat_completion_helpers.py (+893 LOC)
+- **Why:** Adds the streaming dispatcher (`call_chat_completion_streaming`) to the helpers module. Total module now 2,078 LOC across the two parts.
+- **Conflict:** None.
+
+### P186 — Upstream absorption: extract run_conversation to agent/conversation_loop.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 10/12)
+- **Upstream:** `053025238` refactor(run_agent): extract run_conversation to agent/conversation_loop.py
+- **Local:** `be1c96e35` (amended for P161 carry-forward)
+- **Files:** run_agent.py, agent/conversation_loop.py (NEW, 4,099 LOC), agent/auxiliary_client.py (set_runtime_main backport), agent/iteration_budget.py (NEW, copied from upstream), agent/process_bootstrap.py (NEW, copied from upstream)
+- **Why:** Largest extraction — the 3,877-line `run_conversation` body becomes its own module. AIAgent.run_conversation is now a thin forwarder.
+- **Conflict:** P161 (perf: `List[str].append` + `"".join` for truncated_response_parts) silently dropped by cherry-pick (upstream used older `str` form). Re-attached at 4 sites in agent/conversation_loop.py: declaration (line 467), accumulate calls (line 1360), join-and-strip (line 1381), final-response prepend (lines 3585-3587). Cascading imports satisfied by backporting `set_runtime_main`/`clear_runtime_main` to agent/auxiliary_client.py from upstream `3800972dd`, plus verbatim copy of agent/iteration_budget.py and agent/process_bootstrap.py from upstream `5f309ae68`.
+
+### P187 — Upstream absorption: extract __init__ to agent/agent_init.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 11/12)
+- **Upstream:** `9f408989c` refactor(run_agent): extract __init__ (1,381 LOC) to agent/agent_init.py
+- **Local:** `a9cbbae21`
+- **Files:** run_agent.py, agent/agent_init.py (NEW, 1,504 LOC)
+- **Why:** Extracts the 1,381-line AIAgent.__init__ body. `__init__` is now a thin forwarder calling `init_agent(self, ...)`.
+- **Conflict:** Standard delete-old-body / accept-upstream-forwarder. All five fingerprints intact post-snap.
+
+### P188 — Upstream absorption: extract 10 remaining helpers to agent/agent_runtime_helpers.py
+- **Cherry-picked:** 2026-05-19 (MOL-597 — 12/12)
+- **Upstream:** `94c3e0ab8` refactor(run_agent): extract 10 more helpers to agent/agent_runtime_helpers.py
+- **Local:** `3b3be6ad5`
+- **Files:** run_agent.py, agent/agent_runtime_helpers.py (NEW, 2,159 LOC)
+- **Why:** Final batch — extracts `_invoke_tool`, `_extract_api_error_context`, `switch_model`, and 7 sibling helpers. Each becomes a thin forwarder. End state: run_agent.py 5,297 lines (was 15,195 — 65% reduction).
+- **Conflict:** Three delete-vs-modified blocks resolved bottom-up; standard accept-upstream-forwarder pattern. All five fingerprints intact post-snap.
+
 ### P176 — Kimi K2.6 fallback for transient composer failures
 - **Cherry-picked:** N/A (local patch — MOL-660)
 - **Upstream:** N/A
