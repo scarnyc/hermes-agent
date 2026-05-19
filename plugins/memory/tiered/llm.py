@@ -77,6 +77,7 @@ _call_count = 0
 KIMI_FALLBACK_MODEL = "kimi-k2.6"
 KIMI_FALLBACK_BASE_URL = "https://api.moonshot.ai/v1"
 KIMI_FALLBACK_API_KEY_ENV = "KIMI_API_KEY"
+KIMI_FALLBACK_TEMPERATURE = 1.0  # kimi-k2.6 requires temperature=1
 
 # P169 review fix-pass I1: one-shot announce gate for resolved BASE_URL.
 _base_url_announced = False
@@ -208,7 +209,7 @@ def _try_kimi_fallback(prompt: str) -> Optional[str]:
         response = client.chat.completions.create(
             model=KIMI_FALLBACK_MODEL,
             max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
+            temperature=KIMI_FALLBACK_TEMPERATURE,
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as e:
