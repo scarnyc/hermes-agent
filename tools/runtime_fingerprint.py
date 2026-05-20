@@ -340,6 +340,37 @@ def h1_pre_write_guard(path: Path | str, caller: str) -> H1Outcome:
         return "proceed"
 
     # External mutation detected.
+    # P181 — stale-baseline auto-recovery: if the file hasn't changed since
+    # session-start (fingerprinter agrees with disk), the baseline is stale,
+    # not the file. Auto-heal by updating the baseline and proceeding.
+    session_id = os.environ.get("HERMES_SESSION_ID")
+    if session_id:
+        fp_path = STATE_DIR / "session-fingerprints" / f"{session_id}.json"
+        try:
+            with open(fp_path, "r", encoding="utf-8") as _fp:
+                sf = json.load(_fp)
+            sf_hashes = sf.get("hashes", {}) if isinstance(sf, dict) else {}
+            session_hash = sf_hashes.get(key)
+            if session_hash is not None and session_hash == current:
+                # File was stable at session start — baseline is stale.
+                emit_audit_jsonl(
+                    WRITE_COLLISION_LOG,
+                    {
+                        "ts": _now_iso(),
+                        "event": "stale_baseline_auto_healed",
+                        "path": key,
+                        "old_baseline": last,
+                        "new_baseline": current,
+                        "session_id": session_id,
+                        "caller": caller_label,
+                    },
+                )
+                h1_record_post_write(p)
+                return "proceed"
+        except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError):
+            # Fingerprint unavailable — genuine mutation possible, fall through.
+            pass
+
     if _is_interactive():
         try:
             sys.stderr.write(
