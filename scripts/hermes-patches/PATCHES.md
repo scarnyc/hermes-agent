@@ -12470,3 +12470,34 @@ Layer 1 fix: stale hash updated in `hermes-last-write-hashes.json` from `2be9fef
 Layer 2 fix: this auto-recovery (P181).
 Layer 3 forensics: session DB search inconclusive — write happened at session boundary with no message trail.
 3. **Remove the worktree** `git -C ~/.hermes/hermes-agent worktree remove ~/Code/hermes-agent-MOL-597` (defer 24h per plan; keeps debug copy available).
+
+---
+
+## MOL-601 — Goal Judge Time Injection (P213) + Gemma-4 Reasoning Allowlist (P214)
+
+### P213 — Inject current time into goal judge prompt
+
+**Upstream:** `6158964ff`
+**File:** `hermes_cli/goals.py`
+**Lines:** +4
+
+Hand-adapted (not cherry-picked) because our fork lacks `JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE`. Only the simple template path modified.
+
+1. Added `from datetime import datetime, timezone` import
+2. Added `"Current time: {current_time}\n\n"` to `JUDGE_USER_PROMPT_TEMPLATE`
+3. Inline `datetime.now(tz=timezone.utc).astimezone().strftime(...)` in the `.format()` call — single-expression, no variable assignment needed since the simple template has no subgoals branch
+
+The goal judge now receives the current time in its prompt, enabling evaluation of time-sensitive goals like "keep working until 5 PM."
+
+### P214 — Add Gemma-4 to OpenRouter reasoning allowlist
+
+**Upstream:** `8f3bc17db` (cherry-pick of `7244116b6`)
+**File:** `run_agent.py`
+**Lines:** +1
+
+Added `"google/gemma-4"` to the `reasoning_model_prefixes` tuple in `_supports_reasoning_extra_body()` (line 4593). Without this, Gemma 4 models on OpenRouter don't receive the `reasoning` extra_body parameter, breaking their thinking/reasoning capability.
+
+Note: Gemma 4 models were already listed in `agent/models_dev.py` and context lengths in `agent/model_metadata.py`, and `<thought>` tag stripping in `agent/agent_runtime_helpers.py`. This was the only missing piece for full reasoning support on OpenRouter.
+
+### Verification
+- `pytest tests/hermes_cli/test_goals.py tests/run_agent/test_run_agent.py` — 359 passed

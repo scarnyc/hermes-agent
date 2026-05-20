@@ -34,6 +34,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ JUDGE_SYSTEM_PROMPT = (
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "Current time: {current_time}\n\n"
     "Is the goal satisfied?"
 )
 
@@ -324,6 +326,7 @@ def judge_goal(
     prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
         goal=_truncate(goal, 2000),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        current_time=datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
     )
 
     try:

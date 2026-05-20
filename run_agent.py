@@ -4591,6 +4591,7 @@ class AIAgent:
             "openai/",
             "google/gemini-2",
             "google/gemini-3",
+            "google/gemma-4",
             "moonshotai/",
             "qwen/qwen3",
             "tencent/hy3-preview",
