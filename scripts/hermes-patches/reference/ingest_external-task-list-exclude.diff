@@ -1,0 +1,33 @@
+--- a/plugins/memory/tiered/ingest_external.py
++++ b/plugins/memory/tiered/ingest_external.py
+@@ -29,7 +29,12 @@ MAX_FILE_BYTES = 1 * 1024 * 1024
+
+ # Obsidian subdirectories to skip outright.
+-OBSIDIAN_EXCLUDE_DIRS = {".obsidian", "Excalidraw", ".trash", ".git"}
++# Anywhere-in-path: matches hidden/metadata dirs at any depth (e.g., nested .obsidian).
++# "Task List" is NOT here — it's handled by a top-level-only check in the ingest
++# loop (P38) so the daily-task-list skill's folder is excluded without over-matching
++# any user-created subfolder named "Task List" elsewhere in the vault (e.g.,
++# ~/Will's Vault/Archive/Task List/). User corrections flow into tiered memory via
++# the explicit diff→memory_observe path in the daily-task-list skill.
++OBSIDIAN_EXCLUDE_DIRS = {".obsidian", "Excalidraw", ".trash", ".git"}
+
+
+@@ -107,9 +112,19 @@ def ingest_obsidian_vault(
+     for md_path in vault.rglob("*.md"):
+-        # Skip excluded directories
+-        if any(part in OBSIDIAN_EXCLUDE_DIRS for part in md_path.parts):
+-            continue
++        # Compute vault-relative path once — used for both scoping and titling.
++        try:
++            rel_parts = md_path.relative_to(vault).parts
++        except ValueError:
++            rel_parts = md_path.parts
++        # Top-level-only exclusion for Task List (owned by daily-task-list skill).
++        # A user subfolder like ~/Will's Vault/Archive/Task List/ is NOT excluded.
++        if rel_parts and rel_parts[0] == "Task List":
++            continue
++        # Anywhere-in-path exclusion for hidden/metadata dirs (.obsidian, Excalidraw, etc).
++        if any(part in OBSIDIAN_EXCLUDE_DIRS for part in md_path.parts):
++            continue
+         counts["scanned"] += 1

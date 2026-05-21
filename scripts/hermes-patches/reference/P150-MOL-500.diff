@@ -1,0 +1,226 @@
+--- /tmp/sb.pre-p150.py	2026-05-11 08:56:27
++++ /Users/wills_mac_mini/.hermes/scripts/symphony_bridge.py	2026-05-11 10:00:38
+@@ -37,6 +37,21 @@
+ # P148/MOL-498: JSONL diagnostic log for observability into tier failures + SIGKILL recovery.
+ LOG_DIR = HOME / ".hermes" / "logs"
+ LOG_FILE = LOG_DIR / "symphony_bridge.log"
++
++# P150/MOL-500: CC-native agent files — externalized phase prompts.
++# Loaded via _load_phase_agent at first use, cached for tick lifetime.
++AGENTS_DIR = HOME / ".claude" / "agents"
++
++# P150/MOL-500: kwargs that carry user-controlled content (ticket bodies, plan text).
++# str.format() does NOT re-interpret braces in substituted VALUES, so no pre-escaping
++# is needed here — the earlier "escape user content" design produced doubled-brace
++# bugs. The brace-safety burden is on agent body TEMPLATES, not on these values:
++# agent body markdown must not contain literal `{`/`}` outside placeholder positions.
++# This frozenset is documentary metadata for future content-validation hooks; see
++# safe_format() docstring for the full contract.
++_USER_CONTENT_FIELDS = frozenset({
++    "summary", "ticket_body_truncated", "plan_content_truncated",
++})
+ 
+ CLAUDE_BIN = os.path.expanduser("~/.local/bin/claude")
+ 
+@@ -280,8 +295,63 @@
+             time.sleep(retry_wait)
+ 
+     return last_result
++
++
++# P150/MOL-500: CC-native agent file loading + safe placeholder substitution.
++
++_PHASE_AGENT_CACHE: dict[str, str] = {}
++
++
++def _load_phase_agent(phase: str) -> str:
++    """P150/MOL-500: load + cache the body of a CC-native agent file from AGENTS_DIR.
++
++    Returns just the Markdown body (everything after the closing `---`).
++    Cached per process — call sites do not pay re-read cost across phases.
++
++    Raises:
++        FileNotFoundError: agent file missing.
++        RuntimeError: malformed YAML frontmatter (missing or unclosed `---`).
++    """
++    if phase in _PHASE_AGENT_CACHE:
++        return _PHASE_AGENT_CACHE[phase]
++
++    path = AGENTS_DIR / f"{phase}.md"
++    if not path.exists():
++        raise FileNotFoundError(f"phase agent file missing: {path}")
++    content = path.read_text()
++    parts = re.split(r"^---\s*$", content, maxsplit=2, flags=re.MULTILINE)
++    if len(parts) != 3:
++        raise RuntimeError(
++            f"phase agent {path} malformed: expected `---` frontmatter delimiters "
++            f"(got {len(parts)} parts, need 3)"
++        )
++    body = parts[2].lstrip()
++    _PHASE_AGENT_CACHE[phase] = body
++    return body
+ 
+ 
++def safe_format(template: str, **vars) -> str:
++    """P150/MOL-500: thin wrapper over str.format with defensive guarantees.
++
++    str.format() does NOT re-interpret brace characters in substituted VALUES,
++    so user content like a JSON object `{"required": ["x"]}` passes through
++    literally — no per-value escaping needed. The earlier "escape user content"
++    approach was wrong: it produced doubled braces (`{{...}}`) in the output.
++
++    Hard constraints (enforced by verify_patches.sh):
++      - Agent file BODY (the template) must not contain literal `{` / `}`
++        outside designated placeholder positions.
++      - Every placeholder name in the body must be a kwarg of safe_format —
++        an unsubstituted `{name}` would ship to the LLM as literal text
++        (skill_prompt_placeholder_fragility memory).
++
++    Raises KeyError loud-and-clear if the template references a placeholder
++    name that isn't in `vars`. _USER_CONTENT_FIELDS documents which kwarg
++    names carry untrusted text (for future content-validation hooks).
++    """
++    return template.format(**vars)
++
++
+ def _get_api_key(key_name: str) -> str:
+     """Fetch an API key from envchain."""
+     try:
+@@ -931,18 +1001,16 @@
+     plan_file = PLANS_DIR / f"{key}.md"
+     PLANS_DIR.mkdir(parents=True, exist_ok=True)
+ 
+-    goal = (
+-        f"Write an implementation plan for {key} — ticket: '{summary}'.\n"
+-        f"Output the plan to {plan_file} following the planning profile format "
+-        f"(Context, Approach, Target files, Acceptance criteria with → mappings, "
+-        f"Out of scope). Then call ExitPlanMode.\n"
+-        f"Working repo: {repo_path}."
+-    )
+-    context = (
+-        f"Ticket body: {ticket_body[:3000]}.\n"
+-        f"Repo: {repo_path}."
++    # P150/MOL-500: prompt template lives in ~/.claude/agents/planner.md
++    ticket_body_truncated = ticket_body[:3000]
++    prompt = safe_format(
++        _load_phase_agent("planner"),
++        key=key,
++        summary=summary,
++        plan_file=str(plan_file),
++        ticket_body_truncated=ticket_body_truncated,
++        repo_path=repo_path,
+     )
+-    prompt = f"{goal}\n\nContext: {context}"
+ 
+     _log(f"Phase 1 (Planner): {key} → {plan_file}")
+     result = run_phase_with_fallback(
+@@ -966,18 +1034,22 @@
+             "tier": result["tier"]}
+ 
+ 
+-def phase_skeptic(key: str, plan_content: str, repo_path: str) -> dict:
+-    """Phase 2: Adversarial plan review."""
++def phase_skeptic(key: str, repo_path: str) -> dict:
++    """Phase 2: Adversarial plan review.
++
++    Reads the plan from disk at PLANS_DIR/{key}.md — does NOT take an
++    in-memory plan_content arg. Phase 1 must have written the plan to disk
++    before this is called (callers verify p1["ok"] first).
++    """
+     plan_file = PLANS_DIR / f"{key}.md"
+ 
+-    goal = (
+-        f"Review the plan at {plan_file} adversarially. "
+-        f"Invoke the plan-skeptic skill (use Skill tool with '/plan-skeptic {plan_file}'). "
+-        f"Output exactly one verdict line: 'VERDICT: SHIP IT', 'VERDICT: REVISE', "
+-        f"or 'VERDICT: RETHINK', followed by specific findings.\n"
+-        f"Working repo: {repo_path}."
++    # P150/MOL-500: prompt template lives in ~/.claude/agents/skeptic.md
++    prompt = safe_format(
++        _load_phase_agent("skeptic"),
++        key=key,
++        plan_file=str(plan_file),
++        repo_path=repo_path,
+     )
+-    prompt = f"{goal}\n\nPlan file: {plan_file}\nTicket: {key}."
+ 
+     _log(f"Phase 2 (Skeptic): {key}")
+     result = run_phase_with_fallback(
+@@ -1001,25 +1073,16 @@
+     plan_file = PLANS_DIR / f"{key}.md"
+     slug = key.lower().replace("_", "-")
+ 
+-    goal = (
+-        f"Implement {key} per the plan at {plan_file}.\n"
+-        f"Hard rules:\n"
+-        f"(1) Verify pwd matches {repo_path} before any git op.\n"
+-        f"(2) Branch: feature/{key}-{slug}.\n"
+-        f"(3) Commit with --no-verify.\n"
+-        f"(4) Verify commit landed with 'git log -1 --oneline'.\n"
+-        f"(5) Run tests before commit; abort if fail twice.\n"
+-        f"(6) Push to feature/* only.\n"
+-        f"(7) Open PR via gh pr create.\n"
+-        f"(8) Output PR number on its own line: 'PR_NUM=<number>'.\n"
+-        f"Working repo: {repo_path}."
++    # P150/MOL-500: prompt template lives in ~/.claude/agents/builder.md
++    plan_content_truncated = plan_content[:5000]
++    prompt = safe_format(
++        _load_phase_agent("builder"),
++        key=key,
++        slug=slug,
++        plan_file=str(plan_file),
++        plan_content_truncated=plan_content_truncated,
++        repo_path=repo_path,
+     )
+-    context = (
+-        f"Plan: {plan_content[:5000]}.\n"
+-        f"Repo: {repo_path}.\n"
+-        f"Ticket: {key}."
+-    )
+-    prompt = f"{goal}\n\nContext: {context}"
+ 
+     _log(f"Phase 3 (Builder): {key} → {repo_path}")
+     result = run_phase_with_fallback(
+@@ -1050,15 +1113,13 @@
+     """Phase 4: Review PR, write gate decision."""
+     gate_file = f"/tmp/symphony-step65-{pr_num}.gate-decision"
+ 
+-    goal = (
+-        f"Review PR #{pr_num} using the /review-pr skill. "
+-        f"Invoke Skill tool with 'pr-review-toolkit:review-pr {pr_num}'. "
+-        f"Count CRITICAL findings under '## Critical Issues (N found)'. "
+-        f"If N=0: write 'merge:0' to {gate_file} and output 'REVIEW: PASS'. "
+-        f"If N>0: write 'merge:1' to {gate_file} and output 'REVIEW: CRITICAL (N findings)'.\n"
+-        f"Working repo: {repo_path}."
++    # P150/MOL-500: prompt template lives in ~/.claude/agents/reviewer.md
++    prompt = safe_format(
++        _load_phase_agent("reviewer"),
++        pr_num=pr_num,
++        gate_file=gate_file,
++        repo_path=repo_path,
+     )
+-    prompt = f"{goal}\n\nPR: #{pr_num}. Repo: {repo_path}."
+ 
+     _log(f"Phase 4 (Reviewer): PR #{pr_num}")
+     result = run_phase_with_fallback(
+@@ -1235,7 +1296,7 @@
+ 
+         # ── Phase 2: Skeptic ───────────────────────────────────────────
+         _log("── Phase 2 (Skeptic) ──")
+-        p2 = phase_skeptic(key, plan_content, repo_path)
++        p2 = phase_skeptic(key, repo_path)
+ 
+         if p2["verdict"] == "RETHINK":
+             state["last_status"] = "incomplete"
+@@ -1260,9 +1321,8 @@
+                 dispatched += 1
+                 break
+ 
+-            plan_content = p1["plan_content"]
+-
+-            p2 = phase_skeptic(key, plan_content, repo_path)
++            plan_content = p1["plan_content"]  # needed for phase_builder below
++            p2 = phase_skeptic(key, repo_path)
+             if p2["verdict"] in ("REVISE", "RETHINK", None):
+                 state["last_status"] = "incomplete"
+                 state["attempt_count"] += 1

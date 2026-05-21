@@ -1,0 +1,94 @@
+--- /tmp/run_agent.py.pre-P187	2026-05-18 11:38:27
++++ /Users/wills_mac_mini/.hermes/hermes-agent/run_agent.py	2026-05-18 11:52:47
+@@ -3224,8 +3224,25 @@
+             # Envelope layout (native_anthropic=False): markers on inner
+             # content parts, not top-level tool messages.  Matches
+             # pi-mono's "alibaba" cacheControlFormat.
++            return True, False
++
++        # P187/MOL-641 — DeepSeek V4 series on OpenAI-wire chat.completions
++        # accepts Anthropic-style cache_control markers and serves real
++        # cache hits per provider docs. Without this branch the composer +
++        # provider re-bills the full system prompt on every turn.
++        if provider_lower == "deepseek" and "deepseek" in model_lower:
+             return True, False
+ 
++        # P187/MOL-641 — Kimi K2.6 (Moonshot) on OpenAI-wire chat.completions
++        # honours the same cache_control envelope layout. Hermes canonical
++        # provider names are "kimi-coding" (api.moonshot.ai) and
++        # "kimi-coding-cn" (api.moonshot.cn) — see auth.py:1367 alias map
++        # which rewrites bare "moonshot" → "kimi-coding" at config-load time.
++        # Without this branch Kimi traffic sees zero cached tokens despite
++        # documented cache discount on the Moonshot platform.
++        if provider_lower in {"kimi-coding", "kimi-coding-cn"} and "kimi" in model_lower:
++            return True, False
++
+         return False, False
+ 
+     def _use_anthropic_cache_markers(self) -> bool:
+@@ -3890,6 +3907,14 @@
+ 
+         def _run_review():
+             import contextlib
++            # P187/MOL-641 — lazy import of per-thread whitelist helpers.
++            # Inline here (not module-level) matches the codebase's lazy-import
++            # convention (e.g., openai inside llm.py:_call_composer) and the
++            # patch rule against new top-level imports in run_agent.py.
++            from hermes_cli.plugins import (
++                set_thread_tool_whitelist,
++                clear_thread_tool_whitelist,
++            )
+             # Install a non-interactive approval callback on this worker
+             # thread so any dangerous-command guard the review agent trips
+             # resolves to "deny" instead of falling back to input() -- which
+--- /tmp/plugins.py.pre-P187	2026-05-18 11:38:27
++++ /Users/wills_mac_mini/.hermes/hermes-agent/hermes_cli/plugins.py	2026-05-18 11:41:07
+@@ -1211,9 +1211,33 @@
+     Returns a list of non-``None`` return values from plugin callbacks.
+     """
+     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
++
++
++
++# P187/MOL-641 — per-thread tool whitelist. Restricts pre-tool-call gate to
++# a caller-defined allowed set for THIS thread only. Used by the background
++# review path so a self-review pass cannot accidentally call mutating tools.
++_thread_tool_whitelist = threading.local()
++
++
++def set_thread_tool_whitelist(allowed: set, deny_msg_fmt: str) -> None:
++    """Restrict pre-tool-call gate to ``allowed`` tool names for THIS thread.
++
++    ``deny_msg_fmt`` is a ``str.format`` template with ``{tool_name}``
++    substitution that is returned as the block message when a non-allowed
++    tool is invoked on this thread.
++    """
++    _thread_tool_whitelist.allowed = set(allowed)
++    _thread_tool_whitelist.deny_msg_fmt = deny_msg_fmt
+ 
+ 
++def clear_thread_tool_whitelist() -> None:
++    """Lift the per-thread whitelist (no-op if never set)."""
++    for attr in ("allowed", "deny_msg_fmt"):
++        if hasattr(_thread_tool_whitelist, attr):
++            delattr(_thread_tool_whitelist, attr)
+ 
++
+ def get_pre_tool_call_block_message(
+     tool_name: str,
+     args: Optional[Dict[str, Any]],
+@@ -1232,6 +1256,14 @@
+     directive wins.  Invalid or irrelevant hook return values are
+     silently ignored so existing observer-only hooks are unaffected.
+     """
++    # P187/MOL-641 — per-thread whitelist. When set by the background review
++    # path, denies any tool not in the allowed set before evaluating plugin
++    # hooks. Falls through to normal hook evaluation when not set.
++    allowed = getattr(_thread_tool_whitelist, "allowed", None)
++    if allowed is not None and tool_name not in allowed:
++        fmt = getattr(_thread_tool_whitelist, "deny_msg_fmt", "Tool {tool_name} denied")
++        return fmt.format(tool_name=tool_name)
++
+     hook_results = invoke_hook(
+         "pre_tool_call",
+         tool_name=tool_name,

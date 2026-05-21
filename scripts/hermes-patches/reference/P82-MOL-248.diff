@@ -1,0 +1,31 @@
+# P82 / MOL-248 — File-based Granola token persistence
+#
+# Affected file: plugins/memory/tiered/granola_tools.py
+#
+# Summary of changes:
+#   - Add `from hermes_constants import get_hermes_home`.
+#   - Add stdlib imports: `tempfile`, `time`, `from datetime import datetime, timezone`, `from pathlib import Path`.
+#   - Add `_TOKEN_FILE = get_hermes_home() / "state" / "granola-tokens.json"` module constant.
+#   - Add `_load_tokens_from_file() -> dict` helper (returns {} on missing/corrupt).
+#   - Add `_persist_to_file(access_token, refresh_token, expires_in)` helper
+#     (atomic write via tempfile + os.replace + chmod 0o600; mkdir parents=True).
+#   - Update `_persist_to_envchain` docstring to clarify "best-effort under sandbox".
+#   - In `_create_client()`:
+#       * `get_token()` now reads `_load_tokens_from_file()` first, falls back to env.
+#       * Add `_refresh_token()` closure (file-first refresh-token read).
+#       * `_can_refresh()` uses `_refresh_token()`.
+#       * `_refresh()` writes `_persist_to_file(...)` BEFORE calling `_persist_to_envchain(...)`.
+#         File write must succeed (raises); envchain calls are best-effort (warn-and-continue).
+#       * Update success log line to "rotated and persisted to file".
+#
+# Marker count contract (verify_patches.sh):
+#   _load_tokens_from_file() — 4 occurrences:
+#     1. function def
+#     2. get_token() body
+#     3. _refresh_token() body
+#     4. _persist_to_file() body (read existing for refresh_token preservation)
+#
+# This is a NEW behavior file, not a small surgical edit — see runtime file
+# at ~/.hermes/hermes-agent/plugins/memory/tiered/granola_tools.py for
+# the full post-patch source. To re-apply: copy that file verbatim, then
+# run `bash scripts/hermes-patches/verify_patches.sh --quiet` to confirm.

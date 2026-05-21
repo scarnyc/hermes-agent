@@ -1,0 +1,595 @@
+--- a/plugins/memory/tiered/llm.py
++++ b/plugins/memory/tiered/llm.py
+@@ -13,10 +13,26 @@
+ consolidation run — accepted as worth the operational simplification.
+ 
+ Public API `llm_compose(prompt, context)` signature is unchanged.
++
++P169 review fix-pass (silent-failure-hunter findings on PR #200):
++- Distinct `ComposerKeyMissing` / `ComposerAuthFailure` exceptions separate
++  permanent-failure modes (missing key, expired key) from transient ones
++  (rate limit, 5xx, network blip). Both write tripwires to
++  `~/.hermes/state/composer-<reason>-<ts>.json` so cron failures surface
++  via the existing maintenance-pending scanner instead of waiting for
++  MEMORY.md staleness to become user-visible.
++- `COMPOSER_BASE_URL` resolved-value logged once per process so a stale
++  `HERMES_MOCK_LLM_URL` env var doesn't silently redirect production to
++  the mock (`Mock-First Dev Loops` memory pattern).
++- Per-process `MAX_COMPOSER_CALLS_PER_RUN` budget cap guards against
++  runaway loops in multi-session ingest paths (memory_ingest_external.py
++  calls llm_compose once per session × N sessions × cron tick).
+ """
+ 
++import json
+ import logging
+ import os
++import time
+ from typing import Optional
+ 
+ logger = logging.getLogger(__name__)
+@@ -28,6 +44,10 @@
+ COMPOSER_BASE_URL = os.environ.get("HERMES_MOCK_LLM_URL", "").strip() or "https://openrouter.ai/api/v1"
+ COMPOSER_API_KEY_ENV = "OPENROUTER_API_KEY"
+ 
++# P169 review fix-pass I1: canonical endpoint — anything else triggers the
++# "stale mock URL silent redirect" guard log.
++_CANONICAL_OPENROUTER_URL = "https://openrouter.ai/api/v1"
++
+ MAX_TOKENS = 4096
+ TEMPERATURE = 0.3
+ 
+@@ -35,40 +55,141 @@
+ # is a cost guard, not an overflow guard.
+ MAX_PROMPT_CHARS = 300_000
+ 
++# P169 review fix-pass I3: per-process budget cap. Resets on gateway restart.
++# 500 covers a normal 4 AM cron (1 consolidation + up to ~100 sessions × 1
++# memory_ingest call each + headroom). Runaway loops trip it visibly.
++MAX_COMPOSER_CALLS_PER_RUN = int(os.environ.get("MEMORY_COMPOSER_MAX_CALLS_PER_RUN", "500"))
++_call_count = 0
+ 
+-def _call_composer(prompt: str) -> Optional[str]:
+-    """Call Kimi K2.6 via OpenRouter with reasoning: high.
++# P169 review fix-pass I1: one-shot announce gate for resolved BASE_URL.
++_base_url_announced = False
+ 
+-    P169/MOL-560: this was `_call_fallback` until the Ollama primary was
+-    dropped. Now the sole composer path.
++# P169 review fix-pass C2/I2: tripwire dir — matches P79/P168 patterns.
++_TRIPWIRE_DIR = os.path.expanduser("~/.hermes/state")
++
++
++class ComposerKeyMissing(RuntimeError):
++    """OPENROUTER_API_KEY not set. Permanent failure until operator intervenes."""
++
++
++class ComposerAuthFailure(RuntimeError):
++    """OpenRouter returned 401/403. Key expired or revoked — permanent until rotated."""
++
++
++def _write_tripwire(reason: str, detail: dict) -> None:
++    """Best-effort tripwire write to ~/.hermes/state/. Fails open (primary error
++    path already logged at ERROR; tripwire is the secondary audit trail)."""
++    try:
++        os.makedirs(_TRIPWIRE_DIR, exist_ok=True)
++        path = os.path.join(_TRIPWIRE_DIR, f"composer-{reason}-{int(time.time())}.json")
++        with open(path, "w") as f:
++            json.dump({"ts": time.time(), "reason": reason, **detail}, f)
++    except OSError:
++        pass
++
++
++def _announce_base_url_once() -> None:
++    """Log resolved COMPOSER_BASE_URL on first composer call.
++
++    P169 I1: guards against stale HERMES_MOCK_LLM_URL silently redirecting
++    production traffic to the mock. Non-canonical URLs log at WARNING so a
++    grep of gateway.log surfaces the override.
+     """
+-    from openai import OpenAI
++    global _base_url_announced
++    if _base_url_announced:
++        return
++    _base_url_announced = True
++    if COMPOSER_BASE_URL == _CANONICAL_OPENROUTER_URL:
++        logger.info("memory LLM composer: base_url=%s (canonical)", COMPOSER_BASE_URL)
++    else:
++        logger.warning(
++            "memory LLM composer: base_url=%s (non-canonical — HERMES_MOCK_LLM_URL active). "
++            "Confirm this is intentional; stale env var silently redirects production to mock.",
++            COMPOSER_BASE_URL,
++        )
+ 
++
++def _call_composer(prompt: str) -> str:
++    """Call Kimi K2.6 via OpenRouter with reasoning: high. Returns content text.
++
++    Raises:
++        ComposerKeyMissing: OPENROUTER_API_KEY not set in env. Logged at ERROR
++            + tripwire written before raise.
++        ComposerAuthFailure: 401/403 from OpenRouter (expired/revoked key).
++            Logged at ERROR + tripwire before raise.
++        Other openai.* exceptions: transient API errors (rate limit, 5xx,
++            network) — caller's `llm_compose` outer except catches at WARNING.
++    """
++    _announce_base_url_once()
++
++    from openai import OpenAI, AuthenticationError, PermissionDeniedError
++
+     api_key = os.environ.get(COMPOSER_API_KEY_ENV, "").strip()
+     if not api_key:
+-        logger.warning(
+-            "Memory LLM composer unavailable — %s not set", COMPOSER_API_KEY_ENV
++        logger.error(
++            "Memory LLM composer: %s not set — composer is permanently degraded. "
++            "Re-launch gateway under envchain or check ~/.hermes/.env loader.",
++            COMPOSER_API_KEY_ENV,
+         )
+-        return None
++        _write_tripwire("key-missing", {"env_var": COMPOSER_API_KEY_ENV})
++        raise ComposerKeyMissing(f"{COMPOSER_API_KEY_ENV} not set")
+ 
+     client = OpenAI(base_url=COMPOSER_BASE_URL, api_key=api_key)
+-    response = client.chat.completions.create(
+-        model=COMPOSER_MODEL,
+-        max_tokens=MAX_TOKENS,
+-        temperature=TEMPERATURE,
+-        messages=[{"role": "user", "content": prompt}],
+-        extra_body={
+-            "reasoning": {"enabled": True, "effort": "high"},
+-        },
+-    )
++    try:
++        response = client.chat.completions.create(
++            model=COMPOSER_MODEL,
++            max_tokens=MAX_TOKENS,
++            temperature=TEMPERATURE,
++            messages=[{"role": "user", "content": prompt}],
++            extra_body={
++                "reasoning": {"enabled": True, "effort": "high"},
++            },
++        )
++    except (AuthenticationError, PermissionDeniedError) as e:
++        # 401/403 — expired or revoked key. Permanent failure until operator
++        # rotates the credential. Distinct from transient API errors so the
++        # tripwire scanner can escalate it specifically.
++        logger.error(
++            "Memory LLM composer: AUTH FAILURE (%s: %s). Key likely expired or revoked. "
++            "Composer fails every subsequent call until rotated via envchain.",
++            type(e).__name__, str(e)[:200],
++        )
++        _write_tripwire("auth-failure", {
++            "error_class": type(e).__name__,
++            "detail": str(e)[:200],
++        })
++        raise ComposerAuthFailure(str(e)) from e
+     return response.choices[0].message.content
+ 
+ 
+ def llm_compose(prompt: str, context: str) -> Optional[str]:
+     """Compose memory via Kimi K2.6 composer. Returns text or None on failure.
+ 
+-    P169/MOL-560: no longer has a local-vs-cloud chain — Kimi-only.
++    P169 contract change: pre-P169 the Ollama-then-Kimi chain meant `None`
++    was a rare both-failed case. Post-P169 `None` covers any single failure
++    — callers should treat `None` as a loud event and surface it (see
++    consolidation.py and hot_cache.py for the canonical patterns).
++
++    Permanent-failure paths (missing key, auth failure, budget exceeded)
++    log at ERROR + write tripwires to `~/.hermes/state/composer-*.json`.
++    Transient paths (rate limit, 5xx, empty response) log at WARNING.
++    Either way the return is `None`; distinguish via the audit trail.
+     """
++    global _call_count
++
++    # I3 budget cap — runaway-loop guard. Resets on process restart.
++    if _call_count >= MAX_COMPOSER_CALLS_PER_RUN:
++        logger.error(
++            "Memory LLM composer: budget cap hit (%d calls this process). "
++            "Increase MEMORY_COMPOSER_MAX_CALLS_PER_RUN or restart gateway.",
++            MAX_COMPOSER_CALLS_PER_RUN,
++        )
++        _write_tripwire("budget-exceeded", {
++            "cap": MAX_COMPOSER_CALLS_PER_RUN,
++            "called": _call_count,
++        })
++        return None
++
+     full = f"{prompt}\n\n{context}"
+     if len(full) > MAX_PROMPT_CHARS:
+         logger.error(
+@@ -79,6 +200,7 @@
+         )
+         full = full[:MAX_PROMPT_CHARS] + "\n\n[...truncated for size cap — see MOL-168...]"
+ 
++    _call_count += 1
+     try:
+         result = _call_composer(full)
+         if result:
+@@ -86,9 +208,16 @@
+             return result
+         logger.warning("memory LLM composer returned empty content")
+         return None
++    except (ComposerKeyMissing, ComposerAuthFailure):
++        # Already logged at ERROR + tripwire written inside _call_composer.
++        # Don't double-log; return None per public-API contract.
++        return None
+     except Exception as e:
++        # Transient API errors (rate limit, 5xx, network blip). Caller still
++        # treats None as a failure, but log severity reflects that this class
++        # of failure typically self-resolves on the next cron tick.
+         logger.warning(
+-            "memory LLM composer failed (%s: %s)",
++            "memory LLM composer failed transient (%s: %s)",
+             type(e).__name__, str(e)[:200],
+         )
+         return None
+--- a/plugins/memory/tiered/consolidation.py
++++ b/plugins/memory/tiered/consolidation.py
+@@ -4,8 +4,10 @@
+ Chains housekeeping after completion.
+ """
+ 
++import json
+ import logging
+ import os
++import time
+ from pathlib import Path
+ from typing import Optional
+ 
+@@ -60,6 +62,7 @@
+         "entries_24h": 0,
+         "entries_7d": 0,
+         "updated": False,
++        "composer_failed": False,  # P169/MOL-560 review fix-pass: signal llm_compose None case
+         "housekeeping": None,
+         "deduped": 0,
+         "telegram_sent": False,
+@@ -151,6 +154,30 @@
+             tmp_path.rename(memory_path)
+             result["updated"] = True
+             logger.info("Consolidation: updated MEMORY.md (%d lines)", len(lines))
++        else:
++            # P169/MOL-560 review fix-pass: llm_compose returned None — surface
++            # loudly. Pre-P169 this required BOTH local Ollama AND Kimi to fail;
++            # post-P169 any single Kimi failure (rate limit, auth, network)
++            # lands here. The tripwire + ERROR log ensure the cron-failure
++            # signal pipeline (P45-P48) catches it the next morning instead of
++            # waiting until MEMORY.md staleness becomes user-visible.
++            result["composer_failed"] = True
++            logger.error(
++                "Consolidation: composer failed (llm_compose returned None) — "
++                "MEMORY.md NOT updated. Check ~/.hermes/state/composer-*.json + gateway.log."
++            )
++            try:
++                tripwire_dir = Path.home() / ".hermes" / "state"
++                tripwire_dir.mkdir(parents=True, exist_ok=True)
++                tripwire = tripwire_dir / f"consolidation-failed-{int(time.time())}.json"
++                tripwire.write_text(json.dumps({
++                    "ts": time.time(),
++                    "reason": "llm_compose returned None",
++                    "entries_24h_count": len(entries_24h),
++                    "entries_7d_count": len(entries_7d),
++                }))
++            except OSError:
++                pass  # Fail-open; primary ERROR log already surfaces the failure.
+ 
+     # Step 6: Telegram nudge
+     if len(result["patterns"]) >= 2:
+--- a/plugins/memory/tiered/hot_cache.py
++++ b/plugins/memory/tiered/hot_cache.py
+@@ -74,7 +74,10 @@
+     result = llm_compose(prompt, context)
+ 
+     if not result:
+-        logger.info("LLM composition returned empty — preserving existing MEMORY.md")
++        # P169/MOL-560 review fix-pass: bumped from info → warning. With the
++        # Ollama primary removed, every composer failure surfaces here; INFO
++        # severity was burying the signal in routine cron logs.
++        logger.warning("LLM composition returned empty — preserving existing MEMORY.md")
+         return False
+ 
+     # Strip markdown code fences (LLM sometimes wraps output)
+--- a/plugins/memory/tiered/tests/test_llm.py
++++ b/plugins/memory/tiered/tests/test_llm.py
+@@ -1,105 +1,227 @@
+-"""Tests for llm.py — shared LLM helper for tiered memory composition."""
++"""Tests for llm.py — Kimi K2.6 composer (post-P169/MOL-560).
+ 
++P169 review fix-pass: this test file replaces the pre-P169 surface which
++asserted against `claude-haiku-4-5-20251001` + `anthropic_adapter` — both
++retired since at least P151. The new tests cover the four critical-class
++scenarios surfaced by silent-failure-hunter + pr-test-analyzer on PR #200:
++
++  1. Happy path — OpenRouter mock returns content; assert call_args has
++     reasoning.effort = "high" (regression guard for I3).
++  2. OPENROUTER_API_KEY not set — raise ComposerKeyMissing inside
++     _call_composer; llm_compose catches and returns None; ERROR log +
++     tripwire written. Most likely production failure mode (envchain drift).
++  3. Auth failure (401/403) — raise ComposerAuthFailure inside
++     _call_composer; ERROR log + tripwire. Distinct from transient errors.
++  4. Transient API error — generic exception → WARNING log + None return.
++  5. HERMES_MOCK_LLM_URL routing — env var honored; non-canonical URLs log
++     at WARNING (guards against stale-env-var silent redirect).
++  6. MAX_PROMPT_CHARS truncation — input > 300k chars truncated with marker.
++"""
++
++import importlib
++import os
+ import sys
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ 
+ 
++def _reload_llm():
++    """Reload llm.py so module-level constants (BASE_URL, _call_count,
++    _base_url_announced) reset to fresh state per test. Required because
++    P169's per-process counter + announce-once gate are intentionally
++    module-level singletons."""
++    mod_name = "plugins.memory.tiered.llm"
++    if mod_name in sys.modules:
++        del sys.modules[mod_name]
++    return importlib.import_module(mod_name)
++
++
+ class TestLlmComposeSuccess:
+-    def test_llm_compose_success(self):
+-        """Mock adapter: token + client work. Verify messages.create call shape."""
++    def test_llm_compose_success_with_reasoning_payload(self):
++        """Happy path — mock OpenAI client, assert content returned AND
++        reasoning.effort=high is in the call's extra_body. P169 review
++        fix-pass C4: source-pattern verifier can't catch a runtime payload
++        regression; this test locks the call-shape behaviorally."""
+         mock_response = MagicMock()
+-        mock_response.content = [MagicMock(text="Composed memory output")]
+-
++        mock_response.choices = [MagicMock(message=MagicMock(content="Composed memory output"))]
+         mock_client = MagicMock()
+-        mock_client.messages.create.return_value = mock_response
++        mock_client.chat.completions.create.return_value = mock_response
+ 
+-        mock_build = MagicMock(return_value=mock_client)
+-        mock_resolve = MagicMock(return_value="test-token-abc")
++        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}, clear=False):
++            llm = _reload_llm()
++            with patch("openai.OpenAI", return_value=mock_client):
++                result = llm.llm_compose("Compose memory", "Context data")
+ 
+-        with patch.dict("sys.modules", {
+-            "agent": MagicMock(),
+-            "agent.anthropic_adapter": MagicMock(
+-                build_anthropic_client=mock_build,
+-                resolve_anthropic_token=mock_resolve,
+-            ),
+-        }):
+-            # Re-import to pick up the mocked modules
+-            from plugins.memory.tiered.llm import llm_compose
++        assert result == "Composed memory output"
++        mock_client.chat.completions.create.assert_called_once()
++        kwargs = mock_client.chat.completions.create.call_args.kwargs
++        assert kwargs["model"] == "moonshotai/kimi-k2.6"
++        assert kwargs["max_tokens"] == 4096
++        assert kwargs["temperature"] == 0.3
++        # P169 C4 lock-in: reasoning_effort regression guard.
++        assert kwargs["extra_body"]["reasoning"]["enabled"] is True
++        assert kwargs["extra_body"]["reasoning"]["effort"] == "high"
++        # Single user message containing the joined prompt+context.
++        assert len(kwargs["messages"]) == 1
++        assert kwargs["messages"][0]["role"] == "user"
++        assert "Compose memory" in kwargs["messages"][0]["content"]
++        assert "Context data" in kwargs["messages"][0]["content"]
+ 
+-            result = llm_compose("Compose memory", "Context data here")
+ 
+-        assert result == "Composed memory output"
+-        mock_resolve.assert_called_once()
+-        mock_build.assert_called_once_with("test-token-abc")
+-        mock_client.messages.create.assert_called_once()
++class TestLlmComposeNoApiKey:
++    def test_llm_compose_missing_api_key_returns_none_writes_tripwire(self, tmp_path, monkeypatch, caplog):
++        """P169 review fix-pass C2 + C3: OPENROUTER_API_KEY unset is the
++        most likely production failure (envchain drift). Must return None,
++        log at ERROR, and write a tripwire."""
++        monkeypatch.setenv("OPENROUTER_API_KEY", "")
++        # Redirect tripwire dir to tmp_path so the test doesn't pollute real state.
++        llm = _reload_llm()
++        monkeypatch.setattr(llm, "_TRIPWIRE_DIR", str(tmp_path))
+ 
+-        call_kwargs = mock_client.messages.create.call_args
+-        assert call_kwargs[1]["model"] == "claude-haiku-4-5-20251001"
+-        assert call_kwargs[1]["max_tokens"] == 4096
+-        assert call_kwargs[1]["temperature"] == 0.3
+-        assert len(call_kwargs[1]["messages"]) == 1
+-        assert call_kwargs[1]["messages"][0]["role"] == "user"
+-        assert "Compose memory" in call_kwargs[1]["messages"][0]["content"]
+-        assert "Context data here" in call_kwargs[1]["messages"][0]["content"]
++        with caplog.at_level("ERROR", logger="plugins.memory.tiered.llm"):
++            result = llm.llm_compose("Compose", "Context")
+ 
++        assert result is None
++        assert "OPENROUTER_API_KEY not set" in caplog.text
++        tripwires = list(tmp_path.glob("composer-key-missing-*.json"))
++        assert len(tripwires) == 1, f"expected 1 key-missing tripwire, got {len(tripwires)}"
+ 
+-class TestLlmComposeNoToken:
+-    def test_llm_compose_no_token(self):
+-        """resolve_anthropic_token returns None. Verify returns None, no client created."""
+-        mock_build = MagicMock()
+-        mock_resolve = MagicMock(return_value=None)
+ 
+-        with patch.dict("sys.modules", {
+-            "agent": MagicMock(),
+-            "agent.anthropic_adapter": MagicMock(
+-                build_anthropic_client=mock_build,
+-                resolve_anthropic_token=mock_resolve,
+-            ),
+-        }):
+-            from plugins.memory.tiered.llm import llm_compose
++class TestLlmComposeAuthError:
++    def test_llm_compose_auth_failure_returns_none_writes_tripwire(self, tmp_path, monkeypatch, caplog):
++        """P169 review fix-pass I2: expired/revoked OpenRouter key returns
++        AuthenticationError. Must surface at ERROR + tripwire (distinct from
++        transient errors that log at WARNING)."""
++        from openai import AuthenticationError
+ 
+-            result = llm_compose("Compose memory", "Context data")
++        monkeypatch.setenv("OPENROUTER_API_KEY", "expired-key")
++        llm = _reload_llm()
++        monkeypatch.setattr(llm, "_TRIPWIRE_DIR", str(tmp_path))
+ 
++        mock_client = MagicMock()
++        # openai.AuthenticationError requires positional args (message, response, body).
++        auth_err = AuthenticationError(
++            message="invalid_api_key",
++            response=MagicMock(status_code=401, request=MagicMock()),
++            body=None,
++        )
++        mock_client.chat.completions.create.side_effect = auth_err
++
++        with patch("openai.OpenAI", return_value=mock_client):
++            with caplog.at_level("ERROR", logger="plugins.memory.tiered.llm"):
++                result = llm.llm_compose("Compose", "Context")
++
+         assert result is None
+-        mock_resolve.assert_called_once()
+-        mock_build.assert_not_called()
++        assert "AUTH FAILURE" in caplog.text
++        tripwires = list(tmp_path.glob("composer-auth-failure-*.json"))
++        assert len(tripwires) == 1, f"expected 1 auth-failure tripwire, got {len(tripwires)}"
+ 
+ 
+-class TestLlmComposeApiError:
+-    def test_llm_compose_api_error(self):
+-        """client.messages.create raises Exception. Verify returns None."""
++class TestLlmComposeTransientError:
++    def test_llm_compose_transient_api_error_returns_none_logs_warning(self, monkeypatch, caplog):
++        """P169 review fix-pass I4: rate limit / 5xx / network blip should
++        log at WARNING (not ERROR — these self-resolve on next tick) and
++        return None without writing a permanent-failure tripwire."""
++        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
++        llm = _reload_llm()
++
+         mock_client = MagicMock()
+-        mock_client.messages.create.side_effect = Exception("API timeout")
++        mock_client.chat.completions.create.side_effect = Exception("OpenRouter 503 backend overloaded")
+ 
+-        mock_build = MagicMock(return_value=mock_client)
+-        mock_resolve = MagicMock(return_value="test-token-abc")
++        with patch("openai.OpenAI", return_value=mock_client):
++            with caplog.at_level("WARNING", logger="plugins.memory.tiered.llm"):
++                result = llm.llm_compose("Compose", "Context")
+ 
+-        with patch.dict("sys.modules", {
+-            "agent": MagicMock(),
+-            "agent.anthropic_adapter": MagicMock(
+-                build_anthropic_client=mock_build,
+-                resolve_anthropic_token=mock_resolve,
+-            ),
+-        }):
+-            from plugins.memory.tiered.llm import llm_compose
++        assert result is None
++        assert "transient" in caplog.text
++        assert "503 backend overloaded" in caplog.text
++        # No ERROR-class log; no tripwire dir spam for transient errors.
++        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
++        assert not error_records, f"transient error should not log at ERROR; got: {error_records}"
+ 
+-            result = llm_compose("Compose memory", "Context data")
+ 
+-        assert result is None
++class TestLlmComposeMockUrlRouting:
++    def test_hermes_mock_llm_url_redirects_base_url(self, monkeypatch):
++        """P169 review fix-pass I5: HERMES_MOCK_LLM_URL routes COMPOSER_BASE_URL
++        to the local mock for mock-first dev loops. Empty-string value must
++        not mask via .strip() (project memory: stale-env-var trap)."""
++        monkeypatch.setenv("HERMES_MOCK_LLM_URL", "http://localhost:4010")
++        llm = _reload_llm()
++        assert llm.COMPOSER_BASE_URL == "http://localhost:4010"
+ 
++        # Empty-string env var must NOT redirect (defense against masking).
++        monkeypatch.setenv("HERMES_MOCK_LLM_URL", "")
++        llm = _reload_llm()
++        assert llm.COMPOSER_BASE_URL == "https://openrouter.ai/api/v1"
+ 
+-class TestLlmComposeAdapterImportError:
+-    def test_llm_compose_adapter_import_error(self):
+-        """Import of anthropic_adapter fails. Verify returns None."""
+-        # Setting modules to None causes ImportError on from ... import
+-        with patch.dict("sys.modules", {
+-            "agent": None,
+-            "agent.anthropic_adapter": None,
+-        }):
+-            from plugins.memory.tiered.llm import llm_compose
++    def test_non_canonical_base_url_logs_warning(self, monkeypatch, caplog):
++        """P169 I1: non-canonical BASE_URL announces at WARNING so a stale
++        HERMES_MOCK_LLM_URL doesn't silently redirect production to mock."""
++        monkeypatch.setenv("HERMES_MOCK_LLM_URL", "http://localhost:4010")
++        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
++        llm = _reload_llm()
+ 
+-            result = llm_compose("Compose memory", "Context data")
++        mock_response = MagicMock()
++        mock_response.choices = [MagicMock(message=MagicMock(content="ok"))]
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = mock_response
+ 
+-        assert result is None
++        with patch("openai.OpenAI", return_value=mock_client):
++            with caplog.at_level("WARNING", logger="plugins.memory.tiered.llm"):
++                llm.llm_compose("p", "c")
++
++        # The warning should fire EXACTLY once (announce-once gate).
++        warnings = [r for r in caplog.records if "non-canonical" in r.message]
++        assert len(warnings) == 1, f"expected exactly one non-canonical warning, got {len(warnings)}"
++
++
++class TestLlmComposeTruncation:
++    def test_oversize_input_is_truncated_with_marker(self, monkeypatch):
++        """P169 review fix-pass I5: prompts > MAX_PROMPT_CHARS (300k) are
++        truncated with a visible marker. Loop guard — without this, a
++        runaway upstream input could pass the gateway-side request size
++        guards but fail at OpenRouter with an unhelpful 400."""
++        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
++        llm = _reload_llm()
++
++        mock_response = MagicMock()
++        mock_response.choices = [MagicMock(message=MagicMock(content="ok"))]
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = mock_response
++
++        huge_context = "x" * 400_000
++        with patch("openai.OpenAI", return_value=mock_client):
++            llm.llm_compose("p", huge_context)
++
++        sent = mock_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
++        assert len(sent) <= llm.MAX_PROMPT_CHARS + 200  # marker adds < 200 chars
++        assert "[...truncated for size cap — see MOL-168...]" in sent
++
++
++class TestLlmComposeBudgetCap:
++    def test_budget_cap_returns_none_after_max_calls(self, monkeypatch, tmp_path, caplog):
++        """P169 review fix-pass I3: per-process call counter caps composer
++        runaway. Once MAX_COMPOSER_CALLS_PER_RUN is reached, further calls
++        return None + log ERROR + write tripwire without contacting OpenRouter."""
++        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
++        monkeypatch.setenv("MEMORY_COMPOSER_MAX_CALLS_PER_RUN", "2")
++        llm = _reload_llm()
++        monkeypatch.setattr(llm, "_TRIPWIRE_DIR", str(tmp_path))
++
++        mock_response = MagicMock()
++        mock_response.choices = [MagicMock(message=MagicMock(content="ok"))]
++        mock_client = MagicMock()
++        mock_client.chat.completions.create.return_value = mock_response
++
++        with patch("openai.OpenAI", return_value=mock_client):
++            assert llm.llm_compose("p", "c") == "ok"
++            assert llm.llm_compose("p", "c") == "ok"
++            with caplog.at_level("ERROR", logger="plugins.memory.tiered.llm"):
++                third = llm.llm_compose("p", "c")
++        assert third is None
++        assert "budget cap hit" in caplog.text
++        tripwires = list(tmp_path.glob("composer-budget-exceeded-*.json"))
++        assert len(tripwires) == 1
++        # Third call must not have reached OpenRouter.
++        assert mock_client.chat.completions.create.call_count == 2

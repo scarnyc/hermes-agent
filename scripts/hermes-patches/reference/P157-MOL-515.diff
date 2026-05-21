@@ -1,0 +1,520 @@
+diff --git a/.hermes/scripts/symphony_daemon.py b/.hermes/scripts/symphony_daemon.py
+new file mode 100644
+index 0000000..0000001
+--- /dev/null
++++ b/.hermes/scripts/symphony_daemon.py
+@@ -0,0 +1,421 @@
++"""Symphony v2 long-running daemon — owns its own loop over queue.db.
++PATCH: P157/MOL-515.
++
++Replaces the cron-as-driver model that hit a 3600s SIGKILL ceiling when
++MOL-481 ran past the cron timeout on 2026-05-10. launchd's KeepAlive
++restarts the daemon on crash instead of killing it on a clock.
++
++Pipeline per loop iteration:
++  1. (Pre-tick) PAUSED file present → sleep, continue.
++  2. Heartbeat write (best-effort; OSError logged, not fatal).
++  3. get_next_claimable(queue.db) → candidate or None.
++  4. (DRY_RUN) if DRY_RUN file present → log would-claim, sleep, continue.
++  5. claim_ticket(queue.db, key, "daemon") → True (won) | False (lost race).
++  6. symphony_bridge.run_one(key) → RunResult.
++  7. release_ticket(queue.db, key, final_state, ...) per mapping table.
++  8. Sleep policy (placeholder flat 60s; real cadence ships in P158 — 4d).
++
++Crash recovery: on daemon startup, the orphan-running sweep flips any
++queue.db rows stuck in 'running' to 'failed'. Reason — the daemon is the
++ONLY writer of queue.db 'running' state during Phase 4c (cron path is
++purely JSON-state until the USE_DAEMON wire-up in P159 — 4e — touches
++the cron-fallback claim primitive). So any row observed in 'running' at
++startup is by definition the result of a prior daemon crash, SIGKILL, or
++admin-initiated stop. This closes the gap noted in the migrate_state_to_queue.py
++docstring which punts queue.db sweep to 'the daemon or the USE_DAEMON wire-up'.
++
++Shutdown semantics: SIGTERM/SIGINT set a shutdown flag; the loop checks
++the flag at the TOP of each iteration. An in-flight run_one() is NOT
++interrupted — the daemon waits for the current ticket to complete before
++exiting. This is on purpose: killing claude -p mid-flight wastes the
++partial work and may leave a half-merged PR.
++
++DRY_RUN: when ~/.hermes/symphony/DRY_RUN exists, the daemon polls but
++DOES NOT claim. The would-claim log line gives operators visibility
++without state mutation. Mirrors symphony_bridge.main()'s DRY_RUN gate.
++
++PAUSED: when ~/.hermes/symphony/PAUSED exists, the daemon doesn't even
++poll. Used for operational shutdown without unloading the plist.
++
++Plan reference: ~/.claude/plans/in-layman-s-terms-are-abstract-wreath.md
++§ "Phase 4 — Daemon, not cron".
++"""
++
++from __future__ import annotations
++
++import signal
++import sqlite3
++import sys
++import time
++from datetime import datetime, timedelta
++from pathlib import Path
++from typing import Any, Callable
++from zoneinfo import ZoneInfo
++
++# Sibling-module import — daemon is invoked as a plain script by launchd.
++sys.path.insert(0, str(Path(__file__).parent))
++import symphony_queue as sq  # noqa: E402
++import symphony_bridge  # noqa: E402
++
++_ET = ZoneInfo("America/New_York")
++_HERMES_HOME = Path.home() / ".hermes"
++_QUEUE_DB = _HERMES_HOME / "symphony" / "queue.db"
++_HEARTBEAT_FILE = _HERMES_HOME / "symphony" / "daemon-heartbeat"
++_PAUSED_FILE = _HERMES_HOME / "symphony" / "PAUSED"
++_DRY_RUN_FILE = _HERMES_HOME / "symphony" / "DRY_RUN"
++_LOG_DIR = _HERMES_HOME / "logs"
++
++# Sleep policy placeholders — real cadence ships in P158 (Phase 4d).
++# These are intentionally flat so 4c can be code-reviewed independently
++# of cadence-decision logic. Numbers chosen to be slow enough to not
++# hot-spin under transient queue errors and fast enough to be responsive
++# during the soak.
++_IDLE_SLEEP_SECS = 60
++_SUCCESS_SLEEP_SECS = 60
++_FAILURE_SLEEP_SECS = 60
++_LOST_RACE_SLEEP_SECS = 30
++_TRANSIENT_ERROR_SLEEP_SECS = 60
++_HEARTBEAT_INTERVAL_SECS = 60
++
++_RUNNER_ID = "daemon"
++
++# PR-URL pattern. The daemon currently targets a single repo (the project
++# `symphony_bridge.run_one` operates on); change here if/when the daemon
++# is generalized to multiple repos.
++_PR_URL_PREFIX = "https://github.com/scarnyc/hermes-control-plane/pull/"
++
++# Canonical RunResult.final_status → (queue.db final_state, error_class).
++# Module-level so the verifier asserts presence + a unit test asserts
++# every FinalStatus literal is covered. The _map_result_to_queue_state
++# fallback catches new vocabulary additions loudly rather than silently
++# treating them as 'failed'.
++_STATUS_TO_QUEUE_STATE: dict[str, tuple[str, str | None]] = {
++    "succeeded": ("succeeded", None),
++    "incomplete": ("failed", "incomplete"),
++    "failed": ("failed", "planner_failed"),
++    "dry_run": ("pending", None),
++    "skipped_max_attempts": ("blocked", None),
++    "skipped_recently_running": ("pending", None),
++    "skipped_succeeded_in_progress": ("succeeded", None),
++    "skipped_progressed": ("succeeded", None),
++}
++
++# Per-status `next_attempt_at` delay (seconds). When a status is released back
++# to a non-terminal queue state, the delay gates re-claim via the queue's
++# get_next_claimable WHERE julianday(next_attempt_at) <= julianday(now) filter.
++#
++# `skipped_recently_running` is the critical case: run_one returns this when
++# the cron-path JSON state shows last_status='running' < 60min ago. Without a
++# delay, the daemon would immediately re-claim on the next iteration, burn an
++# attempt_count, hit run_one's same staleness check, return the same status,
++# release back to pending, and busy-loop for up to 60 minutes until the cron
++# tick clears (`worst case 40+ iterations`). Matching the 3600s cron staleness
++# window means the daemon doesn't poll this ticket again until the cron-side
++# observation that justified the skip has aged out.
++#
++# Statuses not listed default to no delay (immediate re-eligibility), which is
++# correct for terminal states (`succeeded`, `blocked`) and for the placeholder
++# failure path until P158 (Phase 4d) ships real backoff cadence.
++_STATUS_TO_NEXT_ATTEMPT_DELAY_SECS: dict[str, int] = {
++    "skipped_recently_running": 3600,
++}
++
++# Module-level shutdown flag set by signal handlers. Read at the top of
++# each loop iteration. Single-threaded daemon, so simple bool is safe.
++_shutdown_requested = False
++
++
++def _now_iso() -> str:
++    return datetime.now(_ET).isoformat()
++
++
++def _log(msg: str) -> None:
++    print(f"[{_now_iso()}] [daemon] {msg}", flush=True)
++
++
++def _install_signal_handlers() -> None:
++    def handler(signum: int, _frame: Any) -> None:
++        global _shutdown_requested
++        _shutdown_requested = True
++        _log(
++            f"signal {signal.Signals(signum).name} received — will exit "
++            f"after current ticket"
++        )
++
++    signal.signal(signal.SIGTERM, handler)
++    signal.signal(signal.SIGINT, handler)
++
++
++def _heartbeat() -> None:
++    """Touch the heartbeat file with current ISO timestamp.
++
++    Caller wraps in try/except OSError — heartbeat failures are
++    non-fatal. Absence of the file = daemon hasn't started; stale
++    file = daemon wedged. Both are operator-visible signals.
++    """
++    _HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
++    _HEARTBEAT_FILE.write_text(_now_iso())
++
++
++def startup_sweep(queue_db: Path = _QUEUE_DB) -> int:
++    """Flip orphan queue.db 'running' rows to 'failed' at daemon start.
++
++    Reason — daemon is the ONLY writer of queue.db 'running' state during
++    Phase 4c. Any row observed in 'running' at startup is the result of
++    a prior daemon crash / SIGKILL / admin stop. Closes the gap that
++    migrate_state_to_queue.py's docstring punts to 'daemon or USE_DAEMON
++    wire-up' (post-renumber: this file or P159 — Phase 4e).
++
++    Returns the row count flipped. Does NOT raise on empty sweep —
++    rowcount==0 is the happy path on first boot.
++    """
++    now = _now_iso()
++    with sqlite3.connect(queue_db, isolation_level=None) as conn:
++        cur = conn.execute(
++            """
++            UPDATE tickets
++               SET state = 'failed',
++                   last_outcome = 'fail',
++                   last_error_class = 'daemon_crash_sweep',
++                   updated_at = ?,
++                   runs_log = json_insert(
++                     runs_log,
++                     '$[#]',
++                     json_object(
++                       'ts', ?,
++                       'event', 'daemon_crash_sweep',
++                       'note', 'orphan running row at daemon startup'
++                     )
++                   )
++             WHERE state = 'running'
++            """,
++            (now, now),
++        )
++        return cur.rowcount
++
++
++def _map_result_to_queue_state(
++    result: symphony_bridge.RunResult,
++) -> tuple[str, str | None]:
++    """RunResult → (queue.db final_state, last_error_class).
++
++    Falls back to ('failed', 'unknown_run_result_status') for unrecognized
++    final_status so a future RunResult vocab addition doesn't silently
++    break the daemon's release path. The unit test asserts every member
++    of FinalStatus is covered by _STATUS_TO_QUEUE_STATE so the fallback
++    is unreachable under the current contract.
++    """
++    if result.final_status in _STATUS_TO_QUEUE_STATE:
++        return _STATUS_TO_QUEUE_STATE[result.final_status]
++    return ("failed", "unknown_run_result_status")
++
++
++def _next_attempt_at_for(final_status: str) -> str | None:
++    """Compute the queue-level `next_attempt_at` ISO timestamp for a given
++    RunResult.final_status. Returns None for statuses with no delay.
++
++    Encapsulated so the verifier + unit tests can assert the timestamp
++    shape without re-deriving the offset logic.
++    """
++    delay = _STATUS_TO_NEXT_ATTEMPT_DELAY_SECS.get(final_status)
++    if delay is None:
++        return None
++    return (datetime.now(_ET) + timedelta(seconds=delay)).isoformat()
++
++
++def _release_after_dispatch(
++    queue_db: Path,
++    key: str,
++    result: symphony_bridge.RunResult,
++) -> None:
++    """Release a claimed ticket per result mapping; swallow release errors.
++
++    A release-time exception (queue.db locked, row already advanced) is
++    logged and dropped — the daemon's next loop iteration continues
++    rather than dying. Stuck rows from a failed release are picked up by
++    the startup sweep on the daemon's next restart.
++    """
++    final_state, error_class = _map_result_to_queue_state(result)
++    last_outcome = "pass" if final_state == "succeeded" else "fail"
++    pr_url = None
++    if result.pr_num:
++        pr_url = f"{_PR_URL_PREFIX}{result.pr_num}"
++    next_attempt_at = _next_attempt_at_for(result.final_status)
++    try:
++        sq.release_ticket(
++            queue_db,
++            key,
++            final_state=final_state,
++            last_outcome=last_outcome,
++            last_error_class=error_class,
++            last_pr_url=pr_url,
++            next_attempt_at=next_attempt_at,
++        )
++        suffix = f" next_at={next_attempt_at}" if next_attempt_at else ""
++        _log(f"released {key} → {final_state} (outcome={last_outcome}){suffix}")
++    except (sqlite3.Error, RuntimeError, ValueError) as exc:
++        _log(f"release_ticket failed for {key}: {exc!r}")
++
++
++def run_loop(
++    *,
++    queue_db: Path = _QUEUE_DB,
++    sleep_fn: Callable[[float], None] = time.sleep,
++    monotonic_fn: Callable[[], float] = time.monotonic,
++    max_iterations: int | None = None,
++) -> int:
++    """Main daemon loop. Returns iteration count.
++
++    `max_iterations` is for tests — production callers leave it None and
++    rely on the shutdown signal flag to break out. A clean SIGTERM lets
++    the in-flight ticket finish (the flag is checked at the TOP of each
++    iteration, not mid-dispatch).
++    """
++    iterations = 0
++    last_heartbeat_mono: float = 0.0
++
++    while not _shutdown_requested:
++        if _PAUSED_FILE.exists():
++            _log("PAUSED file present — sleeping")
++            sleep_fn(_IDLE_SLEEP_SECS)
++            iterations += 1
++            if max_iterations is not None and iterations >= max_iterations:
++                return iterations
++            continue
++
++        now_mono = monotonic_fn()
++        if now_mono - last_heartbeat_mono >= _HEARTBEAT_INTERVAL_SECS:
++            try:
++                _heartbeat()
++                last_heartbeat_mono = now_mono
++            except OSError as exc:
++                _log(f"heartbeat write failed: {exc!r}")
++
++        try:
++            candidate = sq.get_next_claimable(queue_db)
++        except sqlite3.OperationalError as exc:
++            _log(f"get_next_claimable transient error: {exc!r}; backing off")
++            sleep_fn(_TRANSIENT_ERROR_SLEEP_SECS)
++            iterations += 1
++            if max_iterations is not None and iterations >= max_iterations:
++                return iterations
++            continue
++
++        if candidate is None:
++            sleep_fn(_IDLE_SLEEP_SECS)
++            iterations += 1
++            if max_iterations is not None and iterations >= max_iterations:
++                return iterations
++            continue
++
++        key = candidate["key"]
++
++        if _DRY_RUN_FILE.exists():
++            _log(f"DRY_RUN: would claim {key}")
++            sleep_fn(_IDLE_SLEEP_SECS)
++            iterations += 1
++            if max_iterations is not None and iterations >= max_iterations:
++                return iterations
++            continue
++
++        try:
++            won = sq.claim_ticket(queue_db, key, _RUNNER_ID)
++        except sqlite3.OperationalError as exc:
++            _log(
++                f"claim_ticket transient error for {key}: {exc!r}; backing off"
++            )
++            sleep_fn(_TRANSIENT_ERROR_SLEEP_SECS)
++            iterations += 1
++            if max_iterations is not None and iterations >= max_iterations:
++                return iterations
++            continue
++
++        if not won:
++            _log(f"lost claim race on {key}; re-polling")
++            sleep_fn(_LOST_RACE_SLEEP_SECS)
++            iterations += 1
++            if max_iterations is not None and iterations >= max_iterations:
++                return iterations
++            continue
++
++        _log(f"claimed {key}; dispatching to run_one")
++
++        try:
++            result = symphony_bridge.run_one(key, dry_run=False)
++        except Exception as exc:
++            _log(f"run_one raised for {key}: {exc!r}; releasing as failed")
++            try:
++                sq.release_ticket(
++                    queue_db,
++                    key,
++                    final_state="failed",
++                    last_outcome="fail",
++                    last_error_class="run_one_exception",
++                )
++            except (sqlite3.Error, RuntimeError, ValueError) as inner:
++                _log(
++                    f"release after run_one exception also failed: {inner!r}"
++                )
++            sleep_fn(_FAILURE_SLEEP_SECS)
++            iterations += 1
++            if max_iterations is not None and iterations >= max_iterations:
++                return iterations
++            continue
++
++        _release_after_dispatch(queue_db, key, result)
++
++        if result.final_status == "succeeded":
++            sleep_fn(_SUCCESS_SLEEP_SECS)
++        else:
++            sleep_fn(_FAILURE_SLEEP_SECS)
++
++        iterations += 1
++        if max_iterations is not None and iterations >= max_iterations:
++            return iterations
++
++    _log("shutdown flag set — exiting loop cleanly")
++    return iterations
++
++
++def main() -> int:
++    _LOG_DIR.mkdir(parents=True, exist_ok=True)
++    _log("symphony daemon starting")
++
++    # init_queue raises RuntimeError if WAL journal mode could not be
++    # enabled (per its docstring). Catch + log a distinguishing FATAL
++    # line so a launchd KeepAlive crash-loop on a WAL-incompatible FS is
++    # immediately diagnosable from symphony-daemon.error.log instead of
++    # showing up as a bare traceback every 10 seconds.
++    try:
++        sq.init_queue(_QUEUE_DB)
++    except RuntimeError as exc:
++        _log(
++            f"FATAL: queue init failed (likely WAL-not-enabled on this FS): "
++            f"{exc!r}"
++        )
++        return 1
++
++    flipped = startup_sweep(_QUEUE_DB)
++    if flipped:
++        _log(
++            f"startup sweep: flipped {flipped} orphan running row(s) to failed"
++        )
++    else:
++        _log("startup sweep: no orphan running rows")
++
++    _install_signal_handlers()
++    _log(
++        f"entering main loop (queue_db={_QUEUE_DB}, heartbeat={_HEARTBEAT_FILE})"
++    )
++
++    iterations = 0
++    try:
++        iterations = run_loop()
++    finally:
++        _log(f"daemon exiting (iterations={iterations})")
++
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/Library/LaunchAgents/ai.hermes.symphony-daemon.plist b/Library/LaunchAgents/ai.hermes.symphony-daemon.plist
+new file mode 100644
+index 0000000..0000001
+--- /dev/null
++++ b/Library/LaunchAgents/ai.hermes.symphony-daemon.plist
+@@ -0,0 +1,87 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<!--
++  Symphony v2 daemon — Phase 4c (P157/MOL-515).
++
++  Long-running process that owns its own loop over queue.db. Replaces
++  cron-as-driver. SIGKILL-at-3600s is no longer a thing because launchd
++  KeepAlive (with SuccessfulExit=false) auto-restarts on crash but does
++  NOT enforce a wall-clock kill.
++
++  Start the soak:
++    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/ai.hermes.symphony-daemon.plist
++
++  Stop:
++    launchctl bootout gui/$UID/ai.hermes.symphony-daemon
++
++  Tail:
++    tail -f ~/.hermes/logs/symphony-daemon.log
++
++  Pause without unloading:
++    touch ~/.hermes/symphony/PAUSED   # daemon polls but does not poll the queue
++    rm    ~/.hermes/symphony/PAUSED   # resume
++
++  Observe-only:
++    touch ~/.hermes/symphony/DRY_RUN  # daemon polls but does not claim
++-->
++<plist version="1.0">
++<dict>
++    <key>Label</key>
++    <string>ai.hermes.symphony-daemon</string>
++
++    <key>ProgramArguments</key>
++    <array>
++        <string>/Users/wills_mac_mini/.hermes/scripts/envchain-wrapper.sh</string>
++        <string>/Users/wills_mac_mini/.hermes/hermes-agent/venv/bin/python</string>
++        <string>/Users/wills_mac_mini/.hermes/scripts/symphony_daemon.py</string>
++    </array>
++
++    <key>WorkingDirectory</key>
++    <string>/Users/wills_mac_mini/.hermes</string>
++
++    <key>EnvironmentVariables</key>
++    <dict>
++        <key>PATH</key>
++        <string>/Users/wills_mac_mini/.hermes/hermes-agent/venv/bin:/Users/wills_mac_mini/.hermes/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/wills_mac_mini/.local/bin</string>
++        <key>HERMES_HOME</key>
++        <string>/Users/wills_mac_mini/.hermes</string>
++        <key>VIRTUAL_ENV</key>
++        <string>/Users/wills_mac_mini/.hermes/hermes-agent/venv</string>
++        <key>PYTHONUNBUFFERED</key>
++        <string>1</string>
++    </dict>
++
++    <key>RunAtLoad</key>
++    <true/>
++
++    <key>KeepAlive</key>
++    <dict>
++        <key>SuccessfulExit</key>
++        <false/>
++    </dict>
++
++    <key>ThrottleInterval</key>
++    <integer>10</integer>
++
++    <key>ProcessType</key>
++    <string>Adaptive</string>
++
++    <key>LowPriorityIO</key>
++    <true/>
++
++    <key>Nice</key>
++    <integer>10</integer>
++
++    <key>SoftResourceLimits</key>
++    <dict>
++        <key>NumberOfFiles</key>
++        <integer>1024</integer>
++    </dict>
++
++    <key>StandardOutPath</key>
++    <string>/Users/wills_mac_mini/.hermes/logs/symphony-daemon.log</string>
++
++    <key>StandardErrorPath</key>
++    <string>/Users/wills_mac_mini/.hermes/logs/symphony-daemon.error.log</string>
++</dict>
++</plist>

@@ -1,0 +1,39 @@
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -72,6 +72,10 @@
+     - Kimi Code's ``api.kimi.com/coding`` endpoint also speaks the
+       Anthropic Messages protocol (the /coding route accepts Claude
+       Code's native request shape).
++    - Direct ``api.anthropic.com`` only serves ``/v1/messages`` —
++      defaulting to chat_completions sends ``POST /v1/chat/completions``
++      and Anthropic returns 404. Pin to ``anthropic_messages``.
++      (P226/MOL-623 — Gap 4 fix for the role_routing planner/skeptic lane.)
+     """
+     normalized = (base_url or "").strip().lower().rstrip("/")
+     hostname = base_url_hostname(base_url)
+@@ -79,6 +83,8 @@
+         return "codex_responses"
+     if hostname == "api.openai.com":
+         return "codex_responses"
++    if hostname == "api.anthropic.com":
++        return "anthropic_messages"
+     if normalized.endswith("/anthropic"):
+         return "anthropic_messages"
+     if hostname == "api.kimi.com" and "/coding" in normalized:
+--- a/hermes_cli/model_normalize.py
++++ b/hermes_cli/model_normalize.py
+@@ -164,6 +164,14 @@
+         A DeepSeek-accepted model identifier.
+     """
+     bare = _strip_vendor_prefix(model_name).lower()
++
++    # Strip Hermes context-length bracket suffix (e.g. ``[1m]``, ``[200k]``).
++    # DeepSeek's API rejects bracket suffixes — they are a Hermes routing-
++    # table convention used to pin a context-length tier, never a real
++    # model ID. P164/MOL-549 strips it on the delegate_tool Tier 1/3 path;
++    # this mirrors the strip onto the role_routing / AIAgent path.
++    # (P226/MOL-623 — Gap 5 fix for the three-agent loop Builder lane.)
++    bare = re.sub(r"\[[^\]]*\]$", "", bare)
+ 
+     if bare in _DEEPSEEK_CANONICAL_MODELS:
+         return bare

@@ -1,0 +1,45 @@
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 369fe7ac..b192f4b9 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -545,6 +545,9 @@ DEFAULT_CONFIG = {
+         "backup_count": 3,     # Number of rotated backup files to keep
+     },
+ 
++    # MCP servers — top-level key so save_config() preserves it on round-trip.
++    "mcp_servers": {},
++
+     # Config schema version - bump this when adding new required fields
+     "_config_version": 12,
+ }
+@@ -2139,6 +2142,17 @@ def sanitize_env_file() -> int:
+     return fixes
+ 
+ 
++# Prefixes for keys managed by envchain (mirrors scripts/envchain-wrapper.sh
++# ALLOWED_PREFIXES).  These MUST NOT be persisted to ~/.hermes/.env — envchain
++# is the source of truth.  The guard in save_env_value() skips the file write
++# but still sets os.environ so the current process session works.
++_ENVCHAIN_MANAGED_PREFIXES = (
++    "ANTHROPIC_", "OPENAI_", "OPENROUTER_", "GOOGLE_AI_",
++    "TELEGRAM_", "TAVILY_", "ATLASSIAN_", "GRANOLA_",
++    "BROWSERBASE_",
++)
++
++
+ def save_env_value(key: str, value: str):
+     """Save or update a value in ~/.hermes/.env."""
+     if is_managed():
+@@ -2147,6 +2161,12 @@ def save_env_value(key: str, value: str):
+     if not _ENV_VAR_NAME_RE.match(key):
+         raise ValueError(f"Invalid environment variable name: {key!r}")
+     value = value.replace("\n", "").replace("\r", "")
++
++    # Block .env writes for envchain-managed keys (secrets belong in Keychain).
++    if any(key.startswith(p) for p in _ENVCHAIN_MANAGED_PREFIXES):
++        if value:  # Only set os.environ if non-empty (skip stub clears)
++            os.environ[key] = value
++        return
+     ensure_hermes_home()
+     env_path = get_env_path()
+     

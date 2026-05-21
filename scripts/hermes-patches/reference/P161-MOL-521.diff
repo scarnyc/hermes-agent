@@ -1,0 +1,47 @@
+--- a/.hermes/scripts/symphony_bridge.py
++++ b/.hermes/scripts/symphony_bridge.py
+@@ -954,13 +954,19 @@
+                 "error": "DEEPSEEK_API_KEY key not available",
+                 "stderr_tail": "", "rate_limited": False}
+ 
++    # P161/MOL-521: two-bug fix surfaced by MOL-481 live test 2026-05-11.
++    # (1) --bare bypasses claude -p init steps (keychain reads, background
++    # prefetches, plugin sync, CLAUDE.md auto-discovery) that hang silently
++    # for 600s when spawned by the launchd daemon. (2) -- separator before
++    # the prompt terminates --add-dir's variadic <directories...> consumption
++    # so the prompt isn't eaten as an additional directory path.
+     argv = [
+-        CLAUDE_BIN, "-p",
++        CLAUDE_BIN, "-p", "--bare",
+         "--permission-mode", permission_mode,
+         "--max-turns", str(max_turns),
+         "--output-format", "json",
+         "--no-session-persistence",
+-        "--add-dir", repo_path,
++        "--add-dir", repo_path, "--",
+         prompt,
+     ]
+ 
+@@ -1050,13 +1056,20 @@
+ def _run_cc_anthropic(prompt: str, repo_path: str, permission_mode: str,
+                       max_turns: int, timeout_secs: int) -> dict:
+     """Tier 2: claude -p with default Anthropic API."""
++    # P161/MOL-521: see _run_cc_deepseek for the rationale on --bare + --
++    # separator. Tier 2 caveat: --bare also disables keychain reads. Claude
++    # Max OAuth lives in Keychain — under --bare Tier 2 falls back to
++    # ANTHROPIC_API_KEY / apiKeyHelper. If neither is set, Tier 2 fails-auth
++    # fast (visible, < 60s) instead of hanging silently 600s. Strictly
++    # better failure mode; salvaging Tier 2's OAuth path is a separate
++    # ticket.
+     argv = [
+-        CLAUDE_BIN, "-p",
++        CLAUDE_BIN, "-p", "--bare",
+         "--permission-mode", permission_mode,
+         "--max-turns", str(max_turns),
+         "--output-format", "json",
+         "--no-session-persistence",
+-        "--add-dir", repo_path,
++        "--add-dir", repo_path, "--",
+         prompt,
+     ]
+ 

@@ -1,0 +1,502 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 321d46a8..db1a660e 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -750,6 +750,164 @@ def build_skills_system_prompt(
+     return result
+ 
+ 
++# === P78 / MOL-324: tool inventory in system prompt ===
++# Hand-maintained one-liners keyed by MCP server name.  The upstream
++# ``mcp_servers:`` schema has no ``description:`` field, so this is the
++# interim source of truth.  Servers missing from this map fall back to the
++# first registered tool's description (truncated to 80 chars) — see the
++# ``sorted(tools)[0]`` lookup in ``build_tool_inventory_prompt`` so the
++# fallback is byte-stable across restarts.
++MCP_SERVER_PURPOSES: "dict[str, str]" = {
++    "context7": "library docs (React, Next.js, Prisma, etc.) — current versions, not training data",
++    "copilotkit": "CopilotKit + AG-UI documentation and code search for generative-UI / frontend tools",
++    "chrome-devtools": "browser automation, performance traces, Lighthouse audits, accessibility checks",
++    "markitdown": "convert PDF / DOCX / PPTX / XLSX / HTML to Markdown",
++}
++
++# Hand-maintained denylist for plumbing tools that should never appear in
++# the Built-in section.  Currently empty: the empty-description and
++# ``Internal:``-prefix heuristic in ``build_tool_inventory_prompt`` catches
++# every plumbing tool we have today.  Kept as an extension point for tools
++# the heuristic can't catch (well-described but agent-internal); add a name
++# here only after confirming the tool exists in the registry.  ``frozenset``
++# expresses immutability to prevent accidental runtime mutation.
++INTERNAL_TOOL_DENYLIST: "frozenset[str]" = frozenset()
++
++# CLI tools available through the ``terminal`` tool — not in any registry,
++# but materially how Hermes builds and tests UIs.  Static list maintained
++# alongside the canonical AGENTS.md "Library documentation & component
++# installers" section; update both when adding new CLIs.
++CLI_TOOLS_VIA_TERMINAL: "list[tuple[str, str]]" = [
++    ("shadcn", "shadcn/ui component installer (pnpm dlx shadcn@latest add <component>)"),
++    ("playwright-cli", "headed browser automation (token-light vs Playwright MCP)"),
++    ("crawl4ai-wrapper.sh", "URL → markdown extraction with SSRF guard"),
++    ("gws", "Google Workspace CLI (calendar, gmail, drive, docs)"),
++    ("jira", "Atlassian Jira CLI (issue list / view / edit, comment add)"),
++]
++
++
++def build_tool_inventory_prompt(
++    valid_tool_names: "set[str] | None" = None,
++    tool_schemas: "list[dict] | None" = None,
++) -> str:
++    """Build a ``<tool_inventory>`` block listing the agent's actual tools.
++
++    Three sections, all sorted for byte-stable output across restarts (so
++    prompt-cache prefixes survive gateway restarts):
++
++    1. ``## Built-in tools`` — non-MCP names from ``valid_tool_names``,
++       filtered through ``INTERNAL_TOOL_DENYLIST`` and the empty / Internal:
++       description heuristic.
++    2. ``## MCP servers connected`` — one sub-block per server from
++       ``tools.mcp_tool.get_registered_tools_by_server``.  Server purpose
++       comes from ``MCP_SERVER_PURPOSES``; tool list is sorted.
++    3. ``## CLI tools available via terminal`` — hardcoded list.
++
++    Returns ``""`` if nothing to render (defensive; should not happen in
++    normal startup since built-ins are always populated).
++
++    Cache stability: byte-identical output for a fixed
++    ``(_servers, valid_tool_names, tool_schemas)`` triple — server keys,
++    MCP tool names, and built-in names are all sorted before emit, and the
++    ``MCP_SERVER_PURPOSES`` fallback (first tool's description) reads from
++    the post-sort list.  Required because the architecture doc forbids
++    "cache-breaking mutations" — drift here invalidates the prompt-cache
++    prefix on every gateway restart.
++    """
++    parts: list[str] = []
++
++    # Build a name → schema lookup once.
++    schema_by_name: "dict[str, dict]" = {}
++    if tool_schemas:
++        for s in tool_schemas:
++            fn = s.get("function") if isinstance(s, dict) else None
++            if not isinstance(fn, dict):
++                continue
++            n = fn.get("name")
++            if isinstance(n, str):
++                schema_by_name[n] = fn
++
++    # ── Section 1: Built-in tools ────────────────────────────────────
++    builtin_lines: list[str] = []
++    if valid_tool_names:
++        for name in sorted(valid_tool_names):
++            if name.startswith("mcp_"):
++                continue
++            if name in INTERNAL_TOOL_DENYLIST:
++                continue
++            fn = schema_by_name.get(name, {})
++            desc = (fn.get("description") or "").strip()
++            if not desc or desc.startswith("Internal:"):
++                continue
++            # Collapse multi-line descriptions into one line.
++            desc_one_line = " ".join(desc.split())
++            # Cap each entry so a verbose tool doesn't dominate the section.
++            if len(desc_one_line) > 200:
++                desc_one_line = desc_one_line[:197] + "..."
++            builtin_lines.append(f"- {name}: {desc_one_line}")
++    if builtin_lines:
++        parts.append("## Built-in tools\n" + "\n".join(builtin_lines))
++
++    # MCP servers connected
++    mcp_block_lines: list[str] = []
++    try:
++        from tools.mcp_tool import get_registered_tools_by_server
++        mcp_by_server = get_registered_tools_by_server()
++    except (ImportError, AttributeError) as exc:
++        # Drift between repo and runtime: P78 not re-applied after
++        # ``hermes update``, or upstream removed ``_registered_tool_names``.
++        # WARNING-level so production-INFO logs surface it (debug is
++        # invisible at prod log level and would silently empty the section).
++        logger.warning(
++            "MCP registry accessor unavailable for tool inventory "
++            "(P78 not applied or upstream drift?): %s", exc,
++        )
++        mcp_by_server = {}
++
++    for server_name in sorted(mcp_by_server.keys()):
++        tools = mcp_by_server[server_name]
++        if not tools:
++            continue
++        # Sort once; both the fallback header and the body iteration read
++        # from the sorted list so output bytes don't depend on registration
++        # insertion order (load-bearing for prompt-cache stability).
++        sorted_tools = sorted(tools, key=lambda t: t[0])
++        purpose = MCP_SERVER_PURPOSES.get(server_name, "")
++        if not purpose:
++            first_desc = " ".join((sorted_tools[0][1] or "").split())
++            purpose = (first_desc[:80] + "...") if len(first_desc) > 80 else first_desc
++        header = f"### {server_name}" + (f" — {purpose}" if purpose else "")
++        mcp_block_lines.append(header)
++        for tool_name, desc in sorted_tools:
++            d = " ".join((desc or "").split())
++            if len(d) > 200:
++                d = d[:197] + "..."
++            mcp_block_lines.append(f"- {tool_name}: {d}" if d else f"- {tool_name}")
++
++    if mcp_block_lines:
++        parts.append("## MCP servers connected\n" + "\n".join(mcp_block_lines))
++
++    # ── Section 3: CLI tools via terminal ─────────────────────────────
++    if CLI_TOOLS_VIA_TERMINAL:
++        cli_lines = [f"- {name}: {desc}" for name, desc in CLI_TOOLS_VIA_TERMINAL]
++        parts.append(
++            "## CLI tools available via terminal\n" + "\n".join(cli_lines)
++        )
++
++    if not parts:
++        return ""
++
++    body = "\n\n".join(parts)
++    return (
++        "<tool_inventory>\n"
++        "When asked about your capabilities, enumerate from this list; "
++        "do not search docs about yourself.\n"
++        "\n"
++        + body + "\n"
++        "</tool_inventory>"
++    )
++
++
+ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:
+     """Build a compact Nous subscription capability block for the system prompt."""
+     try:
+diff --git a/run_agent.py b/run_agent.py
+index b2b47676..21484fd4 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2896,6 +3194,28 @@ class AIAgent:
+         if skills_prompt:
+             prompt_parts.append(skills_prompt)
+ 
++        # === P78 / MOL-324: tool inventory in system prompt ===
++        # Renders <tool_inventory> with three sections (built-ins, MCP
++        # servers, CLI tools).  Sourced from valid_tool_names + the live
++        # MCP _servers registry — same source-of-truth as the API tools
++        # array, just rendered as readable text so the model can recite
++        # capabilities without searching docs about itself.
++        # Boundary try/except: this is on every system-prompt build; a
++        # rendering bug shouldn't 500 the agent turn.  WARNING-level (not
++        # debug) so the symptom is visible at prod log level — if the
++        # inventory empties, every conversation loses tool context until
++        # the next gateway restart.
++        try:
++            tool_inventory_prompt = build_tool_inventory_prompt(
++                valid_tool_names=self.valid_tool_names,
++                tool_schemas=self.tools,
++            )
++        except Exception as exc:
++            logger.warning("build_tool_inventory_prompt failed: %s", exc)
++            tool_inventory_prompt = ""
++        if tool_inventory_prompt:
++            prompt_parts.append(tool_inventory_prompt)
++
+         if not self.skip_context_files:
+             # Use TERMINAL_CWD for context file discovery when set (gateway
+             # mode).  The gateway process runs from the hermes-agent install
+@@ -2934,7 +3254,29 @@ class AIAgent:
+         if platform_key in PLATFORM_HINTS:
+             prompt_parts.append(PLATFORM_HINTS[platform_key])
+ 
+-        return "\n\n".join(prompt_parts)
++        assembled = "\n\n".join(prompt_parts)
++
++        # === P78 / MOL-324: prompt-build instrumentation ===
++        # Env-var-gated dump for verifying tool-inventory rendering and
++        # tracking prompt-cache stability across restarts.  Cheap variant
++        # (size + sha) can stay on; FULL variant writes the payload to /tmp.
++        # debug-level on failure is appropriate — this is opt-in
++        # observability, not a critical path.
++        if os.getenv("HERMES_DUMP_SYSTEM_PROMPT") == "1":
++            import hashlib
++            try:
++                sha = hashlib.sha256(assembled.encode("utf-8")).hexdigest()[:12]
++                logger.info(
++                    "system_prompt_built bytes=%d sha=%s tools=%d",
++                    len(assembled), sha, len(self.tools or []),
++                )
++                if os.getenv("HERMES_DUMP_SYSTEM_PROMPT_FULL") == "1":
++                    with open("/tmp/hermes-system-prompt.txt", "w", encoding="utf-8") as f:
++                        f.write(assembled)
++            except OSError as _exc:
++                logger.debug("system-prompt dump failed (disk / perm): %s", _exc)
++
++        return assembled
+ 
+     # =========================================================================
+     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
+diff --git a/tests/agent/test_prompt_builder.py b/tests/agent/test_prompt_builder.py
+index 3b6a4c3e..ce2285cd 100644
+--- a/tests/agent/test_prompt_builder.py
++++ b/tests/agent/test_prompt_builder.py
+@@ -1071,3 +1075,208 @@ class TestStripBudgetWarningsFromHistory:
+         _strip_budget_warnings_from_history(messages)
+         parsed = json.loads(messages[0]["content"])
+         assert "_budget_warning" not in parsed
++
++
++# =========================================================================
++# P78 / MOL-324: tool inventory in system prompt
++# =========================================================================
++
++
++class TestBuildToolInventoryPrompt:
++    """Behavioral coverage for the dynamic <tool_inventory> system-prompt
++    section.  Cache-stability properties (sort discipline, byte-stable
++    output) are load-bearing because every byte change here invalidates
++    the prompt-cache prefix on gateway restart — locked here so a future
++    refactor that swaps a sorted iteration for a bare dict iteration fails
++    a test instead of silently breaking caching."""
++
++    @staticmethod
++    def _schema(name: str, description: str = "") -> dict:
++        return {"function": {"name": name, "description": description}}
++
++    def test_byte_stable_across_calls_same_input(self):
++        valid = {"web_search", "terminal"}
++        schemas = [
++            self._schema("web_search", "Tavily-backed web search."),
++            self._schema("terminal", "Run shell commands."),
++        ]
++        a = build_tool_inventory_prompt(valid_tool_names=valid, tool_schemas=schemas)
++        b = build_tool_inventory_prompt(valid_tool_names=valid, tool_schemas=schemas)
++        assert a == b
++
++    def test_byte_stable_across_dict_insertion_order(self):
++        # Different set / list iteration orders MUST produce identical bytes —
++        # without sort discipline this fails on Python's hash-randomized sets.
++        schemas = [
++            self._schema("alpha", "Alpha tool."),
++            self._schema("beta", "Beta tool."),
++            self._schema("gamma", "Gamma tool."),
++        ]
++        forward = build_tool_inventory_prompt(
++            valid_tool_names={"alpha", "beta", "gamma"},
++            tool_schemas=schemas,
++        )
++        reverse = build_tool_inventory_prompt(
++            valid_tool_names={"gamma", "beta", "alpha"},
++            tool_schemas=list(reversed(schemas)),
++        )
++        assert forward == reverse
++
++    def test_internal_denylist_excludes_member(self, monkeypatch):
++        # Patch the denylist to verify the filter still wires correctly even
++        # though the production set is currently empty.
++        monkeypatch.setattr(
++            "agent.prompt_builder.INTERNAL_TOOL_DENYLIST",
++            frozenset({"plumbing_tool"}),
++        )
++        out = build_tool_inventory_prompt(
++            valid_tool_names={"plumbing_tool", "web_search"},
++            tool_schemas=[
++                self._schema("plumbing_tool", "Should be excluded."),
++                self._schema("web_search", "Should be present."),
++            ],
++        )
++        assert "plumbing_tool" not in out
++        assert "web_search" in out
++
++    def test_empty_description_skipped(self):
++        out = build_tool_inventory_prompt(
++            valid_tool_names={"emptydesc", "realtool"},
++            tool_schemas=[
++                self._schema("emptydesc", ""),
++                self._schema("realtool", "Has a description."),
++            ],
++        )
++        assert "emptydesc" not in out
++        assert "realtool" in out
++
++    def test_internal_prefixed_description_skipped(self):
++        out = build_tool_inventory_prompt(
++            valid_tool_names={"hidden", "shown"},
++            tool_schemas=[
++                self._schema("hidden", "Internal: pipeline plumbing."),
++                self._schema("shown", "User-facing description."),
++            ],
++        )
++        assert "hidden" not in out
++        assert "shown" in out
++
++    def test_long_description_truncated_with_ellipsis(self):
++        long_desc = "x" * 500
++        out = build_tool_inventory_prompt(
++            valid_tool_names={"longtool"},
++            tool_schemas=[self._schema("longtool", long_desc)],
++        )
++        for line in out.splitlines():
++            if line.startswith("- longtool: "):
++                body = line[len("- longtool: "):]
++                assert body.endswith("...")
++                assert len(body) == 200
++                return
++        raise AssertionError("longtool line not found in output")
++
++    def test_short_description_not_truncated(self):
++        # Floor + ceiling per project memory: assert the
++        # not-truncated path explicitly so drift in either direction shows up.
++        short = "Exactly 199 chars: " + ("y" * 180)
++        assert len(short) == 199
++        out = build_tool_inventory_prompt(
++            valid_tool_names={"shorttool"},
++            tool_schemas=[self._schema("shorttool", short)],
++        )
++        assert f"- shorttool: {short}" in out
++
++    def test_mcp_section_omitted_when_no_servers_connected(self):
++        # In a fresh process with no MCP _servers, the section header
++        # should NOT appear (avoid an empty "## MCP servers connected"
++        # block in the prompt).
++        out = build_tool_inventory_prompt(
++            valid_tool_names={"terminal"},
++            tool_schemas=[self._schema("terminal", "Shell.")],
++        )
++        assert "## MCP servers connected" not in out
++
++    def test_cli_footer_always_present_when_constant_nonempty(self):
++        out = build_tool_inventory_prompt()
++        assert "## CLI tools available via terminal" in out
++        assert "shadcn:" in out
++        assert "playwright-cli:" in out
++
++    def test_mcp_block_uses_purpose_map(self, monkeypatch):
++        def fake_accessor():
++            return {
++                "context7": [
++                    ("mcp_context7_query_docs", "Query the documentation index."),
++                    ("mcp_context7_resolve_library_id", "Resolve a library name to an ID."),
++                ],
++            }
++        monkeypatch.setattr(
++            "tools.mcp_tool.get_registered_tools_by_server", fake_accessor,
++        )
++        out = build_tool_inventory_prompt(
++            valid_tool_names=set(),
++            tool_schemas=[],
++        )
++        assert "## MCP servers connected" in out
++        assert "### context7 — " in out
++        assert MCP_SERVER_PURPOSES["context7"] in out
++        # Tools sorted alphabetically inside the server block.
++        idx_query = out.index("mcp_context7_query_docs")
++        idx_resolve = out.index("mcp_context7_resolve_library_id")
++        assert idx_query < idx_resolve
++
++    def test_unknown_server_uses_first_tool_fallback_byte_stably(self, monkeypatch):
++        # A server NOT in MCP_SERVER_PURPOSES must produce stable header
++        # bytes regardless of how the accessor returns the tool list,
++        # because the fallback now reads from sorted_tools[0], not tools[0].
++        unsorted_tools = [
++            ("mcp_newserver_zeta", "zeta description"),
++            ("mcp_newserver_alpha", "alpha description"),
++        ]
++        def fake_accessor_a():
++            return {"newserver": unsorted_tools}
++        def fake_accessor_b():
++            return {"newserver": list(reversed(unsorted_tools))}
++        monkeypatch.setattr("tools.mcp_tool.get_registered_tools_by_server", fake_accessor_a)
++        out_a = build_tool_inventory_prompt(valid_tool_names=set(), tool_schemas=[])
++        monkeypatch.setattr("tools.mcp_tool.get_registered_tools_by_server", fake_accessor_b)
++        out_b = build_tool_inventory_prompt(valid_tool_names=set(), tool_schemas=[])
++        assert out_a == out_b
++        # And the header uses alpha description (the post-sort first entry).
++        assert "### newserver — alpha description" in out_a
++
++    def test_returns_inventory_with_only_cli_when_no_builtins_or_mcp(self):
++        # Defensive contract: even with empty inputs, the static CLI footer
++        # ensures the block isn't empty.  Wrapped in <tool_inventory>.
++        out = build_tool_inventory_prompt(valid_tool_names=set(), tool_schemas=[])
++        assert out.startswith("<tool_inventory>")
++        assert out.endswith("</tool_inventory>")
++        assert "## CLI tools available via terminal" in out
++
++    def test_mcp_registry_failure_logs_warning(self, monkeypatch, caplog):
++        # If the accessor raises ImportError (P78 not re-applied after
++        # hermes update), the failure must surface at WARNING level so
++        # production-INFO logs catch it — silent debug-level was the
++        # MOL-324 round-3 review finding.
++        def broken_accessor():
++            raise ImportError("simulated drift")
++        monkeypatch.setattr(
++            "tools.mcp_tool.get_registered_tools_by_server", broken_accessor,
++        )
++        with caplog.at_level(logging.WARNING, logger="agent.prompt_builder"):
++            out = build_tool_inventory_prompt(valid_tool_names=set(), tool_schemas=[])
++        assert any("MCP registry accessor unavailable" in rec.message for rec in caplog.records)
++        # Inventory still renders (CLI footer at minimum).
++        assert "## CLI tools available via terminal" in out
++
++    def test_internal_tool_denylist_is_frozenset(self):
++        # Type-design lock: prevents accidental .add()/.discard() at runtime.
++        assert isinstance(INTERNAL_TOOL_DENYLIST, frozenset)
++
++    def test_mcp_server_purposes_covers_configured_servers(self):
++        # Sanity: every server name we ship in mcp_servers: should have a
++        # one-liner.  Catches drift if a new server gets wired into
++        # config.yaml without an inventory entry.
++        configured = {"context7", "copilotkit", "chrome-devtools", "markitdown"}
++        missing = configured - set(MCP_SERVER_PURPOSES.keys())
++        assert not missing, f"servers without MCP_SERVER_PURPOSES entry: {missing}"
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index 4040ed74..df6f5ccd 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -2110,6 +2110,51 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
+     return result
+ 
+ 
++# === P78 / MOL-324: tool inventory in system prompt ===
++def get_registered_tools_by_server() -> Dict[str, List[Tuple[str, str]]]:
++    """Return ``{server_name: [(prefixed_tool_name, description), ...]}``
++    from the live ``_servers`` registry.
++
++    Reads what is already connected at agent init.  Differs from
++    ``probe_mcp_server_tools`` (which reconnects each call); this is safe for
++    hot-path use during system-prompt assembly because no I/O happens.
++
++    Empty dict if no servers connected.
++
++    Description text is sourced from the central tool registry (the same
++    schema sent to the model), so what appears in the prompt and what the
++    model receives in the ``tools`` array stay aligned.
++    """
++    from tools.registry import registry
++
++    result: Dict[str, List[Tuple[str, str]]] = {}
++    with _lock:
++        servers_snapshot = list(_servers.items())
++    for name, server in servers_snapshot:
++        registered = list(server._registered_tool_names)
++        if not registered:
++            continue
++        pairs: List[Tuple[str, str]] = []
++        for prefixed in registered:
++            schema = registry.get_schema(prefixed)
++            if schema is None:
++                # Invariant violation: server registered the tool but the
++                # central registry never persisted its schema.  Surface so
++                # the registration-drift bug is visible — don't silently
++                # emit a description-less line that hides the gap.
++                logger.warning(
++                    "MCP tool '%s' in server '%s' _registered_tool_names "
++                    "but absent from central registry — skipping in inventory",
++                    prefixed, name,
++                )
++                continue
++            description = schema.get("function", {}).get("description", "") or ""
++            pairs.append((prefixed, description))
++        if pairs:
++            result[name] = pairs
++    return result
++
++
+ def shutdown_mcp_servers():
+     """Close all MCP server connections and stop the background loop.
+ 

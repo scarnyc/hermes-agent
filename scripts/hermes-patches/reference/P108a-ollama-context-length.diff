@@ -1,0 +1,331 @@
+commit 0dd373ec43976f0b6fff2108120b8d31cbf9774f
+Author: Rob Moen <rob@atlas.lan>
+Date:   Wed Apr 29 20:18:08 2026 -0700
+
+    fix(context): honor model.context_length for Ollama num_ctx and all display paths
+    
+    When a user sets model.context_length in config.yaml, the value was only
+    used for Hermes' internal compression decisions (context_compressor) but
+    NOT for Ollama's num_ctx parameter. Ollama auto-detects context from GGUF
+    metadata (often 256K+) and allocates that much VRAM regardless of the
+    user's config — causing OOM on smaller GPUs like the P100 (16GB).
+    
+    Root cause: two separate context values existed independently:
+      - context_compressor.context_length = config value (e.g. 65536) ✓
+      - _ollama_num_ctx = GGUF metadata value (e.g. 256000) ✗ ignored config
+    
+    Changes:
+    
+    1. Cap Ollama num_ctx to config context_length (run_agent.py)
+       When model.context_length is explicitly set and no explicit
+       ollama_num_ctx override exists, cap the auto-detected GGUF value
+       to the user's context_length. This is the core fix — it prevents
+       Ollama from allocating more VRAM than the user budgeted.
+    
+    2. Pass config_context_length through all secondary call sites
+       Several paths called get_model_context_length() without the config
+       override, falling through to the 256K default fallback:
+       - cli.py: @-reference expansion and /model switch display
+       - gateway/run.py: @-reference expansion and /model switch display
+       - tui_gateway/server.py: @-reference expansion
+       - hermes_cli/model_switch.py: resolve_display_context_length()
+    
+    3. Normalize root-level context_length in config (hermes_cli/config.py)
+       _normalize_root_model_keys() now migrates root-level context_length
+       into the model section, matching existing behavior for provider and
+       base_url. Users who wrote `context_length: 65536` at the YAML root
+       instead of under `model:` had it silently ignored.
+    
+    4. Fix misleading comments (agent/model_metadata.py)
+       DEFAULT_FALLBACK_CONTEXT is 256K (CONTEXT_PROBE_TIERS[0]), not 128K
+       as two comments stated.
+    
+    Tests: 3 new tests for root-level context_length normalization.
+    All existing context_length tests pass (96 tests).
+
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index cca842f6b..12117f144 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -1247,7 +1247,7 @@ def get_model_context_length(
+     6. Nous suffix-match via OpenRouter cache
+     7. models.dev registry lookup (provider-aware)
+     8. Thin hardcoded defaults (broad family patterns)
+-    9. Default fallback (128K)
++    9. Default fallback (256K)
+     """
+     # 0. Explicit config override — user knows best
+     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
+@@ -1427,7 +1427,7 @@ def get_model_context_length(
+                 save_context_length(model, base_url, local_ctx)
+             return local_ctx
+ 
+-    # 10. Default fallback — 128K
++    # 10. Default fallback — 256K
+     return DEFAULT_FALLBACK_CONTEXT
+ 
+ 
+diff --git a/cli.py b/cli.py
+index 1d0285a57..f3b601d88 100644
+--- a/cli.py
++++ b/cli.py
+@@ -5328,6 +5328,7 @@ class HermesCLI:
+                 base_url=result.base_url or self.base_url or "",
+                 api_key=result.api_key or self.api_key or "",
+                 model_info=mi,
++                config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None,
+             )
+             if ctx:
+                 _cprint(f"    Context: {ctx:,} tokens")
+@@ -5554,6 +5555,7 @@ class HermesCLI:
+             base_url=result.base_url or self.base_url or "",
+             api_key=result.api_key or self.api_key or "",
+             model_info=mi,
++            config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None,
+         )
+         if ctx:
+             _cprint(f"    Context: {ctx:,} tokens")
+@@ -8728,7 +8730,8 @@ class HermesCLI:
+                 from agent.context_references import preprocess_context_references
+                 from agent.model_metadata import get_model_context_length
+                 _ctx_len = get_model_context_length(
+-                    self.model, base_url=self.base_url or "", api_key=self.api_key or "")
++                    self.model, base_url=self.base_url or "", api_key=self.api_key or "",
++                    config_context_length=getattr(self.agent, "_config_context_length", None) if self.agent else None)
+                 _ctx_result = preprocess_context_references(
+                     message, cwd=os.getcwd(), context_length=_ctx_len)
+                 if _ctx_result.expanded or _ctx_result.blocked:
+diff --git a/gateway/run.py b/gateway/run.py
+index b92979cc4..77ab89aca 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4792,10 +4792,21 @@ class GatewayRunner:
+ 
+                 _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
+                 _msg_runtime = _resolve_runtime_agent_kwargs()
++                _msg_config_ctx = None
++                try:
++                    _msg_cfg = _load_gateway_config()
++                    _msg_model_cfg = _msg_cfg.get("model", {})
++                    if isinstance(_msg_model_cfg, dict):
++                        _msg_raw_ctx = _msg_model_cfg.get("context_length")
++                        if _msg_raw_ctx is not None:
++                            _msg_config_ctx = int(_msg_raw_ctx)
++                except Exception:
++                    pass
+                 _msg_ctx_len = get_model_context_length(
+                     self._model,
+                     base_url=self._base_url or _msg_runtime.get("base_url") or "",
+                     api_key=_msg_runtime.get("api_key") or "",
++                    config_context_length=_msg_config_ctx,
+                 )
+                 _ctx_result = await preprocess_context_references_async(
+                     message_text,
+@@ -6508,6 +6519,16 @@ class GatewayRunner:
+                         lines.append(f"Provider: {plabel}")
+                         mi = result.model_info
+                         from hermes_cli.model_switch import resolve_display_context_length
++                        _sw_config_ctx = None
++                        try:
++                            _sw_cfg = _load_gateway_config()
++                            _sw_model_cfg = _sw_cfg.get("model", {})
++                            if isinstance(_sw_model_cfg, dict):
++                                _sw_raw = _sw_model_cfg.get("context_length")
++                                if _sw_raw is not None:
++                                    _sw_config_ctx = int(_sw_raw)
++                        except Exception:
++                            pass
+                         ctx = resolve_display_context_length(
+                             result.new_model,
+                             result.target_provider,
+@@ -6515,6 +6536,7 @@ class GatewayRunner:
+                             api_key=result.api_key or current_api_key or "",
+                             model_info=mi,
+                             custom_providers=custom_provs,
++                            config_context_length=_sw_config_ctx,
+                         )
+                         if ctx:
+                             lines.append(f"Context: {ctx:,} tokens")
+@@ -6657,6 +6679,16 @@ class GatewayRunner:
+         # Copilot, and Nous-enforced caps win over the raw models.dev entry.
+         mi = result.model_info
+         from hermes_cli.model_switch import resolve_display_context_length
++        _sw2_config_ctx = None
++        try:
++            _sw2_cfg = _load_gateway_config()
++            _sw2_model_cfg = _sw2_cfg.get("model", {})
++            if isinstance(_sw2_model_cfg, dict):
++                _sw2_raw = _sw2_model_cfg.get("context_length")
++                if _sw2_raw is not None:
++                    _sw2_config_ctx = int(_sw2_raw)
++        except Exception:
++            pass
+         ctx = resolve_display_context_length(
+             result.new_model,
+             result.target_provider,
+@@ -6664,6 +6696,7 @@ class GatewayRunner:
+             api_key=result.api_key or current_api_key or "",
+             model_info=mi,
+             custom_providers=custom_provs,
++            config_context_length=_sw2_config_ctx,
+         )
+         if ctx:
+             lines.append(f"Context: {ctx:,} tokens")
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 0c3f40ab6..bf133f121 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -3510,17 +3510,17 @@ def _preserve_env_ref_templates(current, raw, loaded_expanded=None):
+ 
+ 
+ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
+-    """Move stale root-level provider/base_url into model section.
++    """Move stale root-level provider/base_url/context_length into model section.
+ 
+-    Some users (or older code) placed ``provider:`` and ``base_url:`` at the
+-    config root instead of inside ``model:``.  These root-level keys are only
+-    used as a fallback when the corresponding ``model.*`` key is empty — they
+-    never override an existing ``model.provider`` or ``model.base_url``.
++    Some users (or older code) placed ``provider:``, ``base_url:``, or
++    ``context_length:`` at the config root instead of inside ``model:``.
++    These root-level keys are only used as a fallback when the corresponding
++    ``model.*`` key is empty — they never override an existing value.
+     After migration the root-level keys are removed so they can't cause
+     confusion on subsequent loads.
+     """
+     # Only act if there are root-level keys to migrate
+-    has_root = any(config.get(k) for k in ("provider", "base_url"))
++    has_root = any(config.get(k) for k in ("provider", "base_url", "context_length"))
+     if not has_root:
+         return config
+ 
+@@ -3530,7 +3530,7 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
+         model = {"default": model} if model else {}
+         config["model"] = model
+ 
+-    for key in ("provider", "base_url"):
++    for key in ("provider", "base_url", "context_length"):
+         root_val = config.get(key)
+         if root_val and not model.get(key):
+             model[key] = root_val
+diff --git a/hermes_cli/model_switch.py b/hermes_cli/model_switch.py
+index 1d37900f3..f7a613670 100644
+--- a/hermes_cli/model_switch.py
++++ b/hermes_cli/model_switch.py
+@@ -539,6 +539,7 @@ def resolve_display_context_length(
+     api_key: str = "",
+     model_info: Optional[ModelInfo] = None,
+     custom_providers: list | None = None,
++    config_context_length: int | None = None,
+ ) -> Optional[int]:
+     """Resolve the context length to show in /model output.
+ 
+@@ -565,6 +566,7 @@ def resolve_display_context_length(
+             api_key=api_key or "",
+             provider=provider or None,
+             custom_providers=custom_providers,
++            config_context_length=config_context_length,
+         )
+         if ctx:
+             return int(ctx)
+diff --git a/run_agent.py b/run_agent.py
+index 80738aab1..9788a5ddc 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2049,6 +2049,8 @@ class AIAgent:
+         # When running against an Ollama server, detect the model's max context
+         # and pass num_ctx on every chat request so the full window is used.
+         # User override: set model.ollama_num_ctx in config.yaml to cap VRAM use.
++        # If model.context_length is set, it caps num_ctx so the user's VRAM
++        # budget is respected even when GGUF metadata advertises a larger window.
+         self._ollama_num_ctx: int | None = None
+         _ollama_num_ctx_override = None
+         if isinstance(_model_cfg, dict):
+@@ -2065,6 +2067,21 @@ class AIAgent:
+                     self._ollama_num_ctx = _detected
+             except Exception as exc:
+                 logger.debug("Ollama num_ctx detection failed: %s", exc)
++        # Cap auto-detected ollama_num_ctx to the user's explicit context_length.
++        # Without this, GGUF metadata can advertise 256K+ which Ollama honours
++        # by allocating that much VRAM — blowing up small GPUs even though the
++        # user explicitly set a smaller context_length in config.yaml.
++        if (
++            self._ollama_num_ctx
++            and _config_context_length
++            and _ollama_num_ctx_override is None  # don't override explicit ollama_num_ctx
++            and self._ollama_num_ctx > _config_context_length
++        ):
++            logger.info(
++                "Ollama num_ctx capped: %d -> %d (model.context_length override)",
++                self._ollama_num_ctx, _config_context_length,
++            )
++            self._ollama_num_ctx = _config_context_length
+         if self._ollama_num_ctx and not self.quiet_mode:
+             logger.info(
+                 "Ollama num_ctx: will request %d tokens (model max from /api/show)",
+diff --git a/tests/cli/test_cli_init.py b/tests/cli/test_cli_init.py
+index e4e642632..e0fa9e4c2 100644
+--- a/tests/cli/test_cli_init.py
++++ b/tests/cli/test_cli_init.py
+@@ -354,6 +354,49 @@ class TestRootLevelProviderOverride:
+         assert result["model"]["provider"] == "correct-provider"
+         assert "provider" not in result  # root key still cleaned up
+ 
++    def test_normalize_root_context_length_migrates_to_model(self):
++        """Root-level context_length is migrated into the model section."""
++        from hermes_cli.config import _normalize_root_model_keys
++
++        config = {
++            "context_length": 128000,
++            "model": {
++                "default": "my-model",
++            },
++        }
++        result = _normalize_root_model_keys(config)
++        assert result["model"]["context_length"] == 128000
++        assert "context_length" not in result  # root key cleaned up
++
++    def test_normalize_root_context_length_does_not_override_existing(self):
++        """Existing model.context_length is not overridden by root-level key."""
++        from hermes_cli.config import _normalize_root_model_keys
++
++        config = {
++            "context_length": 256000,
++            "model": {
++                "default": "my-model",
++                "context_length": 128000,
++            },
++        }
++        result = _normalize_root_model_keys(config)
++        assert result["model"]["context_length"] == 128000  # preserved
++        assert "context_length" not in result  # root key still cleaned up
++
++    def test_normalize_root_context_length_with_string_model(self):
++        """Root-level context_length is migrated even when model is a string."""
++        from hermes_cli.config import _normalize_root_model_keys
++
++        config = {
++            "context_length": 128000,
++            "model": "my-model",
++        }
++        result = _normalize_root_model_keys(config)
++        assert isinstance(result["model"], dict)
++        assert result["model"]["default"] == "my-model"
++        assert result["model"]["context_length"] == 128000
++        assert "context_length" not in result
++
+ 
+ class TestProviderResolution:
+     def test_api_key_is_string_or_none(self):
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 82e975061..4bbf99b7a 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -2777,6 +2777,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+                     base_url=getattr(agent, "base_url", "") or "",
+                     api_key=getattr(agent, "api_key", "") or "",
+                     provider=getattr(agent, "provider", "") or "",
++                    config_context_length=getattr(agent, "_config_context_length", None),
+                 )
+                 ctx = preprocess_context_references(
+                     prompt,

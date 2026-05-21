@@ -1,0 +1,13 @@
+diff --git a/.hermes/hermes-agent/plugins/memory/tiered/embeddings.py b/.hermes/hermes-agent/plugins/memory/tiered/embeddings.py
+index aaaaaaa..bbbbbbb 100644
+--- a/.hermes/hermes-agent/plugins/memory/tiered/embeddings.py
++++ b/.hermes/hermes-agent/plugins/memory/tiered/embeddings.py
+@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
+
+ OLLAMA_URL = "http://localhost:11434/api/embed"
+ MODEL = "nomic-embed-text"  # P151/MOL-502 — was "bge-m3"
+-MAX_CHARS = 8000
++MAX_CHARS = 6000  # P160/MOL-504 — was 8000; tighter truncation lowers embed-pass RAM
+ DIMS = 768                  # P151/MOL-502 — was 1024 (bge-m3); migration re-embeds existing entries
+ TIMEOUT = 30.0  # First-call cold-load is ~3-5s; 30s keeps slack for rare slow loads
+ KEEP_ALIVE = 90  # seconds; faster eviction than Ollama default 5min

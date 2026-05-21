@@ -1,0 +1,90 @@
+diff --git a/scripts/hermes-patches/verify_patches.sh b/scripts/hermes-patches/verify_patches.sh
+index d38eff6..3d54f45 100755
+--- a/scripts/hermes-patches/verify_patches.sh
++++ b/scripts/hermes-patches/verify_patches.sh
+@@ -470,16 +470,15 @@ fi
+ # reranker; the canonical absence assertion is in the P151 block below.
+ 
+ [[ $QUIET -eq 0 ]] && echo ""
+-[[ $QUIET -eq 0 ]] && echo "=== P20 [SUPERSEDED by P169/MOL-560]: llm.py (memory composer = Kimi K2.6 only; Ollama primary retired) ==="
++[[ $QUIET -eq 0 ]] && echo "=== P20 [SUPERSEDED by P186/MOL-637]: llm.py (memory composer = deepseek-v4-pro; Kimi/OpenRouter retired) ==="
+ F="$HERMES_AGENT/plugins/memory/tiered/llm.py"
+ # History: P20 originally asserted qwen3:8b => P151 downsized to qwen3:1.7b =>
+-# P169/MOL-560 retired the local Ollama primary entirely. P169 below is the
+-# canonical lock-in block for llm.py; this slot is kept slim + correct.
+-check "COMPOSER_MODEL is moonshotai/kimi-k2.6"     "$F" 'COMPOSER_MODEL = "moonshotai/kimi-k2.6"'
+-check "COMPOSER_API_KEY_ENV is OPENROUTER"         "$F" 'COMPOSER_API_KEY_ENV = "OPENROUTER_API_KEY"'
++# P169/MOL-560 retired the local Ollama primary entirely => P186/MOL-637
++# re-baselined the composer to deepseek-v4-pro on api.deepseek.com.
++# P186 below is the canonical lock-in block for llm.py; this slot is slim + correct.
++check "COMPOSER_MODEL is deepseek-v4-pro"          "$F" 'COMPOSER_MODEL = "deepseek-v4-pro"'
++check "COMPOSER_API_KEY_ENV is DEEPSEEK"           "$F" 'COMPOSER_API_KEY_ENV = "DEEPSEEK_API_KEY"'
+ check "_call_composer helper defined"              "$F" 'def _call_composer'
+-# Reasoning enabled - OpenRouter reasoning shape on the sole composer path.
+-check "Reasoning enabled on composer (post-P169)"  "$F" '"reasoning": {"enabled": True, "effort": "high"}'
+ 
+ [[ $QUIET -eq 0 ]] && echo ""
+ [[ $QUIET -eq 0 ]] && echo "=== P21: run_agent.py + local.py (prompt caching + thinking for direct providers) ==="
+@@ -1391,21 +1390,22 @@ fi
+ # runtimes that haven't pulled P169 yet.
+ # ─────────────────────────────────────────────────────────────────────
+ [[ $QUIET -eq 0 ]] && echo ""
+-[[ $QUIET -eq 0 ]] && echo "=== P61 / MOL-268: memory library composer (Kimi K2.6 sole composer post-P169) ==="
++[[ $QUIET -eq 0 ]] && echo "=== P61 / MOL-268: memory library composer (deepseek-v4-pro sole composer post-P186) ==="
+ LLMFILE="$HERMES_AGENT/plugins/memory/tiered/llm.py"
+ # Each branch owns its own counter bumps. The outer `total=$((total + 1))`
+ # was dropped 2026-05-12 (PR #203 review) — the prior top-level bump
+ # combined with the pre-P169 branch's own `check` + inline counter drifted
+ # the pass+fail==total invariant by 1 in the pre-P169 path.
+ if [ -f "$LLMFILE" ] && grep -q 'P169/MOL-560' "$LLMFILE"; then
+-    # Post-P169 absorption: Kimi K2.6 is the sole composer; FALLBACK_MODEL
+-    # gone, COMPOSER_MODEL anchors the contract instead.
++    # Post-P186/MOL-637: deepseek-v4-pro is the sole composer (silently shipped
++    # in commit 479ae4c36 as "docs", verifier re-baselined to match). P169 marker
++    # still anchors the absorption; only the model identifier changes.
+     total=$((total + 1))
+-    if grep -q 'COMPOSER_MODEL = "moonshotai/kimi-k2\.6"' "$LLMFILE"; then
+-        [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m P61/MOL-268 absorbed by P169/MOL-560 — COMPOSER_MODEL is Kimi K2.6\n'
++    if grep -q 'COMPOSER_MODEL = "deepseek-v4-pro"' "$LLMFILE"; then
++        [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m P61/MOL-268 absorbed by P186/MOL-637 — COMPOSER_MODEL is deepseek-v4-pro\n'
+         passed=$((passed + 1))
+     else
+-        [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m P61/MOL-268 — P169 marker present but COMPOSER_MODEL not Kimi K2.6\n'
++        [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m P61/MOL-268 — P169 marker present but COMPOSER_MODEL not deepseek-v4-pro\n'
+         failed=$((failed + 1))
+     fi
+ else
+@@ -5375,9 +5375,9 @@ else
+     failed=$((failed + 1))
+ fi
+ 
+-# Positive lock-in - Kimi K2.6 is now the sole composer.
+-check_fixed "P169 COMPOSER_MODEL is moonshotai/kimi-k2.6" \
+-    "$P169_LLM_RUNTIME" 'COMPOSER_MODEL = "moonshotai/kimi-k2.6"'
++# Positive lock-in - deepseek-v4-pro is now the sole composer (P186/MOL-637 re-baseline).
++check_fixed "P169 COMPOSER_MODEL is deepseek-v4-pro (re-baselined by P186)" \
++    "$P169_LLM_RUNTIME" 'COMPOSER_MODEL = "deepseek-v4-pro"'
+ check_fixed "P169 _call_composer function defined" \
+     "$P169_LLM_RUNTIME" "def _call_composer(prompt: str)"
+ check_fixed "P169 llm_compose calls _call_composer (sole composer path)" \
+@@ -7160,6 +7160,20 @@ else
+     [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m P185 behavioral test skipped (venv or profile missing)\n'
+ fi
+ 
++[[ $QUIET -eq 0 ]] && echo ""
++[[ $QUIET -eq 0 ]] && echo "=== P186 / MOL-637: verify_patches.sh COMPOSER_MODEL re-baseline (silently-shipped 479ae4c36 recovery) ==="
++# Commit 479ae4c36 (2026-05-17, mislabeled "docs") swapped llm.py constants from
++# Kimi K2.6/OpenRouter to DeepSeek V4-Pro without a P-block. P186 re-baselines
++# the 5 verifier sites (P20, P61, P169) to match shipped runtime + adds this
++# marker pair so future drift is caught immediately. [SUPERSEDES P169 composer
++# model identifier; the P169 architectural shift "single composer via API"
++# stands unchanged.]
++check_marker_count "P186/MOL-637" "scripts/hermes-patches/verify_patches.sh" "PATCHES.md" 2
++check_fixed       "P186 COMPOSER_MODEL is deepseek-v4-pro" \
++    "$P169_LLM_RUNTIME" 'COMPOSER_MODEL = "deepseek-v4-pro"'
++check_fixed       "P186 COMPOSER_API_KEY_ENV is DEEPSEEK_API_KEY" \
++    "$P169_LLM_RUNTIME" 'COMPOSER_API_KEY_ENV = "DEEPSEEK_API_KEY"'
++
+ if [ "$failed" -gt 0 ]; then
+     exit 1
+ fi

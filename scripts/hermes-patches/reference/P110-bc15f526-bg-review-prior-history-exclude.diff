@@ -1,0 +1,262 @@
+commit bc15f526fbbd3381a26a5166a3671e75483492f1
+Author: luyao618 <364939526@qq.com>
+Date:   Fri Apr 24 03:08:25 2026 -0700
+
+    fix(agent): exclude prior-history tool messages from background review summary
+    
+    Cherry-pick-of: 27b6a217b (PR #14967 by @luyao618)
+    
+    Co-authored-by: luyao618 <364939526@qq.com>
+
+diff --git a/run_agent.py b/run_agent.py
+index 54abe95ce..f31554123 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -2907,6 +2907,69 @@ class AIAgent:
+         "If nothing stands out, just say 'Nothing to save.' and stop."
+     )
+ 
++    @staticmethod
++    def _summarize_background_review_actions(
++        review_messages: List[Dict],
++        prior_snapshot: List[Dict],
++    ) -> List[str]:
++        """Build the human-facing action summary for a background review pass.
++
++        Walks the review agent's session messages and collects "successful tool
++        action" descriptions to surface to the user (e.g. "Memory updated").
++        Tool messages already present in ``prior_snapshot`` are skipped so we
++        don't re-surface stale results from the prior conversation that the
++        review agent inherited via ``conversation_history`` (issue #14944).
++
++        Matching is by ``tool_call_id`` when available, with a content-equality
++        fallback for tool messages that lack one.
++        """
++        existing_tool_call_ids = set()
++        existing_tool_contents = set()
++        for prior in prior_snapshot or []:
++            if not isinstance(prior, dict) or prior.get("role") != "tool":
++                continue
++            tcid = prior.get("tool_call_id")
++            if tcid:
++                existing_tool_call_ids.add(tcid)
++            else:
++                content = prior.get("content")
++                if isinstance(content, str):
++                    existing_tool_contents.add(content)
++
++        actions: List[str] = []
++        for msg in review_messages or []:
++            if not isinstance(msg, dict) or msg.get("role") != "tool":
++                continue
++            tcid = msg.get("tool_call_id")
++            if tcid and tcid in existing_tool_call_ids:
++                continue
++            if not tcid:
++                content_str = msg.get("content")
++                if isinstance(content_str, str) and content_str in existing_tool_contents:
++                    continue
++            try:
++                data = json.loads(msg.get("content", "{}"))
++            except (json.JSONDecodeError, TypeError):
++                continue
++            if not isinstance(data, dict) or not data.get("success"):
++                continue
++            message = data.get("message", "")
++            target = data.get("target", "")
++            if "created" in message.lower():
++                actions.append(message)
++            elif "updated" in message.lower():
++                actions.append(message)
++            elif "added" in message.lower() or (target and "add" in message.lower()):
++                label = "Memory" if target == "memory" else "User profile" if target == "user" else target
++                actions.append(f"{label} updated")
++            elif "Entry added" in message:
++                label = "Memory" if target == "memory" else "User profile" if target == "user" else target
++                actions.append(f"{label} updated")
++            elif "removed" in message.lower() or "replaced" in message.lower():
++                label = "Memory" if target == "memory" else "User profile" if target == "user" else target
++                actions.append(f"{label} updated")
++        return actions
++
+     def _spawn_background_review(
+         self,
+         messages_snapshot: List[Dict],
+@@ -2956,32 +3019,15 @@ class AIAgent:
+                     )
+ 
+                 # Scan the review agent's messages for successful tool actions
+-                # and surface a compact summary to the user.
+-                actions = []
+-                for msg in getattr(review_agent, "_session_messages", []):
+-                    if not isinstance(msg, dict) or msg.get("role") != "tool":
+-                        continue
+-                    try:
+-                        data = json.loads(msg.get("content", "{}"))
+-                    except (json.JSONDecodeError, TypeError):
+-                        continue
+-                    if not data.get("success"):
+-                        continue
+-                    message = data.get("message", "")
+-                    target = data.get("target", "")
+-                    if "created" in message.lower():
+-                        actions.append(message)
+-                    elif "updated" in message.lower():
+-                        actions.append(message)
+-                    elif "added" in message.lower() or (target and "add" in message.lower()):
+-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
+-                        actions.append(f"{label} updated")
+-                    elif "Entry added" in message:
+-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
+-                        actions.append(f"{label} updated")
+-                    elif "removed" in message.lower() or "replaced" in message.lower():
+-                        label = "Memory" if target == "memory" else "User profile" if target == "user" else target
+-                        actions.append(f"{label} updated")
++                # and surface a compact summary to the user. Tool messages
++                # already present in messages_snapshot must be skipped, since
++                # the review agent inherits that history and would otherwise
++                # re-surface stale "created"/"updated" messages from the prior
++                # conversation as if they just happened (issue #14944).
++                actions = self._summarize_background_review_actions(
++                    getattr(review_agent, "_session_messages", []),
++                    messages_snapshot,
++                )
+ 
+                 if actions:
+                     summary = " · ".join(dict.fromkeys(actions))
+diff --git a/tests/run_agent/test_background_review_summary.py b/tests/run_agent/test_background_review_summary.py
+new file mode 100644
+index 000000000..7401b1eb1
+--- /dev/null
++++ b/tests/run_agent/test_background_review_summary.py
+@@ -0,0 +1,130 @@
++"""Tests for AIAgent._summarize_background_review_actions.
++
++Regression coverage for issue #14944: the background memory/skill review used
++to re-surface tool results that were already present in the conversation
++history before the review started (e.g. an earlier "Cron job '...' created.").
++"""
++
++import json
++
++from run_agent import AIAgent
++
++
++_summarize = AIAgent._summarize_background_review_actions
++
++
++def _tool_msg(tool_call_id, payload):
++    return {
++        "role": "tool",
++        "tool_call_id": tool_call_id,
++        "content": json.dumps(payload),
++    }
++
++
++def test_skips_prior_tool_messages_by_tool_call_id():
++    """Stale 'created' tool result from prior history must not be re-surfaced."""
++    prior_payload = {"success": True, "message": "Cron job 'remind-me' created."}
++    new_payload = {
++        "success": True,
++        "message": "Entry added",
++        "target": "user",
++    }
++
++    snapshot = [
++        {"role": "user", "content": "create a reminder"},
++        _tool_msg("call_old", prior_payload),
++        {"role": "assistant", "content": "done"},
++    ]
++    review_messages = list(snapshot) + [
++        {"role": "user", "content": "<review prompt>"},
++        _tool_msg("call_new", new_payload),
++    ]
++
++    actions = _summarize(review_messages, snapshot)
++
++    assert "Cron job 'remind-me' created." not in actions
++    assert "User profile updated" in actions
++
++
++def test_includes_genuinely_new_actions():
++    new_payload = {
++        "success": True,
++        "message": "Memory entry created.",
++    }
++    review_messages = [_tool_msg("call_new", new_payload)]
++
++    actions = _summarize(review_messages, prior_snapshot=[])
++
++    assert actions == ["Memory entry created."]
++
++
++def test_falls_back_to_content_equality_when_tool_call_id_missing():
++    """If a tool message has no tool_call_id, match prior entries by content."""
++    payload = {"success": True, "message": "Cron job 'X' created."}
++    raw = json.dumps(payload)
++    prior_msg = {"role": "tool", "content": raw}  # no tool_call_id
++    review_messages = [
++        {"role": "tool", "content": raw},  # same content -> stale, skip
++        _tool_msg("call_new", {"success": True, "message": "Skill created."}),
++    ]
++
++    actions = _summarize(review_messages, [prior_msg])
++
++    assert "Cron job 'X' created." not in actions
++    assert "Skill created." in actions
++
++
++def test_ignores_failed_tool_results():
++    bad = {"success": False, "message": "something created but failed"}
++    review_messages = [_tool_msg("call_new", bad)]
++
++    actions = _summarize(review_messages, [])
++
++    assert actions == []
++
++
++def test_handles_non_json_tool_content_gracefully():
++    review_messages = [
++        {"role": "tool", "tool_call_id": "x", "content": "not-json"},
++        _tool_msg("call_y", {"success": True, "message": "Memory updated."}),
++    ]
++
++    actions = _summarize(review_messages, [])
++
++    assert actions == ["Memory updated."]
++
++
++def test_empty_inputs():
++    assert _summarize([], []) == []
++    assert _summarize(None, None) == []
++
++
++def test_added_message_relabels_by_target():
++    review_messages = [
++        _tool_msg(
++            "c1",
++            {"success": True, "message": "Entry added to store.", "target": "memory"},
++        )
++    ]
++
++    actions = _summarize(review_messages, [])
++
++    assert actions == ["Memory updated"]
++
++
++def test_removed_or_replaced_relabels_by_target():
++    review_messages = [
++        _tool_msg(
++            "c1",
++            {"success": True, "message": "Entry removed.", "target": "user"},
++        ),
++        _tool_msg(
++            "c2",
++            {"success": True, "message": "Entry replaced.", "target": "memory"},
++        ),
++    ]
++
++    actions = _summarize(review_messages, [])
++
++    assert "User profile updated" in actions
++    assert "Memory updated" in actions

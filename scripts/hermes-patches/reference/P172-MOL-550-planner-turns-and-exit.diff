@@ -1,0 +1,22 @@
+--- a/scripts/symphony_bridge.py
++++ b/scripts/symphony_bridge.py
+@@ -153,8 +153,18 @@
+     "skeptic_revise": 300,
+ })
+ 
++# P172/MOL-550 S6: planner ceiling 60→120 for Iter 5 F6 fix. The S6 acceptance
++# dispatch on MOL-481 2026-05-12 burned $3.25 of Tier 1 budget when the planner
++# wrote a substantive 12kB plan around turn 25 then kept exploring via Grep/Read/
++# Task subagent dispatches until hitting the 60-turn ceiling → error_max_turns,
++# no ExitPlanMode call. Tier 2 happened to fit in 60 turns and saved us. 120 is
++# 2× headroom — enough margin for thorough multi-Task-dispatch work while still
++# terminating infinite-loop pathologies. Companion F7 fix in ~/.claude/agents/
++# planner.md forces ExitPlanMode immediately after plan-write (reduces typical
++# turn count, keeps 120 as catastrophic-thrash backstop not operating point).
++# planner_revise stays at 60 — revision pass is bounded by definition.
+ _CC_MAX_TURNS: "MappingProxyType[PhaseName, int]" = MappingProxyType({
+-    "planner": 60,
++    "planner": 120,
+     "skeptic": 40,
+     "builder": 150,
+     "reviewer": 80,

@@ -1,0 +1,58 @@
+# P141/MOL-491 reference diff — forward iteration instrumentation
+#
+# Shape: adds `_emit_iteration_audit()` helper at module level + invocations
+# at all 3 exit paths in `_run_single_child` + `child._delegate_profile`
+# attribute set in `delegate_task`'s child-build loop.
+#
+# Synopsis (the focused 4-hunk shape — see `git show <P141-merge-SHA>` for
+# the canonical reapply patch; this comment file documents the surface
+# while the binding behavior lives in `verify_patches.sh` check_fixed
+# assertions on the runtime file):
+#
+# Hunk 1 (module-level, near _P103_AUDIT_DROP_COUNT):
+#   + _P141_ITER_AUDIT_DROP_COUNT = 0
+#   + def _emit_iteration_audit(*, exit_reason, api_calls_val, child_obj):
+#         try:
+#             _iter_audit_path = Path("~/.hermes/logs/iteration-audit.jsonl").expanduser()
+#             _iter_audit_path.parent.mkdir(parents=True, exist_ok=True)
+#             _iter_max = getattr(child_obj, "max_iterations", None)
+#             iters_used = int(api_calls_val) if isinstance(api_calls_val, (int, float)) else 0
+#             _iter_record = {
+#                 "ts": datetime.now(timezone.utc).isoformat(),
+#                 "job_id": os.environ.get("HERMES_JOB_ID", "unknown"),
+#                 "key": os.environ.get("HERMES_TICKET_KEY", "unknown"),
+#                 "profile": getattr(child_obj, "_delegate_profile", "default"),
+#                 "iterations_used": iters_used,
+#                 "iterations_max": int(_iter_max) if isinstance(_iter_max, (int, float)) else None,
+#                 "exit_reason": exit_reason,
+#             }
+#             with _iter_audit_path.open("a") as _fp:
+#                 _fp.write(json.dumps(_iter_record) + "\n")
+#         except (OSError, ValueError, TypeError) as _iter_exc:
+#             # logger.error + counter + tier-2 /tmp fallback
+#             ...
+#
+# Hunk 2 (in _run_single_child, normal exit path after exit_reason set):
+#   + _emit_iteration_audit(exit_reason=exit_reason, api_calls_val=api_calls, child_obj=child)
+#
+# Hunk 3 (in _run_single_child, timeout path before the return at line 2007):
+#   + _emit_iteration_audit(
+#         exit_reason="timeout" if is_timeout else "error",
+#         api_calls_val=child_api_calls,
+#         child_obj=child,
+#     )
+#
+# Hunk 4 (in _run_single_child, outer-exception path before return at line 2269):
+#   + (best-effort api_calls extraction) + _emit_iteration_audit(exit_reason="error", ...)
+#
+# Hunk 5 (in delegate_task, after child._delegate_saved_tool_names = _parent_tool_names):
+#   + child._delegate_profile = profile or "default"
+#
+# Verifier: 13 check_fixed assertions in verify_patches.sh — each invariant
+# has its own assertion, so re-application correctness is observable
+# without diffing the full file.
+#
+# For the full reapply patch (after `hermes update` overwrites runtime):
+#   bash scripts/hermes-patches/verify_patches.sh --quiet
+#   # If P141 block reports failures, the missing hunks correspond to the
+#   # failed assertion's literal target.

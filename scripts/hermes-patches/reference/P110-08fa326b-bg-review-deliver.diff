@@ -1,0 +1,75 @@
+commit 08fa326bb059897bed9bb1fa7b93e9053e45dd6e
+Author: Teknium <127238744+teknium1@users.noreply.github.com>
+Date:   Thu Mar 26 17:38:24 2026 -0700
+
+    feat(gateway): deliver background review notifications to user chat (#3293)
+    
+    The background memory/skill review (_spawn_background_review) runs
+    after the agent response when turn/iteration counters exceed their
+    thresholds. It saves memories and skills, then prints a summary like
+    '💾 Memory updated · User profile updated'. In CLI mode this goes to
+    the terminal via _safe_print. In gateway mode, _safe_print routes to
+    print() which goes to stdout — invisible to the user.
+    
+    Add a background_review_callback attribute to AIAgent. When set, the
+    background review thread calls it with the summary string after saves
+    complete. The gateway wires this to adapter.send() via the same
+    run_coroutine_threadsafe bridge used by status_callback, delivering
+    the notification to the user's chat.
+
+diff --git a/gateway/run.py b/gateway/run.py
+index fd0d60042..8ac7098aa 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5128,7 +5128,25 @@ class GatewayRunner:
+             agent.stream_delta_callback = _stream_delta_cb
+             agent.status_callback = _status_callback_sync
+             agent.reasoning_config = reasoning_config
+-            
++
++            # Background review delivery — send "💾 Memory updated" etc. to user
++            def _bg_review_send(message: str) -> None:
++                if not _status_adapter:
++                    return
++                try:
++                    asyncio.run_coroutine_threadsafe(
++                        _status_adapter.send(
++                            _status_chat_id,
++                            message,
++                            metadata=_status_thread_metadata,
++                        ),
++                        _loop_for_step,
++                    )
++                except Exception as _e:
++                    logger.debug("background_review_callback error: %s", _e)
++
++            agent.background_review_callback = _bg_review_send
++
+             # Store agent reference for interrupt support
+             agent_holder[0] = agent
+             # Capture the full tool definitions for transcript logging
+diff --git a/run_agent.py b/run_agent.py
+index 7ccf15620..63e4ee772 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -486,6 +486,7 @@ class AIAgent:
+         # instead of going directly to stdout where patch_stdout's StdoutProxy
+         # would mangle the escape sequences.  None = use builtins.print.
+         self._print_fn = None
++        self.background_review_callback = None  # Optional sync callback for gateway delivery
+         self.skip_context_files = skip_context_files
+         self.pass_session_id = pass_session_id
+         self.log_prefix_chars = log_prefix_chars
+@@ -1525,6 +1526,12 @@ class AIAgent:
+                 if actions:
+                     summary = " · ".join(dict.fromkeys(actions))
+                     self._safe_print(f"  💾 {summary}")
++                    _bg_cb = self.background_review_callback
++                    if _bg_cb:
++                        try:
++                            _bg_cb(f"💾 {summary}")
++                        except Exception:
++                            pass
+ 
+             except Exception as e:
+                 logger.debug("Background memory/skill review failed: %s", e)

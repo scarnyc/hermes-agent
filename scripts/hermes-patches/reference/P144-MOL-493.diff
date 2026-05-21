@@ -1,0 +1,2815 @@
+--- /Users/wills_mac_mini/.hermes/hermes-agent.pre-rollback-20260504-200954/tools/delegate_tool.py	2026-05-04 19:22:18
++++ /Users/wills_mac_mini/.hermes/hermes-agent/tools/delegate_tool.py	2026-05-10 09:02:53
+@@ -17,23 +17,32 @@
+ """
+ 
+ import enum
++import hashlib  # P103/MOL-410 — prompt_hash in audit log
+ import json
+ import logging
+-import os
+-import re as _re
+-import threading
+-import urllib.error
+-import urllib.request
+ 
+ logger = logging.getLogger(__name__)
+-logger.setLevel(logging.INFO)  # P92/MOL-388 — override parent's ERROR level so INFO+ propagates to agent.log
++import os
++import re  # P103/MOL-410 — profile name validation + repo-path extraction (#162 review M11/M15)
++import string  # P103/MOL-410 — _build_claude_argv field-name validation (#162 review CRITICAL-6)
++import sys  # P103/MOL-410 — fail-open stderr emit in _emit_profile_audit
++import threading
+ import time
+ from concurrent.futures import (
+     ThreadPoolExecutor,
+     TimeoutError as FuturesTimeoutError,
+ )
+-from dataclasses import dataclass, field
+-from typing import Any, Dict, List, Optional
++from datetime import datetime, timezone  # P103/MOL-410 — audit log timestamps
++from pathlib import Path  # P103/MOL-410 — profile path resolution
++from typing import Any, Dict, List, Optional, Tuple
++
++# P103/MOL-410 (#162 review M9): graceful degradation if PyYAML uninstalled.
++# The default delegate_task path (no profile) MUST keep working even without
++# yaml; only profile-elevation requires it.
++try:
++    import yaml as _p103_yaml
++except ImportError:  # pragma: no cover — depends on venv state
++    _p103_yaml = None  # type: ignore[assignment]
+ 
+ from toolsets import TOOLSETS
+ from tools import file_state
+@@ -136,20 +145,7 @@
+ _MIN_SPAWN_DEPTH = 1
+ _MAX_SPAWN_DEPTH_CAP = 3
+ 
+-# P70/MOL-261: Regex to detect code paths in delegation goals.  Includes
+-# ~/Code/... for user projects AND ~/.hermes/hermes-agent for self-modification.
+-# The negative lookahead (?![A-Za-z0-9-]) on the hermes-agent alternation prevents
+-# sibling-prefix matches (hermes-agent2, hermes-agent-old, hermes-agentFOO).
+-_CODE_PATH_RE = _re.compile(
+-    r'(/Users/[^/\s"\']+/Code/[^\s"\']*'
+-    r'|~/Code/[^\s"\']*'
+-    r'|/Users/[^/\s"\']+/\.hermes/hermes-agent(?![A-Za-z0-9-])[^\s"\']*'
+-    r'|~/\.hermes/hermes-agent(?![A-Za-z0-9-])[^\s"\']*'
+-    r')'
+-)
+-_RATE_LIMIT_PATTERNS = ("429", "rate limit", "overloaded", "quota", "capacity", "too many requests")
+ 
+-
+ # ---------------------------------------------------------------------------
+ # Runtime state: pause flag + active subagent registry
+ #
+@@ -335,12 +331,6 @@
+     r_norm = str(r).strip().lower()
+     if r_norm in ("leaf", "orchestrator"):
+         return r_norm
+-    # P87/MOL-387 — known profile names silently degrade to leaf
+-    if r_norm in (
+-        "analyst", "ticketer", "planner", "architect",
+-        "designer", "debugger", "builder", "reviewer",
+-    ):
+-        return "leaf"
+     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
+     return "leaf"
+ 
+@@ -486,6 +476,37 @@
+     return bool(target and str(target).startswith("mcp-"))
+ 
+ 
++def _expand_parent_toolsets(parent_toolsets: set) -> set:
++    """Expand composite toolsets so individual toolset names are recognized.
++
++    When a parent uses a composite toolset like ``hermes-cli`` (which bundles
++    all core tools), the child may request individual toolsets such as ``web``
++    or ``terminal``.  A simple name-based intersection would reject them
++    because ``"web" != "hermes-cli"``.
++
++    This helper collects the tool names from each parent toolset, then adds
++    the names of any individual toolsets whose tools are a *subset* of the
++    parent's available tools.  The original parent toolset names are preserved.
++    """
++    parent_tool_names: set = set()
++    for ts_name in parent_toolsets:
++        ts_def = TOOLSETS.get(ts_name)
++        if ts_def:
++            parent_tool_names.update(ts_def.get("tools", []))
++
++    if not parent_tool_names:
++        return set(parent_toolsets)
++
++    expanded = set(parent_toolsets)
++    for ts_name, ts_def in TOOLSETS.items():
++        if ts_name in expanded:
++            continue
++        ts_tools = ts_def.get("tools", [])
++        if ts_tools and set(ts_tools).issubset(parent_tool_names):
++            expanded.add(ts_name)
++    return expanded
++
++
+ def _preserve_parent_mcp_toolsets(
+     child_toolsets: List[str], parent_toolsets: set[str]
+ ) -> List[str]:
+@@ -495,8 +516,1157 @@
+         if _is_mcp_toolset_name(toolset_name) and toolset_name not in preserved:
+             preserved.append(toolset_name)
+     return preserved
++
++
++# ============================================================================
++# P103/MOL-410 — Coding-profile elevation for delegate_task
++# ============================================================================
++# Profile-based scoped elevation. delegate_task(profile="coding"|"default", ...)
++# loads YAML at ~/.hermes/config/delegate-profiles/<profile>.yaml. Profile
++# drives: --allowedTools, --settings allow/deny, --max-budget-usd, --max-turns,
++# --add-dir, --append-system-prompt, env-passthrough merge, MCP server inclusion,
++# audit verbosity.
++#
++# Defense-in-depth (additive-only — profiles can ADD allowed ops, NEVER remove
++# deny rules): see PATCHES.md§P103 for the 5-layer stack.
++#
++# HITL session-consent: (profile, repo_path) tuple key, TTL 120 min for
++# `coding`. First-use-per-tuple per session prompts via Telegram. v1 returns
++# (True, "v1-auto-approve") because the Telegram-prompt subsystem is shared
++# with the gateway long-poller (409-conflict if both poll). Full per-call
++# HITL is tracked at MOL-450.
++#
++# Re-applied to runtime via P140/MOL-489 (this patch was originally P103
++# but the runtime-side work was rolled back; this re-application restores
++# the surface PATCHES.md§P103:6662 documents).
++# ============================================================================
++
++_P103_PROFILE_DIR = Path("~/.hermes/config/delegate-profiles").expanduser()
++_P103_LOG_DIR = Path("~/.hermes/logs").expanduser()
++# Module-level consent cache: (profile_name, repo_path) -> monotonic expiry seconds.
++# Single-process scope — the gateway is one process, so this is sufficient
++# for session consent. Cache wipes on gateway restart, which is the
++# intended TTL boundary. P103/MOL-410 (#162 review I4/M7): keyed off
++# time.monotonic(), NOT time.time() — wall-clock skew (NTP correction,
++# macOS sleep/wake) would otherwise produce stale-consent or repeat-prompt
++# anomalies. Monotonic resets on process boot, which is the desired
++# "session" semantic anyway.
++_P103_CONSENT_CACHE: Dict[Tuple[str, str], float] = {}
++_P103_DEFAULT_CONSENT_TTL_MIN = 120
++
++# P103/MOL-410 (#162 review CRITICAL-1): profile name allowlist. Only
++# names matching this regex are accepted by `_load_profile`. Prevents
++# `profile="../../etc/passwd"` from reading arbitrary files on disk
++# when P114/MOL-442 lands (which makes `profile=` LLM-controllable).
++_P103_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
++
++# P103/MOL-410 (#162 review I1, M2 review-fix from original P103):
++# secrets that profiles MUST NEVER passthrough to subprocesses regardless
++# of `env_passthrough` declarations. Closes the regression vs the
++# documented final P103 surface (PATCHES.md:7277).
++_P103_PROFILE_PASSTHROUGH_DENYLIST = frozenset({
++    "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
++    "DEEPSEEK_API_KEY",
++    "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
++    "OPENROUTER_API_KEY",
++    "KIMI_API_KEY", "MOONSHOT_API_KEY",
++    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
++    "TAVILY_API_KEY",
++    "GIPHY_API_KEY",
++    "VIRUSTOTAL_API_KEY", "AI_DEFENSE_API_KEY",
++    "GRANOLA_OAUTH_TOKEN", "GRANOLA_REFRESH_TOKEN",
++    "BROWSERBASE_API_KEY",
++})
++
++# P103/MOL-410 (#162 review M11): pre-compiled regex for repo-path extraction
++# from goal+context. Tighter character class than the prior `[^\s/]+` —
++# excludes trailing punctuation (`,;:.)]`) that the wider class swallowed
++# into the audit `--add-dir` field. Allows `_-` for repo names like
++# `hermes-poc-staging`. Validation fallback at extraction site checks
++# `os.path.isdir` to guard against junk that survives the regex.
++_P103_REPO_PATH_RE = re.compile(r"(?:~|/Users/[^/]+)/Code/[A-Za-z0-9._-]+")
++
++# P103/MOL-410 (#162 review M8): consent-cache lock. v1-auto-approve doesn't
++# need it (no I/O, near-atomic dict op), but locking now removes a footgun
++# from the v2 Telegram-prompt wire-up (which would otherwise dual-prompt
++# under concurrent reads).
++_P103_CONSENT_LOCK = threading.Lock()
++
++# P103/MOL-410 (#162 review CRITICAL-2): audit-write failure counter.
++# Increments when _emit_profile_audit's fail-open path fires. Surfaced
++# via `gateway.log` logger.error AND this counter so cron-context audit
++# loss is observable.
++_P103_AUDIT_DROP_COUNT = 0
++
++# P141/MOL-491 (#163 review HIGH-1): iteration-audit write failure counter.
++# Same pattern as _P103_AUDIT_DROP_COUNT — surfaces fail-open events that
++# would otherwise be silently swallowed by gateway-context stderr eating.
++_P141_ITER_AUDIT_DROP_COUNT = 0
++
++
++def _emit_iteration_audit(
++    *,
++    exit_reason: str,
++    api_calls_val: Any,
++    child_obj: Any,
++) -> None:
++    """P141/MOL-491: per-dispatch iteration audit JSONL writer.
++
++    Extracted into a helper (#163 review CRITICAL-1) so all THREE exit
++    paths of `_run_single_child` (timeout, outer-exception, normal) emit
++    the same record shape. Previously the inline hook only fired on the
++    happy-path exit_reason branches — exactly the wrong subpopulation
++    for "is `max_iterations` enough?" since the timeout/error dispatches
++    are the highest-pressure cases.
++
++    Fail-open via narrowed exception types (#163 review HIGH-1):
++    `OSError`, `ValueError`, `TypeError` — bare `Exception` would mask
++    programming bugs (KeyError on dict construction, attribute typos)
++    that should surface during development. Audit-write failures route
++    through `logger.error` (lands in `gateway.log` per launchd plist —
++    survives the gateway's stderr-eating subprocess context) AND
++    increment a counter so operators can detect silent gaps.
++
++    Tier-2 fallback to `/tmp/hermes-iter-audit-<pid>.jsonl` when the
++    primary path is unwritable (matches the P140 pattern verified at
++    PR #162).
++    """
++    try:
++        _iter_audit_path = Path("~/.hermes/logs/iteration-audit.jsonl").expanduser()
++        _iter_audit_path.parent.mkdir(parents=True, exist_ok=True)
++        _iter_max = getattr(child_obj, "max_iterations", None)
++        # #163 review SUGGESTION-1: coerce to 0 rather than None — downstream
++        # `jq '.iterations_used' | add` aggregations error on null.
++        if isinstance(api_calls_val, (int, float)):
++            iters_used = int(api_calls_val)
++        else:
++            iters_used = 0
++        _iter_record = {
++            "ts": datetime.now(timezone.utc).isoformat(),
++            "job_id": os.environ.get("HERMES_JOB_ID", "unknown"),
++            "key": os.environ.get("HERMES_TICKET_KEY", "unknown"),
++            "profile": getattr(child_obj, "_delegate_profile", "default"),
++            "iterations_used": iters_used,
++            "iterations_max": int(_iter_max) if isinstance(_iter_max, (int, float)) else None,
++            # #163 review IMPORTANT-2: rename exit_status → exit_reason for
++            # consistency with the result dict + rest of codebase.
++            "exit_reason": exit_reason,
++        }
++        with _iter_audit_path.open("a") as _fp:
++            _fp.write(json.dumps(_iter_record) + "\n")
++    except (OSError, ValueError, TypeError) as _iter_exc:
++        global _P141_ITER_AUDIT_DROP_COUNT
++        _P141_ITER_AUDIT_DROP_COUNT += 1
++        msg = (
++            f"P141/MOL-491: iteration-audit write failed "
++            f"(fail-open; drop_count={_P141_ITER_AUDIT_DROP_COUNT}): {_iter_exc}"
++        )
++        sys.stderr.write(f"[P141/MOL-491] {msg}\n")
++        try:
++            logger.error(msg)
++        except Exception:  # noqa: BLE001 — logger itself broken
++            pass
++        # Tier-2 fallback: /tmp survives sandbox edge cases.
++        try:
++            _fallback = Path(f"/tmp/hermes-iter-audit-{os.getpid()}.jsonl")
++            with _fallback.open("a") as _fp:
++                _fp.write(json.dumps({
++                    "ts": datetime.now(timezone.utc).isoformat(),
++                    "exit_reason": exit_reason,
++                    "audit_fallback": "tier2",
++                    "primary_error": str(_iter_exc),
++                }) + "\n")
++        except Exception:  # noqa: BLE001
++            pass
++
++
++def _load_profile(name: str) -> Optional[Dict[str, Any]]:
++    """P103/MOL-410: Load a delegate profile YAML by name.
++
++    Reads ~/.hermes/config/delegate-profiles/<name>.yaml via yaml.safe_load.
++    Returns None if file missing OR yaml is empty/malformed. Caller should
++    handle None by failing loud (return tool_error) when the profile was
++    explicitly requested — silent downgrade to default would mask a config
++    bug as a no-op privilege change.
++
++    P103/MOL-410 (#162 review CRITICAL-1): profile name MUST match
++    `_P103_PROFILE_NAME_RE`. Names with traversal segments / dots / slashes
++    are rejected upfront. The resolved path is also checked to be a
++    descendant of `_P103_PROFILE_DIR` after `.resolve()` (catches
++    symlink-escape attacks).
++
++    P103/MOL-410 (#162 review M9): if PyYAML is uninstalled, log + return
++    None. The default delegate path keeps working.
++
++    P103/MOL-410 (#162 review M12): if the YAML's internal `profile` field
++    differs from the requested filename-name, override it with the
++    filename — the filename is canonical. Prevents copy-paste typos in
++    YAML from emitting audit records under the wrong profile name.
++    """
++    if not _P103_PROFILE_NAME_RE.match(name or ""):
++        logger.warning("P103/MOL-410: invalid profile name %r (allowlist regex rejected)", name)
++        return None
++    if _p103_yaml is None:
++        logger.error(
++            "P103/MOL-410: PyYAML not installed — profile elevation disabled. "
++            "Install via `pip install pyyaml` in the gateway venv."
++        )
++        return None
++    profile_path = _P103_PROFILE_DIR / f"{name}.yaml"
++    if not profile_path.exists():
++        return None
++    # Symlink-escape guard: resolve the path and verify it's still under
++    # the profile dir. Defensive layer on top of the regex allowlist.
++    try:
++        resolved = profile_path.resolve()
++        resolved.relative_to(_P103_PROFILE_DIR.resolve())
++    except (OSError, ValueError) as exc:
++        logger.warning(
++            "P103/MOL-410: profile path escape attempt for %r (resolved=%s): %s",
++            name, profile_path, exc,
++        )
++        return None
++    try:
++        with profile_path.open() as fp:
++            data = _p103_yaml.safe_load(fp)
++    except (OSError, _p103_yaml.YAMLError) as exc:
++        logger.warning("P103/MOL-410: failed to load profile %s: %s", name, exc)
++        return None
++    if not isinstance(data, dict):
++        logger.warning(
++            "P103/MOL-410: profile %s is not a dict (got %s)",
++            name, type(data).__name__,
++        )
++        return None
++    # Canonicalize internal profile name to filename. M12: the YAML's own
++    # `profile` field is informational; filename is authoritative.
++    if data.get("profile") and data["profile"] != name:
++        logger.warning(
++            "P103/MOL-410: profile file %s.yaml has internal name %r; using filename-based name",
++            name, data["profile"],
++        )
++    data["profile"] = name
++    return data
++
++
++def _validate_profile_additive_only(
++    profile: Dict[str, Any],
++    base_settings: Optional[Dict[str, Any]] = None,
++) -> None:
++    """P103/MOL-410: enforce additive-only profile semantics.
++
++    Profiles can ADD allowed_tools entries, MCP servers, env_passthrough
++    entries, and allowed_bash_patterns. They CANNOT remove from base
++    settings.json deny rules — those are kernel-enforced via sandbox-exec
++    + Rampart + git-guardrails. This helper catches profile-YAML mistakes
++    where someone adds a permissive rule that overlaps a base deny.
++
++    P103/MOL-410 (#162 review I1, M2 review-fix): also validates
++    `env_passthrough` against `_P103_PROFILE_PASSTHROUGH_DENYLIST` —
++    profiles cannot lift sensitive credentials (ANTHROPIC_API_KEY etc.)
++    into subprocess env regardless of declarations. This was the
++    documented M2 review-fix from the original P103 surface that the
++    re-application initially missed.
++
++    Raises ValueError if the profile attempts to remove or override a base
++    deny, or if it declares a denylist-protected env_passthrough entry.
++    Silent (no-op) if base_settings is None AND no denylist violations
++    exist.
++    """
++    base = base_settings or {}
++    base_deny = base.get("permissions", {}).get("deny", [])
++    profile_deny = profile.get("permissions", {}).get("deny", [])
++    # If profile defines its own deny list, every base entry must still be present.
++    if profile_deny and base_deny:
++        missing = [d for d in base_deny if d not in profile_deny]
++        if missing:
++            raise ValueError(
++                f"P103/MOL-410: profile '{profile.get('profile', '?')}' attempts to "
++                f"remove base deny rules: {missing}. Profiles are additive-only — "
++                f"deny rules can only be ADDED, never removed."
++            )
++    # Forbid any explicit allow that overlaps a base deny pattern.
++    profile_allow = profile.get("allowed_bash_patterns", [])
++    for pattern in profile_allow:
++        if pattern in base_deny:
++            raise ValueError(
++                f"P103/MOL-410: profile pattern '{pattern}' overlaps base deny. "
++                f"Profiles cannot grant access to denied operations."
++            )
++    # M2 review-fix: env_passthrough denylist enforcement.
++    profile_passthrough = profile.get("env_passthrough", [])
++    if isinstance(profile_passthrough, list):
++        leaked = [k for k in profile_passthrough if k in _P103_PROFILE_PASSTHROUGH_DENYLIST]
++        if leaked:
++            raise ValueError(
++                f"P103/MOL-410: profile '{profile.get('profile', '?')}' declares "
++                f"env_passthrough for denylisted secrets: {leaked}. These keys are "
++                f"NEVER allowed to reach a subprocess regardless of profile YAML "
++                f"(M2 review-fix). See _P103_PROFILE_PASSTHROUGH_DENYLIST."
++            )
+ 
+ 
++def _check_profile_session_consent(
++    profile_name: str, repo_path: str
++) -> Tuple[bool, str]:
++    """P103/MOL-410: HITL session-consent gate keyed by (profile, repo_path).
++
++    First-use-per-tuple per session prompts via Telegram; subsequent uses
++    within TTL bypass the prompt. v1 returns (True, "v1-auto-approve")
++    because the Telegram-prompt subsystem is shared with the gateway
++    long-poller (409-conflict if both poll). Full per-call HITL is
++    tracked at MOL-450.
++
++    P103/MOL-410 (#162 review I4): cache TTL is uptime-relative
++    (`time.monotonic()`), not wall-clock — immune to NTP correction and
++    macOS sleep/wake clock skew. The "session" semantic is process-bounded
++    anyway, so monotonic is the right primitive.
++
++    P103/MOL-410 (#162 review M8): cache mutations are guarded by
++    `_P103_CONSENT_LOCK`. v1 doesn't need it (no I/O between read and
++    write) but locking now removes a footgun from the v2 Telegram-prompt
++    wire-up where the read→prompt→write window would otherwise dual-prompt.
++
++    Returns (consented: bool, reason: str). When False, reason is a short
++    operator-surface message.
++    """
++    key = (profile_name, repo_path)
++    now = time.monotonic()
++    ttl_minutes = _P103_DEFAULT_CONSENT_TTL_MIN
++    with _P103_CONSENT_LOCK:
++        expiry = _P103_CONSENT_CACHE.get(key)
++        if expiry is not None and expiry > now:
++            return True, "cached"
++        _P103_CONSENT_CACHE[key] = now + ttl_minutes * 60
++    return True, "v1-auto-approve (MOL-450 follow-up)"
++
++
++def _emit_profile_audit(
++    profile: Dict[str, Any],
++    argv: List[str],
++    matched_rule: Optional[str] = None,
++    *,
++    caller: Optional[str] = None,
++    prompt: Optional[str] = None,
++    exit_code: Optional[int] = None,
++    cost_usd: Optional[float] = None,
++    turns_used: Optional[int] = None,
++) -> None:
++    """P103/MOL-410: write a per-profile audit JSONL record.
++
++    Path: ~/.hermes/logs/delegate-{profile}.log (per PATCHES.md§P103:6697).
++    Override via profile.audit.jsonl.
++
++    Fields: ts, profile, caller, prompt_hash, argv, exit_code, cost_usd,
++    turns_used, matched_rule. include_prompt is honored from profile.audit
++    (default false — only prompt_hash is recorded for forensics + privacy).
++
++    Fail-open: if the log path is unwritable (sandbox edge case), this
++    function emits a stderr warning and returns without raising. The
++    delegate_task call continues. MOL-474 closes when this function
++    fires on the coding profile and writes a non-empty record.
++    """
++    profile_name = profile.get("profile", "default") if isinstance(profile, dict) else "default"
++    audit_cfg = profile.get("audit", {}) if isinstance(profile, dict) else {}
++    log_path_str = audit_cfg.get("jsonl") if isinstance(audit_cfg, dict) else None
++    if log_path_str:
++        log_path = Path(log_path_str).expanduser()
++    else:
++        log_path = _P103_LOG_DIR / f"delegate-{profile_name}.log"
++
++    record: Dict[str, Any] = {
++        "ts": datetime.now(timezone.utc).isoformat(),
++        "profile": profile_name,
++        "caller": caller or "delegate_task",
++        "argv": argv,
++        "matched_rule": matched_rule,
++        "exit_code": exit_code,
++        "cost_usd": cost_usd,
++        "turns_used": turns_used,
++    }
++    if prompt is not None:
++        record["prompt_hash"] = hashlib.sha256(
++            prompt.encode("utf-8", errors="replace")
++        ).hexdigest()[:16]
++        if isinstance(audit_cfg, dict) and audit_cfg.get("include_prompt"):
++            record["prompt"] = prompt
++
++    try:
++        log_path.parent.mkdir(parents=True, exist_ok=True)
++        with log_path.open("a") as fp:
++            fp.write(json.dumps(record) + "\n")
++    except Exception as exc:  # noqa: BLE001 — fail-open per P103 contract
++        # P103/MOL-410 (#162 review CRITICAL-2): stderr is silent in cron
++        # context (gateway eats it). Loud failure path: stderr + logger.error
++        # (which routes to gateway.log via the gateway logger) + counter
++        # increment + tier-2 fallback to /tmp so audit isn't entirely lost.
++        global _P103_AUDIT_DROP_COUNT
++        _P103_AUDIT_DROP_COUNT += 1
++        msg = (
++            f"P103/MOL-410: _emit_profile_audit failed for profile={profile_name!r} "
++            f"(fail-open; drop_count={_P103_AUDIT_DROP_COUNT}): {exc}"
++        )
++        sys.stderr.write(f"[P103/MOL-410] {msg}\n")
++        try:
++            logger.error(msg)
++        except Exception:  # noqa: BLE001 — logger itself broken; nothing more to do
++            pass
++        # Tier-2 fallback: /tmp survives sandbox edge cases that block
++        # ~/.hermes/logs/. Best-effort — silent failure of THIS too is the
++        # final fail-open boundary.
++        try:
++            fallback = Path(f"/tmp/hermes-delegate-audit-{os.getpid()}.jsonl")
++            with fallback.open("a") as fp:
++                fp.write(json.dumps({**record, "audit_fallback": "tier2"}) + "\n")
++        except Exception:  # noqa: BLE001
++            pass
++
++
++def _build_claude_argv(
++    profile_cfg: Dict[str, Any],
++    repo_path: str,
++    prompt: str,
++    *,
++    extra_add_dirs: Optional[List[str]] = None,
++) -> List[str]:
++    """P103/MOL-410: construct claude -p argv from a coding-profile YAML.
++
++    Emits the CLI flags for max_turns, max_budget_usd, setting_sources,
++    add_dir, allowed_tools, denied_tools, append_system_prompt. The argv
++    is the source-of-truth payload that gets recorded in the audit log
++    AND (when the ACP wire-up is active) handed to the subprocess spawner.
++
++    Profile YAML schema (subset consumed here):
++      profile: <name>
++      max_turns: int  (mapped to --max-turns)
++      max_budget_usd: float  (mapped to --max-budget-usd)
++      add_dirs: [str]  (mapped to --add-dir, runtime-interpolated)
++      allowed_tools: [str]  (mapped to --allowedTools)
++      disallowed_tools: [str]  (mapped to --disallowedTools)
++      system_prompt_suffix: str  (mapped to --append-system-prompt)
++    """
++    argv: List[str] = ["claude", "-p"]
++    # --max-turns: per-subprocess iteration cap from profile (e.g. 100 for coding).
++    max_turns = profile_cfg.get("max_turns")
++    if max_turns is not None:
++        argv.extend(["--max-turns", str(max_turns)])
++    # --max-budget-usd: cost cap per subprocess.
++    max_budget = profile_cfg.get("max_budget_usd")
++    if max_budget is not None:
++        argv.extend(["--max-budget-usd", str(max_budget)])
++    # --setting-sources: control which settings layer the subprocess inherits.
++    # Default to user,project so inline --settings stacks ON TOP of inherited
++    # deny rules (additive-only — profiles can't remove denies).
++    argv.extend(["--setting-sources", "user,project"])
++    # --add-dir: each profile-declared add_dir gets interpolated with repo_path.
++    # P103/MOL-410 (#162 review CRITICAL-6): validate template field names via
++    # string.Formatter before .format() — typos like `{repo-path}` (hyphen)
++    # silently passed through unaltered in the prior implementation; format-spec
++    # injection like `{repo_path:>500}` produced bizarre argv. Now: only
++    # `{repo_path}` is honored; any other field name aborts the directory.
++    _formatter = string.Formatter()
++    add_dirs = list(profile_cfg.get("add_dirs", []))
++    for extra in (extra_add_dirs or []):
++        if extra not in add_dirs:
++            add_dirs.append(extra)
++    for raw_dir in add_dirs:
++        try:
++            field_names = {
++                f for _, f, _, _ in _formatter.parse(raw_dir)
++                if f is not None and f != ""
++            }
++        except (ValueError, IndexError):
++            logger.warning(
++                "P103/MOL-410: add_dir %r has malformed template; skipping", raw_dir
++            )
++            continue
++        unknown = field_names - {"repo_path"}
++        if unknown:
++            logger.warning(
++                "P103/MOL-410: add_dir %r references unknown fields %s; skipping",
++                raw_dir, sorted(unknown),
++            )
++            continue
++        try:
++            resolved = raw_dir.format(repo_path=repo_path) if field_names else raw_dir
++        except (KeyError, IndexError, ValueError) as exc:
++            logger.warning(
++                "P103/MOL-410: add_dir %r format failed: %s; skipping", raw_dir, exc
++            )
++            continue
++        argv.extend(["--add-dir", resolved])
++    # --allowedTools: profile's allowed tools list.
++    allowed_tools = profile_cfg.get("allowed_tools")
++    if allowed_tools:
++        argv.extend(["--allowedTools", ",".join(allowed_tools)])
++    # --disallowedTools: optional inverse list (informational; deny rules
++    # are enforced at sandbox layer regardless).
++    disallowed = profile_cfg.get("disallowed_tools")
++    if disallowed:
++        argv.extend(["--disallowedTools", ",".join(disallowed)])
++    # --append-system-prompt: profile-specific system prompt suffix.
++    suffix = profile_cfg.get("system_prompt_suffix")
++    if suffix:
++        argv.extend(["--append-system-prompt", suffix])
++    # --permission-mode: profile's permission mode (e.g. "plan", "auto").
++    permission_mode = profile_cfg.get("permission_mode")
++    if permission_mode:
++        argv.extend(["--permission-mode", permission_mode])
++    # Final positional: the prompt itself.
++    argv.append(prompt)
++    return argv
++
++
++# ============================================================================
++# End P103/MOL-410 helpers
++# ============================================================================
++
++
++# ── P144/MOL-493 ──────────────────────────────────────────────────────────
++# Claude Code subprocess delegation (Tier 1 native + Tier 2 DeepSeek direct).
++# Replaces the old local proxy with direct api.deepseek.com/anthropic routing.
++# Each spawner emits P141 iteration-audit records so coding-profile dispatches
++# are visible to iteration-pressure analysis.
++
++
++# P144 review (#165): per-occurrence credential redaction — replaces the old
++# all-or-nothing substring check that lost diagnostic info on any match and
++# missed non-covered formats (glpat-*, gho_*, etc.).
++_CREDENTIAL_REDACT_RE = re.compile(
++    r'(?:sk-ant-)[A-Za-z0-9]{1,40}'
++    r'|(?:AIza)[0-9A-Za-z\-_]{1,40}'
++    r'|(?:ya29\.)[0-9A-Za-z\-_]{1,100}'
++    r'|(?:gh[po]_)[0-9A-Za-z]{1,60}'
++    r'|(?:github_pat_)[0-9A-Za-z\-_]{1,100}'
++    r'|(?:glpat-)[0-9A-Za-z\-_]{1,50}'
++)
++
++
++def _redact_credentials(text: str) -> str:
++    """Redact credential patterns inline without discarding diagnostic context."""
++    if not text:
++        return text
++    return _CREDENTIAL_REDACT_RE.sub("[REDACTED]", text)
++
++
++# P144 review (#165): short-term probe cache — avoids burning billable API
++# calls on repeated Tier 2 fallback attempts during degraded-API storms.
++# Keyed by API-key prefix (first 12 chars), 60s TTL.
++_PROBE_CACHE: Dict[str, tuple[float, bool]] = {}
++
++
++def _check_probe_cache(api_key: str) -> Optional[bool]:
++    """Return cached probe result if fresh, None if stale or missing."""
++    _now = time.monotonic()
++    _prefix = api_key[:12]
++    if _prefix in _PROBE_CACHE:
++        _cached_at, _cached_ok = _PROBE_CACHE[_prefix]
++        if _now - _cached_at < 60.0:
++            return _cached_ok
++        del _PROBE_CACHE[_prefix]
++    return None
++
++
++def _set_probe_cache(api_key: str, ok: bool) -> None:
++    _PROBE_CACHE[api_key[:12]] = (time.monotonic(), ok)
++# are visible to iteration-pressure analysis.
++# ───────────────────────────────────────────────────────────────────────────
++
++# P52/MOL-233 — delegation truthfulness verifier.
++# When a subagent claims it modified code, we check git diff to verify.
++
++_VERIFY_EDIT_KEYWORDS: frozenset = frozenset({
++    "modified", "updated", "created", "added", "changed", "edited",
++    "wrote", "rewrote", "patched", "fixed", "implemented", "refactored",
++})
++
++_VERIFY_NOOP_SIGNALS: frozenset = frozenset({
++    "already in place",
++    "already implemented",
++    "already present",
++    "already exists",
++    "no changes needed",
++    "no changes required",
++    "no modifications needed",
++    "nothing to change",
++    "no work needed",
++    "not needed",
++    "not required",
++    "no change",
++})
++
++
++def _verify_delegation_diff(
++    pre_dirty: set,
++    post_dirty: set,
++    goal: str,
++    context: str,
++    result_text: str,
++) -> tuple:
++    """Verify that a delegation that claimed code changes actually produced a diff.
++
++    Returns (verified: bool, reason: str).  ``verified=True`` means either a
++    diff appeared OR the subagent honestly reported a no-op.  ``verified=False``
++    means the subagent described edits but no files changed.
++    """
++    new_files = post_dirty - pre_dirty
++    if new_files:
++        return True, f"diff confirmed: {', '.join(sorted(new_files)[:5])}"
++    combined = f"{result_text} {goal} {context}".lower()
++    for signal in _VERIFY_NOOP_SIGNALS:
++        if signal in combined:
++            return True, f"no-op signal: '{signal}'"
++    for kw in _VERIFY_EDIT_KEYWORDS:
++        if kw.lower() in result_text.lower():
++            return False, f"claimed '{kw}' but no files changed"
++    return True, "no diff but no explicit edit claim — ambiguous"
++
++
++def _run_claude_code_delegation(
++    goal: str = "",
++    context: str = "",
++    repo_path: str = "",
++    max_iterations: int = 100,
++    parent_agent=None,
++    skip_hitl: bool = False,
++    profile_cfg: Optional[Dict[str, Any]] = None,
++) -> dict:
++    """Run a coding task via Claude Code subprocess (Tier 1 — native Anthropic).
++
++    Returns a dict (not a JSON string):
++      - Success: {"result": ..., "duration_seconds": N, "num_turns": N, "cost_usd": N, "model": ...}
++      - Rate limit: {"error": ..., "rate_limited": True}
++      - Other error: {"error": ..., "rate_limited": False}
++    """
++    import subprocess as _subprocess
++    from types import SimpleNamespace
++
++    cfg = _load_config()
++    coding_cfg = cfg.get("coding", {})
++    if not coding_cfg.get("enabled", False):
++        return {"error": "Coding delegation is disabled. Set delegation.coding.enabled=true in config.yaml", "rate_limited": False}
++
++    if parent_agent is None:
++        return {"error": "Claude Code delegation requires a parent agent context.", "rate_limited": False}
++
++    depth = getattr(parent_agent, '_delegate_depth', 0)
++    if depth >= MAX_DEPTH:
++        return {"error": f"Delegation depth limit reached ({MAX_DEPTH}).", "rate_limited": False}
++
++    if not goal or not goal.strip():
++        return {"error": "goal is required and cannot be empty.", "rate_limited": False}
++
++    if not repo_path or not repo_path.startswith("/") or not os.path.isdir(repo_path):
++        return {"error": f"repo_path must be an absolute path to an existing directory: {repo_path}", "rate_limited": False}
++    if not os.path.isdir(os.path.join(repo_path, ".git")):
++        return {"error": f"repo_path is not a git repository: {repo_path}", "rate_limited": False}
++
++    allowed_roots = coding_cfg.get("allowed_write_roots", [])
++    if not allowed_roots:
++        return {"error": "No allowed_write_roots configured.", "rate_limited": False}
++    repo_real = os.path.realpath(repo_path)
++    if not any(repo_real == os.path.realpath(os.path.expanduser(r)) or repo_real.startswith(os.path.realpath(os.path.expanduser(r)) + os.sep) for r in allowed_roots):
++        return {"error": f"repo_path {repo_path} not within allowed_write_roots: {allowed_roots}", "rate_limited": False}
++
++    if not skip_hitl:
++        try:
++            from tools.approval import check_all_command_guards
++            guard_result = check_all_command_guards(
++                f"claude_code_delegation: {goal[:100]} -> {repo_path}",
++                env_type="local",
++            )
++            if not guard_result.get("approved", False):
++                return {"error": f"Delegation denied: {guard_result.get('message', 'denied by command guards')}", "rate_limited": False}
++        except ImportError:
++            return {"error": "approval module not available", "rate_limited": False}
++
++    prompt = f"{goal}\n\nContext: {context}" if context else goal
++    effective_max = max_iterations or coding_cfg.get("max_iterations", 100)
++
++    if profile_cfg:
++        argv = _build_claude_argv(profile_cfg, repo_path, prompt)
++    else:
++        cc_model = coding_cfg.get("model", "sonnet")
++        cc_effort = coding_cfg.get("effort", "high")
++        argv = [
++            "claude", "-p",
++            "--output-format", "json",
++            "--no-session-persistence",
++            "--tools", "Bash,Read,Write,Edit,Glob,Grep",
++            "--permission-mode", "auto",
++            "--model", cc_model,
++            "--effort", cc_effort,
++            "--add-dir", repo_path,
++            "--max-turns", str(effective_max),
++            "--system-prompt", (
++                "You are a coding assistant working on a delegated task. "
++                "Stay focused on the goal. Do not read or print environment variables. "
++                "Do not access files outside the specified repository. "
++                "Do not make network requests or push to git remotes."
++            ),
++            prompt,
++        ]
++
++    from tools.environments.local import _sanitize_subprocess_env
++    _profile_passthrough = set(profile_cfg.get("env_passthrough", [])) if profile_cfg else None
++    safe_env = _sanitize_subprocess_env(os.environ.copy(), profile_passthrough=_profile_passthrough)
++
++    # P52/MOL-233 — pre-delegation dirty files for truthfulness verification.
++    pre_dirty: set = set()
++    pre_check_ok = False
++    try:
++        _pre = _subprocess.run(
++            ["git", "diff", "--name-only", "HEAD"],
++            capture_output=True, text=True, timeout=5, cwd=repo_path,
++        )
++        if _pre.returncode == 0:
++            pre_dirty = {f for f in _pre.stdout.strip().split("\n") if f}
++            pre_check_ok = True
++    except (OSError, _subprocess.TimeoutExpired):
++        pass  # pre-check failed; verification will be conservative
++
++    # P141/MOL-491 stub — carries profile + max_iterations for iteration audit.
++    _p141_stub = SimpleNamespace(
++        max_iterations=effective_max,
++        _delegate_profile=profile_cfg.get("profile", "default") if profile_cfg else "default",
++    )
++
++    start_time = time.monotonic()
++    try:
++        proc = _subprocess.Popen(
++            argv, stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
++            text=True, cwd=repo_path, env=safe_env,
++        )
++    except OSError as exc:
++        _emit_iteration_audit(exit_reason="error", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": f"Failed to start claude subprocess: {exc}", "rate_limited": False}
++
++    heartbeat_stop = threading.Event()
++
++    def _heartbeat():
++        while not heartbeat_stop.wait(15.0):
++            touch = getattr(parent_agent, '_touch_activity', None)
++            if touch:
++                try:
++                    touch(f"claude_code_delegation: PID {proc.pid} active, {round(time.monotonic() - start_time)}s elapsed")
++                except Exception:
++                    pass
++
++    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
++    hb_thread.start()
++
++    try:
++        stdout, stderr = proc.communicate(timeout=600)
++    except _subprocess.TimeoutExpired:
++        heartbeat_stop.set()
++        try:
++            proc.kill()
++        except OSError:
++            pass  # process already dead; proceed with cleanup
++        stdout, stderr = proc.communicate()
++        _emit_iteration_audit(exit_reason="timeout", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": "Claude Code delegation timed out after 600 seconds", "rate_limited": False}
++    except OSError as exc:
++        heartbeat_stop.set()
++        try:
++            proc.kill()
++        except OSError:
++            pass
++        stdout, stderr = proc.communicate()
++        _emit_iteration_audit(exit_reason="error", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": f"Claude Code subprocess pipe error: {exc}", "rate_limited": False}
++    finally:
++        heartbeat_stop.set()
++
++    duration_seconds = round(time.monotonic() - start_time, 1)
++
++    if proc.returncode != 0:
++        safe_stderr = _redact_credentials(stderr[:500] if stderr else "")
++        error_msg = f"Claude Code exited with code {proc.returncode}: {safe_stderr}"
++        combined = f"{proc.returncode} {safe_stderr}".lower()
++        rate_limited = any(p in combined for p in _RATE_LIMIT_PATTERNS)
++        _emit_iteration_audit(
++            exit_reason="rate_limited" if rate_limited else "error",
++            api_calls_val=0,
++            child_obj=_p141_stub,
++        )
++        return {"error": error_msg, "rate_limited": rate_limited}
++
++    try:
++        result_data = json.loads(stdout)
++    except json.JSONDecodeError:
++        safe_stdout = _redact_credentials(stdout[:500] if stdout else "[empty output]")
++        _emit_iteration_audit(exit_reason="error", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": f"Claude Code output was not valid JSON: {safe_stdout}", "rate_limited": False}
++
++    result = result_data.get("result", "") or ""
++    num_turns = result_data.get("num_turns", 0)
++    error_text = result_data.get("error")
++    if isinstance(error_text, str) and error_text.strip():
++        rate_limited = any(p in str(error_text).lower() for p in _RATE_LIMIT_PATTERNS)
++        _emit_iteration_audit(
++            exit_reason="rate_limited" if rate_limited else "error",
++            api_calls_val=num_turns,
++            child_obj=_p141_stub,
++        )
++        return {"error": error_text, "rate_limited": rate_limited}
++
++    # P52/MOL-233 — post-delegation diff verification.
++    post_dirty: set = set()
++    verified = True
++    verification_reason = "skipped"
++    try:
++        _post = _subprocess.run(
++            ["git", "diff", "--name-only", "HEAD"],
++            capture_output=True, text=True, timeout=5, cwd=repo_path,
++        )
++        if _post.returncode == 0:
++            post_dirty = {f for f in _post.stdout.strip().split("\n") if f}
++        if pre_check_ok:
++            verified, verification_reason = _verify_delegation_diff(
++                pre_dirty, post_dirty, goal, context, result,
++            )
++        else:
++            verification_reason = "pre-check failed, conservative diff"
++        if not verified:
++            logger.warning(
++                "delegate_truthfulness verified=false repo=%s reason=%s goal=%.120s",
++                repo_path, verification_reason, goal,
++            )
++    except (OSError, _subprocess.TimeoutExpired):
++        verification_reason = "verification error"
++        verified = True
++
++    _emit_iteration_audit(
++        exit_reason="completed",
++        api_calls_val=num_turns,
++        child_obj=_p141_stub,
++    )
++
++    return {
++        "result": result,
++        "duration_seconds": duration_seconds,
++        "num_turns": num_turns,
++        "cost_usd": result_data.get("total_cost_usd", 0),
++        "model": result_data.get("model", ""),
++        "verified": verified,
++        "verification_reason": verification_reason,
++    }
++
++
++def _run_claude_code_deepseek_direct_delegation(
++    goal: str = "",
++    context: str = "",
++    repo_path: str = "",
++    max_iterations: int = 100,
++    parent_agent=None,
++    skip_hitl: bool = False,
++    profile_cfg: Optional[Dict[str, Any]] = None,
++) -> dict:
++    """Run a coding task via Claude Code through DeepSeek direct API (Tier 2).
++
++    Same contract as _run_claude_code_delegation.  Probes api.deepseek.com
++    before spawning, fetches the API key from envchain hermes-llm, and sets
++    ANTHROPIC_BASE_URL + model-mapping env vars so claude -p routes through
++    DeepSeek's Anthropic-compatible endpoint.  No local proxy required.
++
++    Returns dict with "delegation": "claude-code-deepseek-direct" on success.
++    """
++    import subprocess as _subprocess
++    from types import SimpleNamespace
++
++    cfg = _load_config()
++    coding_cfg = cfg.get("coding", {})
++    fd_cfg = coding_cfg.get("fallback_deepseek_cc", {})
++    if not fd_cfg.get("enabled", True):
++        return {"error": "DeepSeek CC fallback is disabled (delegation.coding.fallback_deepseek_cc.enabled=false)", "rate_limited": False}
++
++    if parent_agent is None:
++        return {"error": "DeepSeek delegation requires a parent agent context.", "rate_limited": False}
++
++    depth = getattr(parent_agent, "_delegate_depth", 0)
++    if depth >= MAX_DEPTH:
++        return {"error": f"Delegation depth limit reached ({MAX_DEPTH}).", "rate_limited": False}
++
++    if not goal or not goal.strip():
++        return {"error": "goal is required and cannot be empty.", "rate_limited": False}
++
++    if not repo_path or not repo_path.startswith("/") or not os.path.isdir(repo_path):
++        return {"error": f"repo_path must be an absolute path to an existing directory: {repo_path}", "rate_limited": False}
++    if not os.path.isdir(os.path.join(repo_path, ".git")):
++        return {"error": f"repo_path is not a git repository: {repo_path}", "rate_limited": False}
++
++    allowed_roots = coding_cfg.get("allowed_write_roots", [])
++    if not allowed_roots:
++        return {"error": "No allowed_write_roots configured for DeepSeek delegation.", "rate_limited": False}
++    repo_real = os.path.realpath(repo_path)
++    if not any(repo_real == os.path.realpath(os.path.expanduser(r)) or repo_real.startswith(os.path.realpath(os.path.expanduser(r)) + os.sep) for r in allowed_roots):
++        return {"error": f"repo_path {repo_path} not within allowed_write_roots: {allowed_roots}", "rate_limited": False}
++
++    prompt = f"{goal}\n\nContext: {context}" if context else goal
++    effective_max = max_iterations or coding_cfg.get("max_iterations", 100)
++
++    # ── Health probe: verify api.deepseek.com responds before spawning ──
++    deepseek_key = ""
++    try:
++        env_result = _subprocess.run(
++            ["envchain", "hermes-llm", "printenv", "DEEPSEEK_API_KEY"],
++            capture_output=True, text=True, timeout=10,
++        )
++        if env_result.returncode == 0 and env_result.stdout.strip():
++            deepseek_key = env_result.stdout.strip()
++    except Exception:
++        pass
++    if not deepseek_key:
++        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
++    if not deepseek_key:
++        return {"error": "DEEPSEEK_API_KEY not available (check envchain hermes-llm)", "rate_limited": False}
++
++    # P141 stub — built early so probe-failure audit records can use it.
++    _p141_stub = SimpleNamespace(
++        max_iterations=effective_max,
++        _delegate_profile=profile_cfg.get("profile", "default") if profile_cfg else "default",
++    )
++
++    # Probe with a minimal 1-token request (same pattern as claude-deepseek-direct.sh).
++    # P144 review (#165): short-term cache avoids burning API calls on repeated
++    # fallback attempts during degraded-API storms (60s TTL per key prefix).
++    _cached = _check_probe_cache(deepseek_key)
++    if _cached is True:
++        probe_ok = True
++    elif _cached is False:
++        _emit_iteration_audit(exit_reason="probe_failed", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": "DeepSeek API probe failed (cached, re-probe in <60s)", "rate_limited": False}
++    else:
++        # P144: DO NOT log probe_cmd — contains API key in curl -H argument.
++        probe_cmd = [
++            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
++            "--max-time", "10",
++            "-X", "POST", "https://api.deepseek.com/anthropic/v1/messages",
++            "-H", f"x-api-key: {deepseek_key}",
++            "-H", "Content-Type: application/json",
++            "-d", '{"model":"deepseek-v4-pro","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}',
++        ]
++        probe_ok = False
++        try:
++            probe_proc = _subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
++            probe_status = probe_proc.stdout.strip()
++            if probe_status.startswith("2"):
++                probe_ok = True
++                _set_probe_cache(deepseek_key, True)
++            else:
++                _set_probe_cache(deepseek_key, False)
++                _emit_iteration_audit(exit_reason="probe_failed", api_calls_val=0, child_obj=_p141_stub)
++                return {"error": f"DeepSeek API probe failed (HTTP {probe_status})", "rate_limited": probe_status == "429"}
++        except _subprocess.TimeoutExpired:
++            _emit_iteration_audit(exit_reason="probe_failed", api_calls_val=0, child_obj=_p141_stub)
++            return {"error": "DeepSeek API probe timed out", "rate_limited": False}
++        except OSError as exc:
++            _emit_iteration_audit(exit_reason="probe_failed", api_calls_val=0, child_obj=_p141_stub)
++            return {"error": f"DeepSeek API probe failed: {exc}", "rate_limited": False}
++
++    if profile_cfg:
++        argv = _build_claude_argv(profile_cfg, repo_path, prompt)
++    else:
++        cc_model = coding_cfg.get("model", "sonnet")
++        cc_effort = coding_cfg.get("effort", "high")
++        argv = [
++            "claude", "-p",
++            "--output-format", "json",
++            "--no-session-persistence",
++            "--tools", "Bash,Read,Write,Edit,Glob,Grep",
++            "--permission-mode", "auto",
++            "--model", cc_model,
++            "--effort", cc_effort,
++            "--add-dir", repo_path,
++            "--max-turns", str(effective_max),
++            "--system-prompt", (
++                "You are a coding assistant working on a delegated task. "
++                "Stay focused on the goal. Do not read or print environment variables. "
++                "Do not access files outside the specified repository. "
++                "Do not make network requests or push to git remotes."
++            ),
++            prompt,
++        ]
++
++    from tools.environments.local import _sanitize_subprocess_env
++    _profile_passthrough = set(profile_cfg.get("env_passthrough", [])) if profile_cfg else None
++    safe_env = _sanitize_subprocess_env(os.environ.copy(), profile_passthrough=_profile_passthrough)
++
++    # ── Inject DeepSeek direct-routing env vars ──────────────────────────
++    safe_env["ANTHROPIC_BASE_URL"] = "https://api.deepseek.com/anthropic"
++    safe_env["ANTHROPIC_AUTH_TOKEN"] = deepseek_key
++    safe_env["ANTHROPIC_MODEL"] = "deepseek-v4-pro[1m]"
++    safe_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "deepseek-v4-pro[1m]"
++    safe_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "deepseek-v4-pro[1m]"
++    safe_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "deepseek-v4-flash"
++    safe_env["CLAUDE_CODE_SUBAGENT_MODEL"] = "deepseek-v4-flash"
++    safe_env["CLAUDE_CODE_EFFORT_LEVEL"] = "max"
++
++    pre_dirty: set = set()
++    pre_check_ok = False
++    try:
++        _pre = _subprocess.run(
++            ["git", "diff", "--name-only", "HEAD"],
++            capture_output=True, text=True, timeout=5, cwd=repo_path,
++        )
++        if _pre.returncode == 0:
++            pre_dirty = {f for f in _pre.stdout.strip().split("\n") if f}
++            pre_check_ok = True
++    except (OSError, _subprocess.TimeoutExpired):
++        pass  # pre-check failed; verification will be conservative
++
++    start_time = time.monotonic()
++    try:
++        proc = _subprocess.Popen(
++            argv, stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
++            text=True, cwd=repo_path, env=safe_env,
++        )
++    except OSError as exc:
++        _emit_iteration_audit(exit_reason="error", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": f"Failed to start claude subprocess (DeepSeek): {exc}", "rate_limited": False}
++
++    heartbeat_stop = threading.Event()
++
++    def _heartbeat():
++        while not heartbeat_stop.wait(15.0):
++            touch = getattr(parent_agent, "_touch_activity", None)
++            if touch:
++                try:
++                    touch(f"deepseek_direct_delegation: PID {proc.pid} active, {round(time.monotonic() - start_time)}s elapsed")
++                except Exception:
++                    pass
++
++    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
++    hb_thread.start()
++
++    try:
++        stdout, stderr = proc.communicate(timeout=600)
++    except _subprocess.TimeoutExpired:
++        heartbeat_stop.set()
++        try:
++            proc.kill()
++        except OSError:
++            pass  # process already dead; proceed with cleanup
++        stdout, stderr = proc.communicate()
++        _emit_iteration_audit(exit_reason="timeout", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": "DeepSeek delegation timed out after 600 seconds", "rate_limited": False}
++    except OSError as exc:
++        heartbeat_stop.set()
++        try:
++            proc.kill()
++        except OSError:
++            pass
++        stdout, stderr = proc.communicate()
++        _emit_iteration_audit(exit_reason="error", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": f"DeepSeek subprocess pipe error: {exc}", "rate_limited": False}
++    finally:
++        heartbeat_stop.set()
++
++    duration_seconds = round(time.monotonic() - start_time, 1)
++
++    if proc.returncode != 0:
++        safe_stderr = _redact_credentials(stderr[:500] if stderr else "")
++        error_msg = f"DeepSeek delegation exited with code {proc.returncode}: {safe_stderr}"
++        rate_limited = any(p in f"{proc.returncode} {safe_stderr}".lower() for p in _RATE_LIMIT_PATTERNS)
++        _emit_iteration_audit(
++            exit_reason="rate_limited" if rate_limited else "error",
++            api_calls_val=0,
++            child_obj=_p141_stub,
++        )
++        return {"error": error_msg, "rate_limited": rate_limited}
++
++    try:
++        result_data = json.loads(stdout)
++    except json.JSONDecodeError:
++        safe_stdout = _redact_credentials(stdout[:500] if stdout else "[empty output]")
++        _emit_iteration_audit(exit_reason="error", api_calls_val=0, child_obj=_p141_stub)
++        return {"error": f"DeepSeek delegation output was not valid JSON: {safe_stdout}", "rate_limited": False}
++
++    result = result_data.get("result", "") or ""
++    num_turns = result_data.get("num_turns", 0)
++    error_text = result_data.get("error")
++    if isinstance(error_text, str) and error_text.strip():
++        rate_limited = any(p in str(error_text).lower() for p in _RATE_LIMIT_PATTERNS)
++        _emit_iteration_audit(
++            exit_reason="rate_limited" if rate_limited else "error",
++            api_calls_val=num_turns,
++            child_obj=_p141_stub,
++        )
++        return {"error": error_text, "rate_limited": rate_limited}
++
++    post_dirty: set = set()
++    verified = True
++    verification_reason = "skipped"
++    try:
++        _post = _subprocess.run(
++            ["git", "diff", "--name-only", "HEAD"],
++            capture_output=True, text=True, timeout=5, cwd=repo_path,
++        )
++        if _post.returncode == 0:
++            post_dirty = {f for f in _post.stdout.strip().split("\n") if f}
++        if pre_check_ok:
++            verified, verification_reason = _verify_delegation_diff(pre_dirty, post_dirty, goal, context, result)
++        else:
++            verification_reason = "pre-check failed, conservative diff"
++        if not verified:
++            logger.warning("delegate_truthfulness verified=false repo=%s reason=%s", repo_path, verification_reason)
++    except (OSError, _subprocess.TimeoutExpired):
++        verification_reason = "verification error"
++        verified = True
++
++    _emit_iteration_audit(
++        exit_reason="completed",
++        api_calls_val=num_turns,
++        child_obj=_p141_stub,
++    )
++
++    return {
++        "result": result,
++        "duration_seconds": duration_seconds,
++        "num_turns": num_turns,
++        "cost_usd": result_data.get("total_cost_usd", 0),
++        "model": result_data.get("model", ""),
++        "verified": verified,
++        "verification_reason": verification_reason,
++        "delegation": "claude-code-deepseek-direct",
++    }
++
++
++_CODE_PATH_RE = re.compile(
++    r'(/Users/[^/\s"\']+/Code/[^\s"\']*'
++    r'|~/Code/[^\s"\']*'
++    r'|/Users/[^/\s"\']+/\.hermes/hermes-agent(?![A-Za-z0-9-])[^\s"\']*'
++    r'|~/\.hermes/hermes-agent(?![A-Za-z0-9-])[^\s"\']*'
++    r')'
++)
++_RATE_LIMIT_PATTERNS = ("429", "rate limit", "overloaded", "quota", "capacity", "too many requests")
++
++
++def _detect_repo_path(goal: str, context: str = "") -> Optional[str]:
++    """Extract a repo path from goal/context if it references ~/Code/."""
++    cfg = _load_config()
++    coding_cfg = cfg.get("coding", {})
++    if not coding_cfg.get("enabled", False):
++        return None
++    allowed_roots = coding_cfg.get("allowed_write_roots", [])
++    if not allowed_roots:
++        return None
++    for match in _CODE_PATH_RE.finditer(f"{goal} {context}"):
++        raw = match.group(1)
++        expanded = os.path.realpath(os.path.expanduser(raw))
++        candidate = expanded
++        while candidate and candidate != "/":
++            if os.path.isdir(os.path.join(candidate, ".git")):
++                for root in allowed_roots:
++                    root_real = os.path.realpath(os.path.expanduser(root))
++                    if candidate == root_real or candidate.startswith(root_real + os.sep):
++                        return candidate
++                break
++            candidate = os.path.dirname(candidate)
++    return None
++
++
+ DEFAULT_MAX_ITERATIONS = 50
+ DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
+ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
+@@ -562,8 +1732,6 @@
+     role: str = "leaf",
+     max_spawn_depth: int = 2,
+     child_depth: int = 1,
+-    # P85/MOL-382 — role-specific suffix injected before closing instructions
+-    role_suffix: Optional[str] = None,
+ ) -> str:
+     """Build a focused system prompt for a child agent.
+ 
+@@ -623,253 +1791,53 @@
+             "- Trivial tasks you can execute in one or two tool calls.\n"
+             "- Re-delegating your entire assigned goal to one worker "
+             "(that's just pass-through with no value added).\n\n"
+-            "Coordinate your workers' results and synthesize them before "
+-            "reporting back to your parent. You are responsible for the "
+-            "final summary, not your workers.\n\n"
+-            f"NOTE: You are at depth {child_depth}. The delegation tree "
+-            f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
+-        )
+-    # P85/MOL-382 — inject role-specific instructions before closing
+-    if role_suffix and role_suffix.strip():
+-        parts.append(f"\nROLE:\n{role_suffix.strip()}")
+-    return "\n".join(parts)
+-
+-
+-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+-    """Best-effort local workspace hint for child prompts.
+-
+-    We only inject a path when we have a concrete absolute directory. This avoids
+-    teaching subagents a fake container path while still helping them avoid
+-    guessing `/workspace/...` for local repo tasks.
+-    """
+-    candidates = [
+-        os.getenv("TERMINAL_CWD"),
+-        getattr(
+-            getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
+-        ),
+-        getattr(parent_agent, "terminal_cwd", None),
+-        getattr(parent_agent, "cwd", None),
+-    ]
+-    for candidate in candidates:
+-        if not candidate:
+-            continue
+-        try:
+-            text = os.path.abspath(os.path.expanduser(str(candidate)))
+-        except Exception:
+-            continue
+-        if os.path.isabs(text) and os.path.isdir(text):
+-            return text
+-    return None
+-
+-
+-def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
+-    """Remove toolsets that contain only blocked tools."""
+-    blocked_toolset_names = {
+-        "delegation",
+-        "clarify",
+-        "memory",
+-        "code_execution",
+-    }
+-    return [t for t in toolsets if t not in blocked_toolset_names]
+-
+-
+-# P85/MOL-382 — resolve a named role profile from delegation config.
+-def _resolve_role_profile(role: Optional[str], cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+-    """Resolve a named role profile from delegation config.
+-
+-    Returns the profile dict (description, toolsets, max_iterations,
+-    system_prompt_suffix) or None when role is empty or unrecognized.
+-    """
+-    if not role:
+-        return None
+-    profiles = cfg.get("role_profiles", {})
+-    if not profiles:
+-        return None
+-    return profiles.get(role)
+-
+-
+-# P91/MOL-387-Phase2 — Arch-Router-based role auto-detection.
+-# Arch-Router-1.5B runs locally on Ollama (localhost:11434), same as the
+-# model-router in agent/smart_model_routing.py. It serves as an optional
+-# semantic classifier with keyword matching as the deterministic fallback.
+-_ARCH_ROUTER_BASE_URL = "http://localhost:11434/v1"
+-_ARCH_ROUTER_MODEL = "hf.co/katanemo/Arch-Router-1.5B.gguf:Q4_K_M"
+-# 5s budget covers Ollama cold-start (model load on first call); steady-state
+-# classification is ~89ms. Override via cfg.role_detection.arch_router_timeout.
+-_ARCH_ROUTER_TIMEOUT = 5
+-
+-# Maps Arch-Router output variants to canonical role names.
+-# Full-text checked before first-word extraction per PR review fix.
+-_ROLE_ALIASES: dict = {
+-    "debug": "debugger",
+-    "debugging": "debugger",
+-    "design": "designer",
+-    "designing": "designer",
+-    "code review": "reviewer",
+-    "review": "reviewer",
+-    "build": "builder",
+-    "coding": "builder",
+-    "implement": "builder",
+-    "plan": "planner",
+-    "planning": "planner",
+-    "analyze": "analyst",
+-    "analysis": "analyst",
+-    "triage": "ticketer",
+-}
+-
+-# P91/MOL-387-Phase2 — Arch-Router prompt templates.
+-# Mirrors the shape used by agent/smart_model_routing.py::classify_with_arch_router.
+-_ARCH_ROLE_SYSTEM = (
+-    "You are a role classifier. You MUST respond with exactly one of these "
+-    "role names: {role_names}. No other output."
+-)
+-
+-_ARCH_ROLE_USER_TEMPLATE = (
+-    "Roles:\n{role_descriptions}\n\nTask: {task}\n\nRole:"
+-)
+-
+-
+-def _detect_role_with_arch_router(
+-    goal: str,
+-    context: str,
+-    cfg: Dict[str, Any],
+-) -> Optional[str]:
+-    """P91/MOL-387-Phase2 — Arch-Router-1.5B semantic role classification.
+-
+-    Posts a classification request to a local Ollama instance running
+-    Arch-Router-1.5B and returns a canonical role name (validated against
+-    role_profiles) or None on any failure. The dispatcher in delegate_task()
+-    falls back to _detect_role_from_task on None.
+-    """
+-    profiles = cfg.get("role_profiles", {})
+-    if not profiles:
+-        logger.warning("Arch-Router classification skipped: role_profiles empty in config")
+-        return None
+-
+-    role_names = ", ".join(profiles.keys())
+-    role_desc_lines = "\n".join(
+-        f"- {name}: {info.get('description', name)}"
+-        for name, info in profiles.items()
+-        if isinstance(info, dict)
+-    )
+-
+-    task_text = (goal + " " + (context or "")).strip()[:2000]
+-    if not task_text:
+-        return None
+-
+-    # Allow per-deployment overrides without code edits (alt-port Ollama,
+-    # different quantization, longer cold-start budget).
+-    rd_cfg = cfg.get("role_detection", {})
+-    base_url = rd_cfg.get("arch_router_base_url", _ARCH_ROUTER_BASE_URL)
+-    model = rd_cfg.get("arch_router_model", _ARCH_ROUTER_MODEL)
+-    timeout = rd_cfg.get("arch_router_timeout", _ARCH_ROUTER_TIMEOUT)
+-
+-    payload = json.dumps({
+-        "model": model,
+-        "messages": [
+-            {
+-                "role": "system",
+-                "content": _ARCH_ROLE_SYSTEM.format(role_names=role_names),
+-            },
+-            {
+-                "role": "user",
+-                "content": _ARCH_ROLE_USER_TEMPLATE.format(
+-                    role_descriptions=role_desc_lines,
+-                    task=task_text,
+-                ),
+-            },
+-        ],
+-        "temperature": 0,
+-        "max_tokens": 5,
+-    }).encode()
+-
+-    t0 = time.monotonic()
+-    try:
+-        req = urllib.request.Request(
+-            f"{base_url}/chat/completions",
+-            data=payload,
+-            headers={"Content-Type": "application/json"},
+-        )
+-        resp = urllib.request.urlopen(req, timeout=timeout)
+-        data = json.loads(resp.read().decode())
+-        elapsed = time.monotonic() - t0
+-        # Strip trailing punctuation Arch-Router occasionally appends ("debugger.")
+-        # so neither alias lookup nor first-word fallback silently rejects them.
+-        raw = (
+-            data.get("choices", [{}])[0]
+-            .get("message", {})
+-            .get("content", "")
+-        ).strip().strip(".,;:!").lower()
+-        if not raw:
+-            return None
+-        # Full-text alias check first so "code review" → reviewer wins over
+-        # the "code" → builder short-circuit.
+-        role = _ROLE_ALIASES.get(raw, raw)
+-        if role in profiles:
+-            logger.info("Arch-Router classified role → %s in %.2fs", role, elapsed)
+-            return role
+-        # First-word fallback for outputs like "debug a flaky test".
+-        first = raw.split()[0]
+-        role = _ROLE_ALIASES.get(first, first)
+-        if role in profiles:
+-            logger.info("Arch-Router classified role (first-word) → %s in %.2fs", role, elapsed)
+-            return role
+-        logger.warning(
+-            "Arch-Router returned unrecognized role: %r in %.2fs — falling back to keyword",
+-            raw, elapsed,
+-        )
+-        return None
+-    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError) as exc:
+-        elapsed = time.monotonic() - t0
+-        logger.warning(
+-            "Arch-Router classification failed (%s: %s) after %.2fs — falling back to keyword",
+-            type(exc).__name__, exc, elapsed,
+-        )
+-        return None
++            "Coordinate your workers' results and synthesize them before "
++            "reporting back to your parent. You are responsible for the "
++            "final summary, not your workers.\n\n"
++            f"NOTE: You are at depth {child_depth}. The delegation tree "
++            f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
++        )
++    return "\n".join(parts)
+ 
+ 
+-# P87/MOL-387 — keyword-based role auto-detection.
+-# Priority-ordered: each tuple is (role_name, [trigger_keywords]).
+-# First match wins. Case-insensitive substring matching.
+-# "bug report" intentionally excluded from debugger — it's ambiguous
+-# (could be triage, review, analysis, or debugging).
+-_ROLE_KEYWORDS: list = [
+-    ("debugger", ["stack trace", "root cause", "what's causing", "keeps crashing", "traceback", "debug", "diagnose", "troubleshoot"]),
+-    ("analyst", ["analyze the", "research", "investigate", "what patterns", "data analysis", "metrics", "explore the codebase", "understand how", "audit the system"]),
+-    ("ticketer", ["triage", "break down", "decompose", "scope this"]),
+-    ("architect", ["interface design", "api design", "adr", "component boundary", "system architecture"]),
+-    ("designer", ["ui", "ux", "frontend design", "visual", "mockup", "wireframe", "landing page", "user interface", "style the", "layout", "redesign the"]),
+-    ("planner", ["how should i", "strategy for", "approach to", "steps to", "plan for"]),
+-    ("reviewer", ["review this", "code review", "security audit", "audit the code"]),
+-    ("builder", ["implement", "build", "create", "refactor", "add a", "fix the"]),
+-]
++def _resolve_workspace_hint(parent_agent) -> Optional[str]:
++    """Best-effort local workspace hint for child prompts.
+ 
+-
+-def _match_any(text: str, keywords: list) -> bool:
+-    """Case-insensitive substring match — returns True if any keyword is in text."""
+-    t = text.lower()
+-    return any(kw in t for kw in keywords)
+-
+-
+-def _detect_role_from_task(goal: str, context: Optional[str] = None) -> Optional[str]:
+-    """P87/MOL-387 — detect best role from task text via keyword matching.
+-
+-    Scans _ROLE_KEYWORDS in priority order, returns the first role whose
+-    keywords match the combined (goal + " " + context) text. Returns None
+-    when no keywords match — caller should fall back to default (builder).
++    We only inject a path when we have a concrete absolute directory. This avoids
++    teaching subagents a fake container path while still helping them avoid
++    guessing `/workspace/...` for local repo tasks.
+     """
+-    combined = (goal or "")
+-    if context and context.strip():
+-        combined += " " + context.strip()
+-    if not combined.strip():
+-        return None
+-    for role_name, keywords in _ROLE_KEYWORDS:
+-        if _match_any(combined, keywords):
+-            return role_name
+-    logger.info("_detect_role_from_task: no keyword match for goal=%r", goal[:120] if goal else "")
++    candidates = [
++        os.getenv("TERMINAL_CWD"),
++        getattr(
++            getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
++        ),
++        getattr(parent_agent, "terminal_cwd", None),
++        getattr(parent_agent, "cwd", None),
++    ]
++    for candidate in candidates:
++        if not candidate:
++            continue
++        try:
++            text = os.path.abspath(os.path.expanduser(str(candidate)))
++        except Exception:
++            continue
++        if os.path.isabs(text) and os.path.isdir(text):
++            return text
+     return None
+ 
+ 
++def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
++    """Remove toolsets that contain only blocked tools."""
++    blocked_toolset_names = {
++        "delegation",
++        "clarify",
++        "memory",
++        "code_execution",
++    }
++    return [t for t in toolsets if t not in blocked_toolset_names]
++
++
+ def _build_child_progress_callback(
+     task_index: int,
+     goal: str,
+@@ -1057,34 +2025,6 @@
+     return _callback
+ 
+ 
+-# P72/MOL-251 — SubagentOverrides dataclass consolidating credential + ACP
+-# + fallback-model overrides into a single typed bundle.  Previously the
+-# seven override_* kwargs were passed individually through _build_child_agent,
+-# _setup_child_progress_callback, and the per-task dispatch path.  Collapsing
+-# them into one dataclass (a) removes the stale-kwarg hazard where adding a
+-# new override silently misses a call site, (b) makes the type shape
+-# self-documenting, and (c) reduces the unwrap-and-passthrough boilerplate
+-# that accumulated across four refactors (delegation provider, ACP transport,
+-# batch-mode per-task ACP args, and fallback_model).
+-@dataclass
+-class SubagentOverrides:
+-    """Credential, transport, and fallback-model overrides for child agents.
+-
+-    Every field is Optional — when None the child inherits from the parent
+-    agent.  Provider/base_url/api_key/api_mode control *which* LLM backend
+-    the child talks to; acp_command/acp_args control *how* (direct API vs.
+-    an ACP subprocess); fallback_model controls the degradation path when
+-    the primary provider fails.
+-    """
+-    provider: Optional[str] = None
+-    base_url: Optional[str] = None
+-    api_key: Optional[str] = None
+-    api_mode: Optional[str] = None
+-    acp_command: Optional[str] = None
+-    acp_args: Optional[List[str]] = None
+-    fallback_model: Optional[dict] = None
+-
+-
+ def _build_child_agent(
+     task_index: int,
+     goal: str,
+@@ -1094,21 +2034,24 @@
+     max_iterations: int,
+     task_count: int,
+     parent_agent,
+-    # P72/MOL-251 — credential/ACP/fallback overrides bundled into one
+-    # typed dataclass instead of seven individual kwargs.
+-    overrides: Optional["SubagentOverrides"] = None,
++    # Credential overrides from delegation config (provider:model resolution)
++    override_provider: Optional[str] = None,
++    override_base_url: Optional[str] = None,
++    override_api_key: Optional[str] = None,
++    override_api_mode: Optional[str] = None,
++    # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
++    override_acp_command: Optional[str] = None,
++    override_acp_args: Optional[List[str]] = None,
+     # Per-call role controlling whether the child can further delegate.
+     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
+     # toolset subject to depth/kill-switch bounds applied below.
+     role: str = "leaf",
+-    # P85/MOL-382 — role-specific suffix injected into child system prompt
+-    role_suffix: Optional[str] = None,
+ ):
+     """
+     Build a child AIAgent on the main thread (thread-safe construction).
+     Returns the constructed child agent without running it.
+ 
+-    When `overrides` fields are set (from delegation config), the child uses
++    When override_* params are set (from delegation config), the child uses
+     those credentials instead of inheriting from the parent.  This enables
+     routing subagents to a different provider:model pair (e.g. cheap/fast
+     model on OpenRouter while the parent runs on Nous Portal).
+@@ -1116,9 +2059,6 @@
+     from run_agent import AIAgent
+     import uuid as _uuid
+ 
+-    if overrides is None:
+-        overrides = SubagentOverrides()
+-
+     # ── Role resolution ─────────────────────────────────────────────────
+     # Honor the caller's role only when BOTH the kill switch and the
+     # child's depth allow it.  This is the single point where role
+@@ -1161,8 +2101,11 @@
+         parent_toolsets = set(DEFAULT_TOOLSETS)
+ 
+     if toolsets:
+-        # Intersect with parent — subagent must not gain tools the parent lacks
+-        child_toolsets = [t for t in toolsets if t in parent_toolsets]
++        # Intersect with parent — subagent must not gain tools the parent lacks.
++        # Expand composite toolsets (e.g. hermes-cli) so that individual
++        # toolset names (e.g. web, terminal) are recognised during intersection.
++        expanded_parent = _expand_parent_toolsets(parent_toolsets)
++        child_toolsets = [t for t in toolsets if t in expanded_parent]
+         if _get_inherit_mcp_toolsets():
+             child_toolsets = _preserve_parent_mcp_toolsets(
+                 child_toolsets, parent_toolsets
+@@ -1190,8 +2133,6 @@
+         role=effective_role,
+         max_spawn_depth=max_spawn,
+         child_depth=child_depth,
+-        # P85/MOL-382 — thread role-specific suffix
+-        role_suffix=role_suffix,
+     )
+     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
+     parent_api_key = getattr(parent_agent, "api_key", None)
+@@ -1236,28 +2177,28 @@
+ 
+     # Resolve effective credentials: config override > parent inherit
+     effective_model = model or parent_agent.model
+-    effective_provider = overrides.provider or getattr(parent_agent, "provider", None)
+-    effective_base_url = overrides.base_url or parent_agent.base_url
+-    effective_api_key = overrides.api_key or parent_api_key
+-    effective_api_mode = overrides.api_mode or getattr(parent_agent, "api_mode", None)
+-    effective_acp_command = overrides.acp_command or getattr(
++    effective_provider = override_provider or getattr(parent_agent, "provider", None)
++    effective_base_url = override_base_url or parent_agent.base_url
++    effective_api_key = override_api_key or parent_api_key
++    effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
++    effective_acp_command = override_acp_command or getattr(
+         parent_agent, "acp_command", None
+     )
+     effective_acp_args = list(
+-        overrides.acp_args
+-        if overrides.acp_args is not None
++        override_acp_args
++        if override_acp_args is not None
+         else (getattr(parent_agent, "acp_args", []) or [])
+     )
+ 
+-    # When overrides.provider is set (e.g. delegation.provider: minimax-cn),
++    # When override_provider is set (e.g. delegation.provider: minimax-cn),
+     # the subagent must use direct API calls — not the parent's ACP transport.
+     # Inheriting acp_command unconditionally causes run_agent.py to initialize
+     # CopilotACPClient, bypassing override credentials entirely (issue #16816).
+-    if overrides.provider and not overrides.acp_command:
++    if override_provider and not override_acp_command:
+         effective_acp_command = None
+         effective_acp_args = []
+ 
+-    if overrides.acp_command:
++    if override_acp_command:
+         # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
+         # so run_agent.py initializes the CopilotACPClient.
+         effective_provider = "copilot-acp"
+@@ -1299,7 +2240,7 @@
+     child_providers_ignored = getattr(parent_agent, "providers_ignored", None)
+     child_providers_order = getattr(parent_agent, "providers_order", None)
+     child_provider_sort = getattr(parent_agent, "provider_sort", None)
+-    if overrides.provider:
++    if override_provider:
+         child_providers_allowed = None
+         child_providers_ignored = None
+         child_providers_order = None
+@@ -1317,7 +2258,7 @@
+         max_tokens=getattr(parent_agent, "max_tokens", None),
+         reasoning_config=child_reasoning,
+         prefill_messages=getattr(parent_agent, "prefill_messages", None),
+-        fallback_model=overrides.fallback_model if overrides.fallback_model is not None else parent_fallback,
++        fallback_model=parent_fallback,
+         enabled_toolsets=child_toolsets,
+         quiet_mode=True,
+         ephemeral_system_prompt=child_prompt,
+@@ -1793,6 +2734,16 @@
+             else:
+                 _err = str(_timeout_exc)
+ 
++            # P141/MOL-491 (#163 review CRITICAL-1): emit iteration audit
++            # on the timeout/error path. This is the highest-signal exit
++            # for the "is max_iterations enough?" question — a child that
++            # hung at iteration 47 of 100 is exactly what the operator
++            # needs to see.
++            _emit_iteration_audit(
++                exit_reason="timeout" if is_timeout else "error",
++                api_calls_val=child_api_calls,
++                child_obj=child,
++            )
+             return {
+                 "task_index": task_index,
+                 "status": "timeout" if is_timeout else "error",
+@@ -1877,6 +2828,17 @@
+         else:
+             exit_reason = "max_iterations"
+ 
++        # P141/MOL-491: forward iteration instrumentation — happy-path exit.
++        # The other two exit paths (timeout @ ~line 2007, outer exception
++        # @ ~line 2269) emit the same record via _emit_iteration_audit
++        # so the audit log covers ALL dispatches, not just clean completions
++        # (#163 review CRITICAL-1).
++        _emit_iteration_audit(
++            exit_reason=exit_reason,
++            api_calls_val=api_calls,
++            child_obj=child,
++        )
++
+         # Extract token counts (safe for mock objects)
+         _input_tokens = getattr(child, "session_prompt_tokens", 0)
+         _output_tokens = getattr(child, "session_completion_tokens", 0)
+@@ -2030,12 +2992,27 @@
+                 )
+             except Exception as e:
+                 logger.debug("Progress callback failure relay failed: %s", e)
++        # P141/MOL-491 (#163 review CRITICAL-1): emit iteration audit on the
++        # outer-exception path. Records exit_reason="error" with whatever
++        # api_calls counter the child captured (or 0 if pre-execution).
++        _api_calls_at_failure = 0
++        try:
++            _summary = getattr(child, "session_summary", None)
++            if _summary is not None and isinstance(_summary, dict):
++                _api_calls_at_failure = int(_summary.get("api_call_count", 0) or 0)
++        except Exception:  # noqa: BLE001 — best-effort field extraction
++            pass
++        _emit_iteration_audit(
++            exit_reason="error",
++            api_calls_val=_api_calls_at_failure,
++            child_obj=child,
++        )
+         return {
+             "task_index": task_index,
+             "status": "error",
+             "summary": None,
+             "error": str(exc),
+-            "api_calls": 0,
++            "api_calls": _api_calls_at_failure,
+             "duration_seconds": duration,
+             "_child_role": getattr(child, "_delegate_role", None),
+         }
+@@ -2089,519 +3066,29 @@
+             logger.debug("Failed to close child agent after delegation")
+ 
+ 
+-# ── MOL-49 / P27: Claude Code delegation helpers ──────────────────────
+-
+-def _detect_repo_path(goal: str, context: str = "") -> Optional[str]:
+-    """Extract a repo path from goal/context if it references ~/Code/."""
+-    cfg = _load_config()
+-    coding_cfg = cfg.get("coding", {})
+-    if not coding_cfg.get("enabled", False):
+-        return None
+-    allowed_roots = coding_cfg.get("allowed_write_roots", [])
+-    if not allowed_roots:
+-        return None
+-    for match in _CODE_PATH_RE.finditer(f"{goal} {context}"):
+-        raw = match.group(1)
+-        expanded = os.path.realpath(os.path.expanduser(raw))
+-        candidate = expanded
+-        while candidate and candidate != "/":
+-            if os.path.isdir(os.path.join(candidate, ".git")):
+-                for root in allowed_roots:
+-                    root_real = os.path.realpath(os.path.expanduser(root))
+-                    if candidate == root_real or candidate.startswith(root_real + os.sep):
+-                        return candidate
+-                break
+-            candidate = os.path.dirname(candidate)
+-    return None
+-
+-
+-# P52/MOL-233 — delegation truthfulness verifier.
+-# When a subagent claims it modified code, we check git diff to verify.
+-
+-_VERIFY_EDIT_KEYWORDS: frozenset = frozenset({
+-    "modified", "updated", "created", "added", "changed", "edited",
+-    "wrote", "rewrote", "patched", "fixed", "implemented", "refactored",
+-    "Done", "modified", "updated", "created",
+-})
+-
+-_VERIFY_NOOP_SIGNALS: frozenset = frozenset({
+-    "already in place",
+-    "already implemented",
+-    "already present",
+-    "already exists",
+-    "no changes needed",
+-    "no changes required",
+-    "no modifications needed",
+-    "nothing to change",
+-    "no work needed",
+-    "not needed",
+-    "not required",
+-    "no change",
+-})
+-
+-
+-def _verify_delegation_diff(
+-    pre_dirty: set,
+-    post_dirty: set,
+-    goal: str,
+-    context: str,
+-    result_text: str,
+-) -> tuple[bool, str]:
+-    """Verify that a delegation that claimed code changes actually produced a diff.
+-
+-    Returns (verified: bool, reason: str).  ``verified=True`` means either a
+-    diff appeared OR the subagent honestly reported a no-op.  ``verified=False``
+-    means the subagent described edits but no files changed.
+-    """
+-    new_files = post_dirty - pre_dirty
+-    if new_files:
+-        return True, f"diff confirmed: {', '.join(sorted(new_files)[:5])}"
+-    # No new files.  Check whether the subagent honestly reported a no-op.
+-    combined = f"{result_text} {goal} {context}".lower()
+-    for signal in _VERIFY_NOOP_SIGNALS:
+-        if signal in combined:
+-            return True, f"no-op signal: '{signal}'"
+-    # No diff AND no no-op signal.  Did the subagent claim edits?
+-    for kw in _VERIFY_EDIT_KEYWORDS:
+-        if kw.lower() in result_text.lower():
+-            return False, f"claimed '{kw}' but no files changed"
+-    # Ambiguous — result doesn't claim edits explicitly but also doesn't
+-    # signal no-op.  Return verified=True with a note (default trust).
+-    return True, "no diff but no explicit edit claim — ambiguous"
+-
+-
+-def _run_claude_code_delegation(
+-    goal: str = "",
+-    context: str = "",
+-    repo_path: str = "",
+-    max_iterations: int = 100,
+-    parent_agent=None,
+-    skip_hitl: bool = False,
+-) -> dict:
+-    """Run a coding task via Claude Code subprocess.
+-
+-    Returns a dict (not a JSON string):
+-      - Success: {"result": ..., "duration_seconds": N, "num_turns": N, "cost_usd": N, "model": ...}
+-      - Rate limit: {"error": ..., "rate_limited": True}
+-      - Other error: {"error": ..., "rate_limited": False}
+-    """
+-    import subprocess as _subprocess
+-
+-    # 1. Config check
+-    cfg = _load_config()
+-    coding_cfg = cfg.get("coding", {})
+-    # P84/MOL-382 — configurable model/effort per coding tier
+-    cc_model = coding_cfg.get("model", "sonnet")
+-    cc_effort = coding_cfg.get("effort", "high")
+-    if not coding_cfg.get("enabled", False):
+-        return {"error": "Coding delegation is disabled. Set delegation.coding.enabled=true in config.yaml", "rate_limited": False}
+-
+-    # 2. Parent agent required
+-    if parent_agent is None:
+-        return {"error": "Claude Code delegation requires a parent agent context.", "rate_limited": False}
+-
+-    # Depth limit — prevent recursive delegation
+-    depth = getattr(parent_agent, '_delegate_depth', 0)
+-    if depth >= MAX_DEPTH:
+-        return {"error": f"Delegation depth limit reached ({MAX_DEPTH}). Cannot spawn Claude Code from a subagent.", "rate_limited": False}
+-
+-    # 2b. Goal validation
+-    if not goal or not goal.strip():
+-        return {"error": "goal is required and cannot be empty.", "rate_limited": False}
+-
+-    # 3. Validate repo_path
+-    if not repo_path:
+-        return {"error": "repo_path is required.", "rate_limited": False}
+-    if not repo_path.startswith("/"):
+-        return {"error": "repo_path must be an absolute path.", "rate_limited": False}
+-    if not os.path.isdir(repo_path):
+-        return {"error": f"repo_path does not exist or is not a directory: {repo_path}", "rate_limited": False}
+-    if not os.path.isdir(os.path.join(repo_path, ".git")):
+-        return {"error": f"repo_path is not a git repository (no .git): {repo_path}", "rate_limited": False}
+-
+-    allowed_roots = coding_cfg.get("allowed_write_roots", [])
+-    if not isinstance(allowed_roots, list):
+-        return {"error": "delegation.coding.allowed_write_roots must be a list", "rate_limited": False}
+-    if not allowed_roots:
+-        return {"error": "No allowed_write_roots configured. Add paths to delegation.coding.allowed_write_roots in config.yaml", "rate_limited": False}
+-    repo_real = os.path.realpath(repo_path)
+-    allowed = False
+-    for root in allowed_roots:
+-        root_real = os.path.realpath(os.path.expanduser(root))
+-        if repo_real == root_real or repo_real.startswith(root_real + os.sep):
+-            allowed = True
+-            break
+-    if not allowed:
+-        return {"error": f"repo_path {repo_path} is not within allowed_write_roots: {allowed_roots}", "rate_limited": False}
+-
+-    # 4. HITL approval via existing command guards (skipped for auto-routed calls)
+-    if not skip_hitl:
+-        try:
+-            from tools.approval import check_all_command_guards
+-            guard_result = check_all_command_guards(
+-                f"claude_code_delegation: {goal[:100]} -> {repo_path}",
+-                env_type="local",
+-            )
+-            if not guard_result.get("approved", False):
+-                deny_msg = guard_result.get("message") or "denied by command guards"
+-                return {"error": f"Delegation denied: {deny_msg}", "rate_limited": False}
+-        except ImportError:
+-            return {"error": "approval module not available — cannot proceed without HITL gate", "rate_limited": False}
+-
+-    # 5. Build subprocess command
+-    prompt = f"{goal}\n\nContext: {context}" if context else goal
+-    effective_max = max_iterations or coding_cfg.get("max_iterations", 100)
+-
+-    cmd = [
+-        "claude", "-p", prompt,
+-        "--output-format", "json",
+-        "--no-session-persistence",
+-        "--tools", "Bash,Read,Write,Edit,Glob,Grep",
+-        "--permission-mode", "auto",
+-        "--model", cc_model,
+-        "--effort", cc_effort,
+-        "--add-dir", repo_path,
+-        "--max-turns", str(effective_max),
+-        "--system-prompt", (
+-            "You are a coding assistant working on a delegated task. "
+-            "Stay focused on the goal. Do not read or print environment variables. "
+-            "Do not access files outside the specified repository. "
+-            "Do not make network requests or push to git remotes."
+-        ),
+-    ]
+-
+-    # Strip provider secrets from subprocess env (Layer 6 equivalent)
+-    from tools.environments.local import _sanitize_subprocess_env
+-    safe_env = _sanitize_subprocess_env(os.environ.copy())
+-
+-    # P52/MOL-233 — capture pre-delegation dirty files for truthfulness verification.
+-    pre_dirty: set[str] = set()
++def _recover_tasks_from_json_string(
++    tasks: Any,
++) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
++    if not isinstance(tasks, str):
++        return None, None
++    raw = tasks.strip()
++    if not raw:
++        return None, "Provide either 'goal' (single task) or 'tasks' (batch)."
+     try:
+-        _pre = _subprocess.run(
+-            ["git", "diff", "--name-only", "HEAD"],
+-            capture_output=True, text=True, timeout=5, cwd=repo_path,
++        parsed = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        return None, (
++            "tasks must be a JSON array of task objects; received a string "
++            f"that could not be parsed as JSON ({exc.msg})."
+         )
+-        if _pre.returncode == 0:
+-            pre_dirty = {f for f in _pre.stdout.strip().split("\n") if f}
+-    except Exception:
+-        pass
+-
+-    start_time = time.monotonic()
+-    try:
+-        proc = _subprocess.Popen(
+-            cmd,
+-            stdout=_subprocess.PIPE,
+-            stderr=_subprocess.PIPE,
+-            text=True,
+-            cwd=repo_path,
+-            env=safe_env,
++    if not isinstance(parsed, list):
++        return None, (
++            f"tasks must be a JSON array of task objects; parsed "
++            f"{type(parsed).__name__} instead."
+         )
+-    except OSError as exc:
+-        return {"error": f"Failed to start claude subprocess: {exc}", "rate_limited": False}
+-
+-    # 6. Heartbeat while subprocess runs
+-    heartbeat_stop = threading.Event()
+-
+-    def _heartbeat():
+-        while not heartbeat_stop.wait(15.0):
+-            touch = getattr(parent_agent, '_touch_activity', None)
+-            if touch:
+-                elapsed = round(time.monotonic() - start_time)
+-                try:
+-                    touch(f"claude_code_delegation: claude-code PID {proc.pid} active, {elapsed}s elapsed")
+-                except Exception:
+-                    pass
+-
+-    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+-    hb_thread.start()
+-
+-    # 7. Collect result
+-    try:
+-        stdout, stderr = proc.communicate(timeout=600)  # 10 minute timeout
+-    except _subprocess.TimeoutExpired:
+-        proc.kill()
+-        stdout, stderr = proc.communicate()
+-        return {"error": "Claude Code delegation timed out after 600 seconds", "rate_limited": False}
+-    finally:
+-        heartbeat_stop.set()
+-
+-    duration_seconds = round(time.monotonic() - start_time, 1)
+-
+-    if proc.returncode != 0:
+-        # Sanitize stderr to avoid leaking credentials in error messages
+-        safe_stderr = stderr[:500] if stderr else ""
+-        for pattern in ("sk-ant-", "AIza", "ya29.", "ghp_", "github_pat_"):
+-            if pattern in safe_stderr:
+-                safe_stderr = "[stderr redacted — may contain credentials]"
+-                break
+-        error_msg = f"Claude Code exited with code {proc.returncode}: {safe_stderr}"
+-        # Detect rate limiting from returncode + error text
+-        combined = f"{proc.returncode} {safe_stderr}".lower()
+-        rate_limited = any(p in combined for p in _RATE_LIMIT_PATTERNS)
+-        return {"error": error_msg, "rate_limited": rate_limited}
+-
+-    try:
+-        result_data = json.loads(stdout)
+-    except json.JSONDecodeError:
+-        safe_stdout = stdout[:500] if stdout else "[empty output]"
+-        for pattern in ("sk-ant-", "AIza", "ya29.", "ghp_", "github_pat_"):
+-            if pattern in safe_stdout:
+-                safe_stdout = "[stdout redacted — may contain credentials]"
+-                break
+-        return {"error": f"Claude Code output was not valid JSON: {safe_stdout}", "rate_limited": False}
+-
+-    # 8. Extract result
+-    result = result_data.get("result", "") or ""
+-    error_text = result_data.get("error")
+-    if isinstance(error_text, str) and error_text.strip():
+-        combined = str(error_text).lower()
+-        rate_limited = any(p in combined for p in _RATE_LIMIT_PATTERNS)
+-        return {"error": error_text, "rate_limited": rate_limited}
+-
+-    # P52/MOL-233 — capture post-delegation dirty files and verify truthfulness.
+-    post_dirty: set = set()
+-    verified = True
+-    verification_reason = "skipped"
+-    try:
+-        _post = _subprocess.run(
+-            ["git", "diff", "--name-only", "HEAD"],
+-            capture_output=True, text=True, timeout=5, cwd=repo_path,
+-        )
+-        if _post.returncode == 0:
+-            post_dirty = {f for f in _post.stdout.strip().split("\n") if f}
+-        verified, verification_reason = _verify_delegation_diff(
+-            pre_dirty, post_dirty, goal, context, result,
+-        )
+-        if not verified:
+-            logger.warning(
+-                "delegate_truthfulness verified=false repo=%s reason=%s goal=%.120s",
+-                repo_path, verification_reason, goal,
+-            )
+-    except Exception:
+-        verification_reason = "verification error"
+-        verified = True  # don't block on infra failures
+-
+-    return {
+-        "result": result,
+-        "duration_seconds": duration_seconds,
+-        "num_turns": result_data.get("num_turns", 0),
+-        "cost_usd": result_data.get("total_cost_usd", 0),
+-        "model": result_data.get("model", ""),
+-        "verified": verified,
+-        "verification_reason": verification_reason,
+-    }
+-
++    return parsed, None
+ 
+-# P84/MOL-382 — Tier 2: Claude Code via free-claude-code DeepSeek V4 proxy.
+-def _run_claude_code_deepseek_delegation(
+-    goal: str = "",
+-    context: str = "",
+-    repo_path: str = "",
+-    max_iterations: int = 100,
+-    parent_agent=None,
+-    skip_hitl: bool = False,
+-) -> dict:
+-    """Run a coding task via Claude Code through the free-claude-code DeepSeek V4 proxy.
+ 
+-    Same contract as _run_claude_code_delegation: returns dict with result/error/rate_limited.
+-    Health-checks the proxy on port 8082, optionally starts it via cc-deepseek.sh.
+-    """
+-    import subprocess as _subprocess
+-
+-    cfg = _load_config()
+-    coding_cfg = cfg.get("coding", {})
+-    fd_cfg = coding_cfg.get("fallback_deepseek", {})
+-    if not fd_cfg.get("enabled", True):
+-        return {"error": "DeepSeek fallback is disabled (delegation.coding.fallback_deepseek.enabled=false)", "rate_limited": False}
+-
+-    proxy_url = fd_cfg.get("proxy_url", "http://127.0.0.1:8082")
+-    proxy_start_script = os.path.expanduser(fd_cfg.get("proxy_start_script", "~/.claude/scripts/cc-deepseek.sh"))
+-
+-    if parent_agent is None:
+-        return {"error": "DeepSeek delegation requires a parent agent context.", "rate_limited": False}
+-
+-    depth = getattr(parent_agent, "_delegate_depth", 0)
+-    if depth >= MAX_DEPTH:
+-        return {"error": f"Delegation depth limit reached ({MAX_DEPTH}).", "rate_limited": False}
+-
+-    if not goal or not goal.strip():
+-        return {"error": "goal is required and cannot be empty.", "rate_limited": False}
+-
+-    if not repo_path or not repo_path.startswith("/") or not os.path.isdir(repo_path):
+-        return {"error": f"repo_path must be an absolute path to an existing directory: {repo_path}", "rate_limited": False}
+-    if not os.path.isdir(os.path.join(repo_path, ".git")):
+-        return {"error": f"repo_path is not a git repository: {repo_path}", "rate_limited": False}
+-
+-    allowed_roots = coding_cfg.get("allowed_write_roots", [])
+-    if not isinstance(allowed_roots, list) or not allowed_roots:
+-        return {"error": "No allowed_write_roots configured for DeepSeek delegation.", "rate_limited": False}
+-    repo_real = os.path.realpath(repo_path)
+-    if not any(repo_real == os.path.realpath(os.path.expanduser(r)) or repo_real.startswith(os.path.realpath(os.path.expanduser(r)) + os.sep) for r in allowed_roots):
+-        return {"error": f"repo_path {repo_path} not within allowed_write_roots: {allowed_roots}", "rate_limited": False}
+-
+-    # Health-check the DeepSeek proxy
+-    import socket as _socket
+-    proxy_alive = False
+-    try:
+-        s = _socket.create_connection(("127.0.0.1", 8082), timeout=2)
+-        s.close()
+-        proxy_alive = True
+-    except (OSError, _socket.timeout):
+-        if os.path.isfile(proxy_start_script):
+-            try:
+-                _subprocess.run(["bash", proxy_start_script, "start"], capture_output=True, text=True, timeout=30)
+-                s = _socket.create_connection(("127.0.0.1", 8082), timeout=2)
+-                s.close()
+-                proxy_alive = True
+-            except Exception:
+-                pass
+-
+-    if not proxy_alive:
+-        return {"error": f"DeepSeek proxy not reachable at {proxy_url}", "rate_limited": False}
+-
+-    # Resolve auth token for the proxy
+-    deepseek_key = ""
+-    try:
+-        env_result = _subprocess.run(
+-            ["envchain", "free-claude-code-deepseek", "printenv", "DEEPSEEK_API_KEY"],
+-            capture_output=True, text=True, timeout=10,
+-        )
+-        if env_result.returncode == 0 and env_result.stdout.strip():
+-            deepseek_key = env_result.stdout.strip()
+-    except Exception:
+-        pass
+-    if not deepseek_key:
+-        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+-    if not deepseek_key:
+-        return {"error": "DEEPSEEK_API_KEY not available for DeepSeek proxy (check envchain free-claude-code-deepseek)", "rate_limited": False}
+-
+-    prompt = f"{goal}\n\nContext: {context}" if context else goal
+-    cc_model = coding_cfg.get("model", "sonnet")
+-    cc_effort = coding_cfg.get("effort", "high")
+-    effective_max = max_iterations or coding_cfg.get("max_iterations", 100)
+-
+-    cmd = [
+-        "claude", "-p", prompt,
+-        "--output-format", "json",
+-        "--no-session-persistence",
+-        "--tools", "Bash,Read,Write,Edit,Glob,Grep",
+-        "--permission-mode", "auto",
+-        "--model", cc_model,
+-        "--effort", cc_effort,
+-        "--add-dir", repo_path,
+-        "--max-turns", str(effective_max),
+-        "--system-prompt", (
+-            "You are a coding assistant working on a delegated task. "
+-            "Stay focused on the goal. Do not read or print environment variables. "
+-            "Do not access files outside the specified repository. "
+-            "Do not make network requests or push to git remotes."
+-        ),
+-    ]
+-
+-    from tools.environments.local import _sanitize_subprocess_env
+-    safe_env = _sanitize_subprocess_env(os.environ.copy())
+-    safe_env["ANTHROPIC_BASE_URL"] = proxy_url
+-    safe_env["ANTHROPIC_AUTH_TOKEN"] = deepseek_key
+-
+-    pre_dirty: set[str] = set()
+-    try:
+-        _pre = _subprocess.run(
+-            ["git", "diff", "--name-only", "HEAD"],
+-            capture_output=True, text=True, timeout=5, cwd=repo_path,
+-        )
+-        if _pre.returncode == 0:
+-            pre_dirty = {f for f in _pre.stdout.strip().split("\n") if f}
+-    except Exception:
+-        pass
+-
+-    start_time = time.monotonic()
+-    try:
+-        proc = _subprocess.Popen(
+-            cmd, stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
+-            text=True, cwd=repo_path, env=safe_env,
+-        )
+-    except OSError as exc:
+-        return {"error": f"Failed to start claude subprocess (DeepSeek proxy): {exc}", "rate_limited": False}
+-
+-    heartbeat_stop = threading.Event()
+-    def _heartbeat():
+-        while not heartbeat_stop.wait(15.0):
+-            touch = getattr(parent_agent, "_touch_activity", None)
+-            if touch:
+-                try:
+-                    touch(f"deepseek_delegation: PID {proc.pid} active, {round(time.monotonic() - start_time)}s elapsed")
+-                except Exception:
+-                    pass
+-    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+-    hb_thread.start()
+-
+-    try:
+-        stdout, stderr = proc.communicate(timeout=600)
+-    except _subprocess.TimeoutExpired:
+-        proc.kill()
+-        stdout, stderr = proc.communicate()
+-        heartbeat_stop.set()
+-        return {"error": "DeepSeek delegation timed out after 600 seconds", "rate_limited": False}
+-    finally:
+-        heartbeat_stop.set()
+-
+-    duration_seconds = round(time.monotonic() - start_time, 1)
+-
+-    if proc.returncode != 0:
+-        safe_stderr = stderr[:500] if stderr else ""
+-        for pattern in ("sk-ant-", "AIza", "ya29.", "ghp_", "github_pat_"):
+-            if pattern in safe_stderr:
+-                safe_stderr = "[stderr redacted]"
+-                break
+-        error_msg = f"DeepSeek delegation exited with code {proc.returncode}: {safe_stderr}"
+-        rate_limited = any(p in f"{proc.returncode} {safe_stderr}".lower() for p in _RATE_LIMIT_PATTERNS)
+-        return {"error": error_msg, "rate_limited": rate_limited}
+-
+-    try:
+-        result_data = json.loads(stdout)
+-    except json.JSONDecodeError:
+-        safe_stdout = stdout[:500] if stdout else "[empty output]"
+-        for pattern in ("sk-ant-", "AIza", "ya29.", "ghp_", "github_pat_"):
+-            if pattern in safe_stdout:
+-                safe_stdout = "[stdout redacted]"
+-                break
+-        return {"error": f"DeepSeek delegation output was not valid JSON: {safe_stdout}", "rate_limited": False}
+-
+-    result = result_data.get("result", "") or ""
+-    error_text = result_data.get("error")
+-    if isinstance(error_text, str) and error_text.strip():
+-        rate_limited = any(p in str(error_text).lower() for p in _RATE_LIMIT_PATTERNS)
+-        return {"error": error_text, "rate_limited": rate_limited}
+-
+-    post_dirty: set = set()
+-    verified = True
+-    verification_reason = "skipped"
+-    try:
+-        _post = _subprocess.run(
+-            ["git", "diff", "--name-only", "HEAD"],
+-            capture_output=True, text=True, timeout=5, cwd=repo_path,
+-        )
+-        if _post.returncode == 0:
+-            post_dirty = {f for f in _post.stdout.strip().split("\n") if f}
+-        verified, verification_reason = _verify_delegation_diff(pre_dirty, post_dirty, goal, context, result)
+-        if not verified:
+-            logger.warning("delegate_truthfulness verified=false repo=%s reason=%s", repo_path, verification_reason)
+-    except Exception:
+-        verification_reason = "verification error"
+-        verified = True
+-
+-    return {
+-        "result": result,
+-        "duration_seconds": duration_seconds,
+-        "num_turns": result_data.get("num_turns", 0),
+-        "cost_usd": result_data.get("total_cost_usd", 0),
+-        "model": result_data.get("model", ""),
+-        "verified": verified,
+-        "verification_reason": verification_reason,
+-        "delegation": "claude-code-deepseek",  # P84/MOL-382 — tier 2 delegation tag
+-    }
+-
+-
+ def delegate_task(
+     goal: Optional[str] = None,
+     context: Optional[str] = None,
+@@ -2611,6 +3098,7 @@
+     acp_command: Optional[str] = None,
+     acp_args: Optional[List[str]] = None,
+     role: Optional[str] = None,
++    profile: str = "default",  # P103/MOL-410 — coding-profile elevation
+     parent_agent=None,
+ ) -> str:
+     """
+@@ -2625,13 +3113,99 @@
+     toolset and can spawn its own workers, bounded by
+     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+ 
+-    For ~/Code/ repos the call dispatches through a three-tier chain:
+-    Claude Code (Sonnet, --effort high) primary → Kimi K2.6 on CC
+-    rate-limit/failure → Gemini 3.1 Pro on Kimi failure.  Non-~/Code/
+-    repos start at tier 2 (Kimi K2.6 subagent).
++    The 'profile' parameter (P103/MOL-410) selects a delegate profile YAML
++    from ~/.hermes/config/delegate-profiles/<profile>.yaml. The default
++    profile is fail-closed (no elevation). The 'coding' profile elevates
++    for end-to-end Jira coding tickets (push to feature/*, open PR,
++    Jira comment, transition). Profile resolution + audit emit fires
++    BEFORE the parent_agent check so smoke-mode invocations without a
++    parent still produce an audit record (closes MOL-474).
+ 
+     Returns JSON with results array, one entry per task.
+     """
++    # P103/MOL-410: profile resolution runs first — audit log records the
++    # invocation attempt regardless of downstream success/failure. This is
++    # what closes MOL-474 (delegate-coding.log audit gap).
++    #
++    # P103/MOL-410 (#162 review HIGH-3): when an explicit profile fails to
++    # load, return tool_error rather than silently downgrading to default.
++    # Silent downgrade would mask config bugs as no-op privilege changes.
++    profile_cfg: Optional[Dict[str, Any]] = None
++    if profile and profile != "default":
++        profile_cfg = _load_profile(profile)
++        if profile_cfg is None:
++            return tool_error(
++                f"P103/MOL-410: profile {profile!r} requested but YAML missing/malformed/rejected "
++                f"at {_P103_PROFILE_DIR}. Refusing to silently downgrade to default. "
++                f"Fix the YAML or invoke with profile='default'."
++            )
++        # Synthesize the smoke-friendly prompt + repo_path. Real Tier 1
++        # callers will pass these through richer plumbing; the smoke
++        # path needs SOMETHING here so the audit record is non-empty.
++        synth_prompt = goal or ""
++        if context:
++            synth_prompt = f"{synth_prompt}\n\n{context}" if synth_prompt else context
++        # P103/MOL-410 (#162 review HIGH-6): repo_path heuristic uses the
++        # pre-compiled _P103_REPO_PATH_RE (tighter character class — no
++        # trailing-punctuation capture), validates `os.path.isdir` post-match,
++        # and falls back to CWD only when nothing better is found.
++        synth_repo: Optional[str] = None
++        for blob in (goal or "", context or ""):
++            if "/Code/" not in blob:
++                continue
++            m = _P103_REPO_PATH_RE.search(blob)
++            if m:
++                candidate = os.path.expanduser(m.group(0))
++                if os.path.isdir(candidate):
++                    synth_repo = candidate
++                    break
++        if synth_repo is None:
++            synth_repo = os.getcwd()
++        # P103/MOL-410 (#162 review M10): pass base_settings if available
++        # so additive-only enforcement compares against the actual base
++        # settings, not the profile-self. Best-effort — log a warning if
++        # base settings aren't loadable so the operator knows enforcement
++        # is half-armed.
++        base_settings: Optional[Dict[str, Any]] = None
++        try:
++            base_settings_path = Path("~/.claude/settings.json").expanduser()
++            if base_settings_path.exists():
++                base_settings = json.loads(base_settings_path.read_text())
++        except (OSError, json.JSONDecodeError) as exc:
++            logger.warning(
++                "P103/MOL-410: could not load base settings.json for additive-only "
++                "validation (%s); validator will run profile-self only", exc,
++            )
++        try:
++            _validate_profile_additive_only(profile_cfg, base_settings)
++        except ValueError as exc:
++            # P103/MOL-410 (#162 review HIGH-4): emit audit BEFORE returning
++            # tool_error. Profile-rejection is the highest-value forensic
++            # event — operator needs the trace.
++            logger.error("P103/MOL-410: profile %r rejected: %s", profile, exc)
++            _emit_profile_audit(
++                profile_cfg,
++                argv=[],
++                matched_rule=f"profile={profile} REJECTED additive_violation: {exc}",
++                caller="delegate_task",
++                prompt=synth_prompt,
++                exit_code=-1,  # sentinel: rejected at validator
++            )
++            return tool_error(str(exc))
++        consented, consent_reason = _check_profile_session_consent(profile, synth_repo)
++        argv = _build_claude_argv(profile_cfg, synth_repo, synth_prompt)
++        _emit_profile_audit(
++            profile_cfg,
++            argv,
++            matched_rule=f"profile={profile} consent={consent_reason}",
++            caller="delegate_task",
++            prompt=synth_prompt,
++        )
++        if not consented:
++            return tool_error(
++                f"P103/MOL-410: HITL consent denied for ({profile}, {synth_repo}): {consent_reason}"
++            )
++
+     if parent_agent is None:
+         return tool_error("delegate_task requires a parent agent context.")
+ 
+@@ -2679,48 +3253,6 @@
+         )
+     effective_max_iter = default_max_iter
+ 
+-    # P85/MOL-382 — resolve top-level role profile for defaults (before normalization,
+-    # since profile names like "ticketer" are NOT leaf/orchestrator)
+-    _top_role_profile = _resolve_role_profile(role, cfg)
+-    _top_role_suffix = None
+-    if _top_role_profile:
+-        if max_iterations is None:
+-            effective_max_iter = _top_role_profile.get("max_iterations", effective_max_iter)
+-        _top_role_suffix = _top_role_profile.get("system_prompt_suffix")
+-
+-    # P87/MOL-387 + P91/MOL-387-Phase2 — auto-detect role when no explicit role
+-    # and the config gate is enabled. Classifier dispatch:
+-    #   - "arch-router" → semantic Ollama call, keyword fallback on miss
+-    #   - "keyword" (default) → keyword matching only
+-    #   - unknown → keyword matching, log a warning
+-    _detected_role = None
+-    if role is None and cfg.get("role_detection", {}).get("enabled"):
+-        classifier = cfg.get("role_detection", {}).get("classifier", "keyword")
+-        if classifier == "arch-router":
+-            _detected_role = _detect_role_with_arch_router(goal or "", context or "", cfg)
+-            if not _detected_role:
+-                _detected_role = _detect_role_from_task(goal or "", context or "")
+-                if _detected_role:
+-                    logger.info("Arch-Router failed — keyword fallback detected role=%s", _detected_role)
+-        elif classifier == "keyword":
+-            _detected_role = _detect_role_from_task(goal or "", context or "")
+-        else:
+-            logger.warning("Unknown role classifier=%r — falling back to keyword matching", classifier)
+-            _detected_role = _detect_role_from_task(goal or "", context or "")
+-
+-        if _detected_role:
+-            logger.info("delegate_task: auto-detected role=%r (classifier=%s)", _detected_role, classifier)
+-            role = _detected_role
+-            # Re-resolve profile with the detected role
+-            _top_role_profile = _resolve_role_profile(role, cfg)
+-            _top_role_suffix = None
+-            if _top_role_profile:
+-                if max_iterations is None:
+-                    effective_max_iter = _top_role_profile.get("max_iterations", effective_max_iter)
+-                _top_role_suffix = _top_role_profile.get("system_prompt_suffix")
+-        else:
+-            logger.info("delegate_task: Role detection ran but found no match for goal=%r", goal[:120] if goal else "")
+-
+     # Resolve delegation credentials (provider:model pair).
+     # When delegation.provider is configured, this resolves the full credential
+     # bundle (base_url, api_key, api_mode) via the same runtime provider system
+@@ -2733,6 +3265,12 @@
+ 
+     # Normalize to task list
+     max_children = _get_max_concurrent_children()
++    recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
++    if tasks_error:
++        return tool_error(tasks_error)
++    if recovered_tasks is not None:
++        tasks = recovered_tasks
++
+     if tasks and isinstance(tasks, list):
+         if len(tasks) > max_children:
+             return tool_error(
+@@ -2744,11 +3282,8 @@
+             )
+         task_list = tasks
+     elif goal and isinstance(goal, str) and goal.strip():
+-        # P87/MOL-387 — store raw role parameter (e.g. "ticketer") not
+-        # normalized top_role (e.g. "leaf") so per-task profile resolution
+-        # can find the matching profile.
+         task_list = [
+-            {"goal": goal, "context": context, "toolsets": toolsets, "role": role}
++            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+         ]
+     else:
+         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
+@@ -2758,21 +3293,29 @@
+ 
+     # Validate each task has a goal
+     for i, task in enumerate(task_list):
++        if not isinstance(task, dict):
++            return tool_error(
++                f"Task {i} must be an object, got {type(task).__name__}."
++            )
+         if not task.get("goal", "").strip():
+             return tool_error(f"Task {i} is missing a 'goal'.")
+ 
+     overall_start = time.monotonic()
+ 
+-    # ── Claude Code-first routing (MOL-49 / P27) ──────────────────────
+-    # For coding tasks (goal/context references ~/Code/ repo), try Claude
+-    # Code first. Fall back to Hermes subagent on rate limit or failure.
+-    claude_code_results = {}  # task_index -> result dict
++    # ── P144/MOL-493: Claude Code-first routing (Tier 1 → Tier 2 → in-process) ──
++    # For tasks whose goal/context references a ~/Code/ repo, try native CC first,
++    # then DeepSeek-direct CC, before falling through to in-process subagents.
++    claude_code_results: Dict[int, dict] = {}
+     remaining_indices = set(range(len(task_list)))
++    # P144 review (#165): cache repo paths during Tier 1 to avoid re-extraction in Tier 2.
++    _task_repo_cache: Dict[int, str] = {}
+ 
+     for i, t in enumerate(task_list):
+         repo_path = _detect_repo_path(t["goal"], t.get("context", ""))
+         if not repo_path:
++            logger.debug("[delegate_task] Task %d: no repo path detected in goal/context, skipping CC routing", i)
+             continue
++        _task_repo_cache[i] = repo_path
+         logger.info("[delegate_task] Routing task %d to Claude Code (repo: %s)", i, repo_path)
+         try:
+             cc_result = _run_claude_code_delegation(
+@@ -2782,20 +3325,16 @@
+                 max_iterations=t.get("max_iterations") or effective_max_iter,
+                 parent_agent=parent_agent,
+                 skip_hitl=True,
++                profile_cfg=profile_cfg,
+             )
+             if "error" not in cc_result:
+-                # P52/MOL-233 — propagate verification fields from
+-                # _run_claude_code_delegation's P52 block.
+                 _verified = cc_result.get("verified", True)
+                 _v_reason = cc_result.get("verification_reason", "")
+                 _status = "completed" if _verified else "completed_unverified"
+                 _error = None
+                 if not _verified:
+                     _error = f"⚠️ VERIFICATION FAILED: {_v_reason}"
+-                    logger.warning(
+-                        "delegate_truthfulness task %d verified=false reason=%s",
+-                        i, _v_reason,
+-                    )
++                    logger.warning("delegate_truthfulness task %d verified=false reason=%s", i, _v_reason)
+                 claude_code_results[i] = {
+                     "task_index": i,
+                     "status": _status,
+@@ -2814,25 +3353,26 @@
+         except Exception as e:
+             logger.warning("[delegate_task] Claude Code routing error: %s — falling back", e)
+ 
+-    # P84/MOL-382 — Tier 2: DeepSeek V4 proxy fallback for tasks that failed tier 1.
++    # ── Tier 2: DeepSeek direct CC fallback ─────────────────────────────
+     if remaining_indices:
+         coding_cfg = cfg.get("coding", {})
+-        fd_cfg = coding_cfg.get("fallback_deepseek", {})
++        fd_cfg = coding_cfg.get("fallback_deepseek_cc", {})
+         if fd_cfg.get("enabled", True):
+             for i in sorted(remaining_indices):
+                 t = task_list[i]
+-                repo_path = _detect_repo_path(t["goal"], t.get("context", ""))
++                repo_path = _task_repo_cache.get(i) or _detect_repo_path(t["goal"], t.get("context", ""))
+                 if not repo_path:
+                     continue
+-                logger.info("[delegate_task] Tier 2 DeepSeek proxy for task %d (repo: %s)", i, repo_path)
++                logger.info("[delegate_task] Tier 2 DeepSeek direct for task %d (repo: %s)", i, repo_path)
+                 try:
+-                    ds_result = _run_claude_code_deepseek_delegation(
++                    ds_result = _run_claude_code_deepseek_direct_delegation(
+                         goal=t["goal"],
+                         context=t.get("context", ""),
+                         repo_path=repo_path,
+                         max_iterations=t.get("max_iterations") or effective_max_iter,
+                         parent_agent=parent_agent,
+                         skip_hitl=True,
++                        profile_cfg=profile_cfg,
+                     )
+                     if "error" not in ds_result:
+                         _verified = ds_result.get("verified", True)
+@@ -2848,31 +3388,34 @@
+                             "error": _error,
+                             "api_calls": ds_result.get("num_turns", 0),
+                             "duration_seconds": ds_result.get("duration_seconds", 0),
+-                            "delegation": "claude-code-deepseek",
++                            "delegation": "claude-code-deepseek-direct",
+                         }
+                         remaining_indices.discard(i)
+                         continue
+                     if ds_result.get("rate_limited"):
+-                        logger.warning("[delegate_task] DeepSeek proxy rate-limited for task %d", i)
++                        logger.warning("[delegate_task] DeepSeek direct rate-limited for task %d", i)
+                     else:
+-                        logger.warning("[delegate_task] DeepSeek proxy failed: %s", str(ds_result.get("error", ""))[:200])
++                        logger.warning("[delegate_task] DeepSeek direct failed: %s", str(ds_result.get("error", ""))[:200])
+                 except Exception as e:
+-                    logger.warning("[delegate_task] DeepSeek proxy routing error: %s", e)
++                    logger.warning("[delegate_task] DeepSeek direct routing error: %s", e)
+ 
+-    remaining_task_list = [(i, task_list[i]) for i in sorted(remaining_indices)]
+-
+-    # If all tasks were handled by Claude Code or DeepSeek, skip subagent path
+-    if not remaining_task_list:
++    # If all tasks were handled by CC, skip the in-process subagent path entirely.
++    if not remaining_indices:
+         results = list(claude_code_results.values())
+         results.sort(key=lambda r: r["task_index"])
+         total_duration = round(time.monotonic() - overall_start, 2)
+         return json.dumps({"results": results, "total_duration_seconds": total_duration}, ensure_ascii=False)
+ 
++    remaining_task_list = [(i, task_list[i]) for i in sorted(remaining_indices)]
++
+     results = []
++    # Pre-populate results with CC-handled tasks so they appear in the final JSON.
++    for cc_r in sorted(claude_code_results.values(), key=lambda r: r["task_index"]):
++        results.append(cc_r)
+ 
+     n_tasks = len(remaining_task_list)
+     # Track goal labels for progress display (truncated for readability)
+-    task_labels = [t["goal"][:40] for t in task_list]
++    task_labels = [t["goal"][:40] for _, t in remaining_task_list]
+ 
+     # Save parent tool names BEFORE any child construction mutates the global.
+     # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
+@@ -2890,49 +3433,39 @@
+             task_acp_args = t.get("acp_args") if "acp_args" in t else None
+             # Per-task role beats top-level; normalise again so unknown
+             # per-task values warn and degrade to leaf uniformly.
+-            _raw_per_task = t.get("role") or role
+-            effective_role = _normalize_role(_raw_per_task)
+-            # P85/MOL-382 — per-task role profile defaults (resolved from raw
+-            # role name before normalization, since names like "ticketer" are
+-            # not leaf/orchestrator)
+-            _task_profile = _resolve_role_profile(_raw_per_task, cfg)
+-            _task_max_iter = effective_max_iter
+-            _task_role_suffix = _top_role_suffix
+-            if _task_profile:
+-                _task_max_iter = _task_profile.get("max_iterations", effective_max_iter)
+-                _task_role_suffix = _task_profile.get("system_prompt_suffix") or _top_role_suffix
++            effective_role = _normalize_role(t.get("role") or top_role)
+             child = _build_child_agent(
+                 task_index=i,
+                 goal=t["goal"],
+                 context=t.get("context"),
+                 toolsets=t.get("toolsets") or toolsets,
+                 model=creds["model"],
+-                max_iterations=_task_max_iter,
++                max_iterations=effective_max_iter,
+                 task_count=n_tasks,
+                 parent_agent=parent_agent,
+-                # P72/MOL-251 — bundle credential/ACP/fallback overrides into
+-                # a single typed dataclass instead of seven individual kwargs.
+-                overrides=SubagentOverrides(
+-                    provider=creds.get("provider"),
+-                    base_url=creds.get("base_url"),
+-                    api_key=creds.get("api_key"),
+-                    api_mode=creds.get("api_mode"),
+-                    acp_command=t.get("acp_command")
+-                    or acp_command
+-                    or creds.get("command"),
+-                    acp_args=(
+-                        task_acp_args
+-                        if task_acp_args is not None
+-                        else (acp_args if acp_args is not None else creds.get("args"))
+-                    ),
+-                    fallback_model=creds.get("fallback_model"),
++                override_provider=creds["provider"],
++                override_base_url=creds["base_url"],
++                override_api_key=creds["api_key"],
++                override_api_mode=creds["api_mode"],
++                override_acp_command=t.get("acp_command")
++                or acp_command
++                or creds.get("command"),
++                override_acp_args=(
++                    task_acp_args
++                    if task_acp_args is not None
++                    else (acp_args if acp_args is not None else creds.get("args"))
+                 ),
+                 role=effective_role,
+-                # P85/MOL-382 — thread role suffix to child system prompt
+-                role_suffix=_task_role_suffix,
+             )
+             # Override with correct parent tool names (before child construction mutated global)
+             child._delegate_saved_tool_names = _parent_tool_names
++            # P141/MOL-491 (#163 review CRITICAL-2): tag child with the
++            # active profile name so iteration-audit records distinguish
++            # coding-profile dispatches from default-profile ones. Without
++            # this, every record reads `profile=default` (since no other
++            # set-site exists) — making the audit log unable to answer
++            # "is the coding profile hitting max_iterations more often?"
++            child._delegate_profile = profile or "default"
+             children.append((i, t, child))
+     finally:
+         # Authoritative restore: reset global to parent's tool names after all children built
+@@ -3249,7 +3782,6 @@
+             "base_url": configured_base_url,
+             "api_key": api_key,
+             "api_mode": api_mode,
+-            "fallback_model": cfg.get("fallback_model"),
+         }
+ 
+     if not configured_provider:
+@@ -3260,7 +3792,6 @@
+             "base_url": None,
+             "api_key": None,
+             "api_mode": None,
+-            "fallback_model": cfg.get("fallback_model"),
+         }
+ 
+     # Provider is configured — resolve full credentials
+@@ -3291,7 +3822,6 @@
+         "api_mode": runtime.get("api_mode"),
+         "command": runtime.get("command"),
+         "args": list(runtime.get("args") or []),
+-        "fallback_model": cfg.get("fallback_model"),
+     }
+ 
+ 
+@@ -3424,7 +3954,7 @@
+                         },
+                         "acp_command": {
+                             "type": "string",
+-                            "description": "Per-task ACP command override (e.g. 'claude'). Overrides the top-level acp_command for this task only.",
++                            "description": "Per-task ACP command override (e.g. 'copilot'). Overrides the top-level acp_command for this task only.",
+                         },
+                         "acp_args": {
+                             "type": "array",
+@@ -3433,11 +3963,7 @@
+                         },
+                         "role": {
+                             "type": "string",
+-                            "enum": [
+-                                "leaf", "orchestrator",
+-                                "analyst", "ticketer", "planner", "architect",
+-                                "designer", "debugger", "builder", "reviewer",
+-                            ],
++                            "enum": ["leaf", "orchestrator"],
+                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                         },
+                     },
+@@ -3454,18 +3980,11 @@
+             },
+             "role": {
+                 "type": "string",
+-                "enum": [
+-                    "leaf", "orchestrator",
+-                    "analyst", "ticketer", "planner", "architect",
+-                    "designer", "debugger", "builder", "reviewer",
+-                ],
++                "enum": ["leaf", "orchestrator"],
+                 "description": (
+                     "Role of the child agent. 'leaf' (default) = focused "
+                     "worker, cannot delegate further. 'orchestrator' = can "
+-                    "use delegate_task to spawn its own workers. Profile "
+-                    "names (analyst, ticketer, planner, architect, designer, "
+-                    "debugger, builder, reviewer) activate the corresponding "
+-                    "role profile from delegation config. Requires "
++                    "use delegate_task to spawn its own workers. Requires "
+                     "delegation.max_spawn_depth >= 2 in config; ignored "
+                     "(treated as 'leaf') when the child would exceed "
+                     "max_spawn_depth or when "
+@@ -3475,10 +3994,11 @@
+             "acp_command": {
+                 "type": "string",
+                 "description": (
+-                    "Override ACP command for child agents (e.g. 'claude', 'copilot'). "
++                    "Override ACP command for child agents (e.g. 'copilot'). "
+                     "When set, children use ACP subprocess transport instead of inheriting "
+-                    "the parent's transport. Enables spawning Claude Code (claude --acp --stdio) "
+-                    "or other ACP-capable agents from any parent, including Discord/Telegram/CLI."
++                    "the parent's transport. Requires an ACP-compatible CLI "
++                    "(currently GitHub Copilot CLI via 'copilot --acp --stdio'). "
++                    "See agent/copilot_acp_client.py for the implementation."
+                 ),
+             },
+             "acp_args": {
+@@ -3486,7 +4006,7 @@
+                 "items": {"type": "string"},
+                 "description": (
+                     "Arguments for the ACP command (default: ['--acp', '--stdio']). "
+-                    "Only used when acp_command is set. Example: ['--acp', '--stdio', '--model', 'claude-opus-4-6']"
++                    "Only used when acp_command is set."
+                 ),
+             },
+         },

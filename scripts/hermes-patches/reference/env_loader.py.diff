@@ -1,0 +1,31 @@
+diff --git a/hermes_cli/env_loader.py b/hermes_cli/env_loader.py
+index 0066d25b..b9360bce 100644
+--- a/hermes_cli/env_loader.py
++++ b/hermes_cli/env_loader.py
+@@ -20,13 +20,12 @@ def load_hermes_dotenv(
+     hermes_home: str | os.PathLike | None = None,
+     project_env: str | os.PathLike | None = None,
+ ) -> list[Path]:
+-    """Load Hermes environment files with user config taking precedence.
++    """Load Hermes environment files as defaults (never clobber envchain values).
+ 
+     Behavior:
+-    - `~/.hermes/.env` overrides stale shell-exported values when present.
+-    - project `.env` acts as a dev fallback and only fills missing values when
+-      the user env exists.
+-    - if no user env exists, the project `.env` also overrides stale shell vars.
++    - `~/.hermes/.env` fills MISSING values only (override=False).
++      envchain-injected secrets always take precedence.
++    - project `.env` acts as a dev fallback and only fills missing values.
+     """
+     loaded: list[Path] = []
+ 
+@@ -35,7 +34,7 @@ def load_hermes_dotenv(
+     project_env_path = Path(project_env) if project_env else None
+ 
+     if user_env.exists():
+-        _load_dotenv_with_fallback(user_env, override=True)
++        _load_dotenv_with_fallback(user_env, override=False)
+         loaded.append(user_env)
+ 
+     if project_env_path and project_env_path.exists():

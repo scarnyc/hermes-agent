@@ -1,0 +1,264 @@
+commit bbbce9265188ecc865b71728a592769213fa4d1f
+Author: Teknium <127238744+teknium1@users.noreply.github.com>
+Date:   Thu Apr 30 13:44:04 2026 -0700
+
+    feat(tui): render self-improvement review summaries in the transcript
+    
+    The Ink TUI (\`hermes --tui\` + dashboard \`/chat\`) had no wiring for the
+    background self-improvement review. When the review fired and patched
+    a skill or saved a memory entry, the change landed but the user had
+    no visual indication it happened — only the CLI had a print surface
+    for the '💾 Self-improvement review: …' line.
+    
+    Changes:
+    
+    - tui_gateway/server.py: in _init_session, attach
+      agent.background_review_callback to an _emit('review.summary',
+      sid, {text}) closure. Wrapped in try/except so agents with locked
+      attribute slots don't break session startup.
+    - ui-tui/src/app/createGatewayEventHandler.ts: handle 'review.summary'
+      by routing ev.payload.text through sys(…), matching the existing
+      'background.complete' pattern. Empty / whitespace payloads are
+      ignored so the transcript never gets a blank system line.
+    - ui-tui/src/gatewayTypes.ts: extend the GatewayEvent discriminated
+      union with { type: 'review.summary', payload?: { text?: string } }.
+    
+    Gateway platforms (Telegram, Discord, Slack, …) already route the
+    review summary via background_review_callback → post-delivery queue
+    in gateway/run.py, so they pick up the new 'Self-improvement review:'
+    prefix from the companion run_agent change with no platform edits.
+    
+    Tests:
+    - tests/tui_gateway/test_review_summary_callback.py (Python, 2 tests):
+      _init_session attaches a callback that emits the right event; the
+      callback path survives agents that can't accept the attribute.
+    - ui-tui/src/__tests__/createGatewayEventHandler.test.ts (vitest, 2
+      new cases): review.summary events feed sys(...) with the full text;
+      empty / missing payloads are no-ops.
+    - TypeScript type-check passes.
+    - tui_gateway suite: 64/64 pass.
+
+diff --git a/tests/tui_gateway/test_review_summary_callback.py b/tests/tui_gateway/test_review_summary_callback.py
+new file mode 100644
+index 000000000..9fc7f54dd
+--- /dev/null
++++ b/tests/tui_gateway/test_review_summary_callback.py
+@@ -0,0 +1,117 @@
++"""Tests for tui_gateway background-review summary delivery.
++
++When the self-improvement background review fires and saves a skill or
++memory entry, it calls ``agent.background_review_callback(message)``. In
++the CLI that routes through a prompt_toolkit-safe ``_cprint``; in the TUI
++there is no print surface, so without a callback wired up the review
++writes the change silently. ``_init_session`` attaches a callback that
++emits a ``review.summary`` event which Ink renders as a persistent
++transcript line.
++"""
++
++from __future__ import annotations
++
++import sys
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++
++@pytest.fixture()
++def server():
++    with patch.dict(
++        "sys.modules",
++        {
++            "hermes_constants": MagicMock(
++                get_hermes_home=MagicMock(return_value="/tmp/hermes_test_review_summary")
++            ),
++            "hermes_cli.env_loader": MagicMock(),
++            "hermes_cli.banner": MagicMock(),
++            "hermes_state": MagicMock(),
++        },
++    ):
++        import importlib
++
++        mod = importlib.import_module("tui_gateway.server")
++        yield mod
++        mod._sessions.clear()
++        mod._pending.clear()
++        mod._answers.clear()
++        mod._methods.clear()
++        importlib.reload(mod)
++
++
++def test_init_session_attaches_background_review_callback(server, monkeypatch):
++    """After _init_session, agent.background_review_callback is set to a
++    function that emits 'review.summary' for the session's sid."""
++    # Neutralize side-effect calls inside _init_session so we're testing
++    # just the callback wiring.
++    monkeypatch.setattr(server, "_SlashWorker", lambda *a, **kw: object())
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **kw: None)
++    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": "m"})
++    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
++    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
++
++    captured_emits: list = []
++    monkeypatch.setattr(
++        server,
++        "_emit",
++        lambda event, sid, payload=None: captured_emits.append(
++            (event, sid, payload)
++        ),
++    )
++
++    class FakeAgent:
++        model = "fake/model"
++        # Presence of the attribute is all the Python side needs; the real
++        # AIAgent has it defaulted to None in __init__.
++        background_review_callback = None
++
++    agent = FakeAgent()
++    server._init_session("sid-abc", "session-key", agent, [], cols=80)
++
++    cb = getattr(agent, "background_review_callback", None)
++    assert callable(cb), (
++        "_init_session must attach a background_review_callback to the "
++        "agent so the self-improvement review is visible in the TUI."
++    )
++
++    # Clear the session.info emit captured during _init_session.
++    captured_emits.clear()
++
++    # Invoke the callback the way AIAgent._spawn_background_review would.
++    cb("💾 Self-improvement review: Skill 'hermes-release' patched")
++
++    # Exactly one review.summary event should have been emitted, bound to
++    # the session id we passed in, carrying the full message text.
++    matched = [e for e in captured_emits if e[0] == "review.summary"]
++    assert len(matched) == 1, captured_emits
++    event, sid, payload = matched[0]
++    assert sid == "sid-abc"
++    assert payload == {
++        "text": "💾 Self-improvement review: Skill 'hermes-release' patched"
++    }
++
++
++def test_review_summary_callback_survives_agent_without_attribute(server, monkeypatch):
++    """If the agent is a bare object that doesn't allow attribute
++    assignment (e.g. some stubbed test double), _init_session must not
++    raise — session startup stays robust."""
++    monkeypatch.setattr(server, "_SlashWorker", lambda *a, **kw: object())
++    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
++    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **kw: None)
++    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": "m"})
++    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
++    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
++    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
++
++    class LockedAgent:
++        __slots__ = ("model",)
++
++        def __init__(self):
++            self.model = "fake/model"
++
++    # LockedAgent's __slots__ blocks background_review_callback assignment.
++    server._init_session("sid-x", "key-x", LockedAgent(), [], cols=80)
++    # If we got here, _init_session swallowed the AttributeError gracefully.
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 6aa025309..47f25e7e1 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1806,6 +1806,21 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
+         load_permanent_allowlist()
+     except Exception:
+         pass
++    # Surface the self-improvement background review's "💾 …" summary as a
++    # review.summary event so Ink can render it as a persistent system line
++    # in the transcript. In the CLI path this message is printed via
++    # prompt_toolkit; the TUI has no equivalent print surface, so without
++    # this callback the review would write the skill/memory change silently.
++    try:
++        agent.background_review_callback = (
++            lambda message, _sid=sid: _emit(
++                "review.summary", _sid, {"text": str(message)}
++            )
++        )
++    except Exception:
++        # Bare AIAgents that don't expose the attribute (unlikely, but keep
++        # session startup resilient).
++        pass
+     _wire_callbacks(sid)
+     _notify_session_boundary("on_session_reset", key)
+     _emit("session.info", sid, _session_info(agent))
+diff --git a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+index 1729f0c27..d74976d19 100644
+--- a/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
++++ b/ui-tui/src/__tests__/createGatewayEventHandler.test.ts
+@@ -132,6 +132,33 @@ describe('createGatewayEventHandler', () => {
+     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
+   })
+ 
++  it('surfaces self-improvement review summaries as a persistent system line', () => {
++    const appended: Msg[] = []
++    const ctx = buildCtx(appended)
++    const onEvent = createGatewayEventHandler(ctx)
++
++    onEvent({
++      payload: { text: "💾 Self-improvement review: Skill 'hermes-release' patched" },
++      type: 'review.summary'
++    } as any)
++
++    expect(ctx.system.sys).toHaveBeenCalledWith(
++      "💾 Self-improvement review: Skill 'hermes-release' patched"
++    )
++  })
++
++  it('ignores review.summary events with empty or missing text', () => {
++    const appended: Msg[] = []
++    const ctx = buildCtx(appended)
++    const onEvent = createGatewayEventHandler(ctx)
++
++    onEvent({ payload: { text: '' }, type: 'review.summary' } as any)
++    onEvent({ payload: { text: '   ' }, type: 'review.summary' } as any)
++    onEvent({ payload: undefined, type: 'review.summary' } as any)
++
++    expect(ctx.system.sys).not.toHaveBeenCalled()
++  })
++
+   it('clears the visible todo list when the todo tool returns an empty list', () => {
+     const appended: Msg[] = []
+     const todos = [{ content: 'Boil water', id: 'boil', status: 'in_progress' }]
+diff --git a/ui-tui/src/app/createGatewayEventHandler.ts b/ui-tui/src/app/createGatewayEventHandler.ts
+index 86295f67d..7230d1cf9 100644
+--- a/ui-tui/src/app/createGatewayEventHandler.ts
++++ b/ui-tui/src/app/createGatewayEventHandler.ts
+@@ -510,6 +510,20 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
+ 
+         return
+ 
++      case 'review.summary': {
++        // Self-improvement background review emitted a persistent summary
++        // of what it saved to memory/skills. Surface it as a system line
++        // in the transcript so it never gets lost to a transient status
++        // flash. Python-side already formats it as "💾 Self-improvement
++        // review: …".
++        const text = String(ev.payload?.text ?? '').trim()
++        if (text) {
++          sys(text)
++        }
++
++        return
++      }
++
+       case 'subagent.spawn_requested':
+         // Child built but not yet running (waiting on ThreadPoolExecutor slot).
+         // Preserve completed state if a later event races in before this one.
+diff --git a/ui-tui/src/gatewayTypes.ts b/ui-tui/src/gatewayTypes.ts
+index 60957fc28..02d878cb2 100644
+--- a/ui-tui/src/gatewayTypes.ts
++++ b/ui-tui/src/gatewayTypes.ts
+@@ -493,6 +493,7 @@ export type GatewayEvent =
+   | { payload: { request_id: string }; session_id?: string; type: 'sudo.request' }
+   | { payload: { env_var: string; prompt: string; request_id: string }; session_id?: string; type: 'secret.request' }
+   | { payload: { task_id: string; text: string }; session_id?: string; type: 'background.complete' }
++  | { payload?: { text?: string }; session_id?: string; type: 'review.summary' }
+   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.spawn_requested' }
+   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.start' }
+   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.thinking' }

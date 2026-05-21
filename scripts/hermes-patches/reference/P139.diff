@@ -1,0 +1,15 @@
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1004,8 +1004,11 @@
+         # Set to false for strict intersection.
+         "inherit_mcp_toolsets": True,
+-        "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
+-                               # independent of the parent's max_iterations)
++        "max_iterations": 100,  # P139/MOL-487 — bumped from 50 after MOL-417 dispatch hit cap
++                                # twice on the agent-swarm Pattern 1 chain (planner+plan-skeptic+
++                                # builder+reviewer + git/gh/jira shell calls). 100 = 2x prior;
++                                # matches dormant delegation.coding.max_iterations override that
++                                # P103 will activate once re-applied to runtime.
+         "child_timeout_seconds": 600,  # wall-clock timeout for each child agent (floor 30s,
+                                        # no ceiling). High-reasoning models on large tasks
+                                        # (e.g. gpt-5.5 xhigh, opus-4.6) need generous budgets;

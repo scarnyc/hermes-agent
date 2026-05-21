@@ -1,0 +1,627 @@
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 3856ce776..a391223f7 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -17,18 +17,32 @@ never the child's intermediate tool calls or reasoning.
+ """
+ 
+ import enum
++import hashlib  # P103/MOL-410 — prompt_hash in audit log
+ import json
+ import logging
+ 
+ logger = logging.getLogger(__name__)
+ import os
++import re  # P103/MOL-410 — profile name validation + repo-path extraction (#162 review M11/M15)
++import string  # P103/MOL-410 — _build_claude_argv field-name validation (#162 review CRITICAL-6)
++import sys  # P103/MOL-410 — fail-open stderr emit in _emit_profile_audit
+ import threading
+ import time
+ from concurrent.futures import (
+     ThreadPoolExecutor,
+     TimeoutError as FuturesTimeoutError,
+ )
+-from typing import Any, Dict, List, Optional
++from datetime import datetime, timezone  # P103/MOL-410 — audit log timestamps
++from pathlib import Path  # P103/MOL-410 — profile path resolution
++from typing import Any, Dict, List, Optional, Tuple
++
++# P103/MOL-410 (#162 review M9): graceful degradation if PyYAML uninstalled.
++# The default delegate_task path (no profile) MUST keep working even without
++# yaml; only profile-elevation requires it.
++try:
++    import yaml as _p103_yaml
++except ImportError:  # pragma: no cover — depends on venv state
++    _p103_yaml = None  # type: ignore[assignment]
+ 
+ from toolsets import TOOLSETS
+ from tools import file_state
+@@ -504,6 +518,425 @@ def _preserve_parent_mcp_toolsets(
+     return preserved
+ 
+ 
++# ============================================================================
++# P103/MOL-410 — Coding-profile elevation for delegate_task
++# ============================================================================
++# Profile-based scoped elevation. delegate_task(profile="coding"|"default", ...)
++# loads YAML at ~/.hermes/config/delegate-profiles/<profile>.yaml. Profile
++# drives: --allowedTools, --settings allow/deny, --max-budget-usd, --max-turns,
++# --add-dir, --append-system-prompt, env-passthrough merge, MCP server inclusion,
++# audit verbosity.
++#
++# Defense-in-depth (additive-only — profiles can ADD allowed ops, NEVER remove
++# deny rules): see PATCHES.md§P103 for the 5-layer stack.
++#
++# HITL session-consent: (profile, repo_path) tuple key, TTL 120 min for
++# `coding`. First-use-per-tuple per session prompts via Telegram. v1 returns
++# (True, "v1-auto-approve") because the Telegram-prompt subsystem is shared
++# with the gateway long-poller (409-conflict if both poll). Full per-call
++# HITL is tracked at MOL-450.
++#
++# Re-applied to runtime via P140/MOL-489 (this patch was originally P103
++# but the runtime-side work was rolled back; this re-application restores
++# the surface PATCHES.md§P103:6662 documents).
++# ============================================================================
++
++_P103_PROFILE_DIR = Path("~/.hermes/config/delegate-profiles").expanduser()
++_P103_LOG_DIR = Path("~/.hermes/logs").expanduser()
++# Module-level consent cache: (profile_name, repo_path) -> monotonic expiry seconds.
++# Single-process scope — the gateway is one process, so this is sufficient
++# for session consent. Cache wipes on gateway restart, which is the
++# intended TTL boundary. P103/MOL-410 (#162 review I4/M7): keyed off
++# time.monotonic(), NOT time.time() — wall-clock skew (NTP correction,
++# macOS sleep/wake) would otherwise produce stale-consent or repeat-prompt
++# anomalies. Monotonic resets on process boot, which is the desired
++# "session" semantic anyway.
++_P103_CONSENT_CACHE: Dict[Tuple[str, str], float] = {}
++_P103_DEFAULT_CONSENT_TTL_MIN = 120
++
++# P103/MOL-410 (#162 review CRITICAL-1): profile name allowlist. Only
++# names matching this regex are accepted by `_load_profile`. Prevents
++# `profile="../../etc/passwd"` from reading arbitrary files on disk
++# when P114/MOL-442 lands (which makes `profile=` LLM-controllable).
++_P103_PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
++
++# P103/MOL-410 (#162 review I1, M2 review-fix from original P103):
++# secrets that profiles MUST NEVER passthrough to subprocesses regardless
++# of `env_passthrough` declarations. Closes the regression vs the
++# documented final P103 surface (PATCHES.md:7277).
++_P103_PROFILE_PASSTHROUGH_DENYLIST = frozenset({
++    "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
++    "DEEPSEEK_API_KEY",
++    "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
++    "OPENROUTER_API_KEY",
++    "KIMI_API_KEY", "MOONSHOT_API_KEY",
++    "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
++    "TAVILY_API_KEY",
++    "GIPHY_API_KEY",
++    "VIRUSTOTAL_API_KEY", "AI_DEFENSE_API_KEY",
++    "GRANOLA_OAUTH_TOKEN", "GRANOLA_REFRESH_TOKEN",
++    "BROWSERBASE_API_KEY",
++})
++
++# P103/MOL-410 (#162 review M11): pre-compiled regex for repo-path extraction
++# from goal+context. Tighter character class than the prior `[^\s/]+` —
++# excludes trailing punctuation (`,;:.)]`) that the wider class swallowed
++# into the audit `--add-dir` field. Allows `_-` for repo names like
++# `hermes-poc-staging`. Validation fallback at extraction site checks
++# `os.path.isdir` to guard against junk that survives the regex.
++_P103_REPO_PATH_RE = re.compile(r"(?:~|/Users/[^/]+)/Code/[A-Za-z0-9._-]+")
++
++# P103/MOL-410 (#162 review M8): consent-cache lock. v1-auto-approve doesn't
++# need it (no I/O, near-atomic dict op), but locking now removes a footgun
++# from the v2 Telegram-prompt wire-up (which would otherwise dual-prompt
++# under concurrent reads).
++_P103_CONSENT_LOCK = threading.Lock()
++
++# P103/MOL-410 (#162 review CRITICAL-2): audit-write failure counter.
++# Increments when _emit_profile_audit's fail-open path fires. Surfaced
++# via `gateway.log` logger.error AND this counter so cron-context audit
++# loss is observable.
++_P103_AUDIT_DROP_COUNT = 0
++
++
++def _load_profile(name: str) -> Optional[Dict[str, Any]]:
++    """P103/MOL-410: Load a delegate profile YAML by name.
++
++    Reads ~/.hermes/config/delegate-profiles/<name>.yaml via yaml.safe_load.
++    Returns None if file missing OR yaml is empty/malformed. Caller should
++    handle None by failing loud (return tool_error) when the profile was
++    explicitly requested — silent downgrade to default would mask a config
++    bug as a no-op privilege change.
++
++    P103/MOL-410 (#162 review CRITICAL-1): profile name MUST match
++    `_P103_PROFILE_NAME_RE`. Names with traversal segments / dots / slashes
++    are rejected upfront. The resolved path is also checked to be a
++    descendant of `_P103_PROFILE_DIR` after `.resolve()` (catches
++    symlink-escape attacks).
++
++    P103/MOL-410 (#162 review M9): if PyYAML is uninstalled, log + return
++    None. The default delegate path keeps working.
++
++    P103/MOL-410 (#162 review M12): if the YAML's internal `profile` field
++    differs from the requested filename-name, override it with the
++    filename — the filename is canonical. Prevents copy-paste typos in
++    YAML from emitting audit records under the wrong profile name.
++    """
++    if not _P103_PROFILE_NAME_RE.match(name or ""):
++        logger.warning("P103/MOL-410: invalid profile name %r (allowlist regex rejected)", name)
++        return None
++    if _p103_yaml is None:
++        logger.error(
++            "P103/MOL-410: PyYAML not installed — profile elevation disabled. "
++            "Install via `pip install pyyaml` in the gateway venv."
++        )
++        return None
++    profile_path = _P103_PROFILE_DIR / f"{name}.yaml"
++    if not profile_path.exists():
++        return None
++    # Symlink-escape guard: resolve the path and verify it's still under
++    # the profile dir. Defensive layer on top of the regex allowlist.
++    try:
++        resolved = profile_path.resolve()
++        resolved.relative_to(_P103_PROFILE_DIR.resolve())
++    except (OSError, ValueError) as exc:
++        logger.warning(
++            "P103/MOL-410: profile path escape attempt for %r (resolved=%s): %s",
++            name, profile_path, exc,
++        )
++        return None
++    try:
++        with profile_path.open() as fp:
++            data = _p103_yaml.safe_load(fp)
++    except (OSError, _p103_yaml.YAMLError) as exc:
++        logger.warning("P103/MOL-410: failed to load profile %s: %s", name, exc)
++        return None
++    if not isinstance(data, dict):
++        logger.warning(
++            "P103/MOL-410: profile %s is not a dict (got %s)",
++            name, type(data).__name__,
++        )
++        return None
++    # Canonicalize internal profile name to filename. M12: the YAML's own
++    # `profile` field is informational; filename is authoritative.
++    if data.get("profile") and data["profile"] != name:
++        logger.warning(
++            "P103/MOL-410: profile file %s.yaml has internal name %r; using filename-based name",
++            name, data["profile"],
++        )
++    data["profile"] = name
++    return data
++
++
++def _validate_profile_additive_only(
++    profile: Dict[str, Any],
++    base_settings: Optional[Dict[str, Any]] = None,
++) -> None:
++    """P103/MOL-410: enforce additive-only profile semantics.
++
++    Profiles can ADD allowed_tools entries, MCP servers, env_passthrough
++    entries, and allowed_bash_patterns. They CANNOT remove from base
++    settings.json deny rules — those are kernel-enforced via sandbox-exec
++    + Rampart + git-guardrails. This helper catches profile-YAML mistakes
++    where someone adds a permissive rule that overlaps a base deny.
++
++    P103/MOL-410 (#162 review I1, M2 review-fix): also validates
++    `env_passthrough` against `_P103_PROFILE_PASSTHROUGH_DENYLIST` —
++    profiles cannot lift sensitive credentials (ANTHROPIC_API_KEY etc.)
++    into subprocess env regardless of declarations. This was the
++    documented M2 review-fix from the original P103 surface that the
++    re-application initially missed.
++
++    Raises ValueError if the profile attempts to remove or override a base
++    deny, or if it declares a denylist-protected env_passthrough entry.
++    Silent (no-op) if base_settings is None AND no denylist violations
++    exist.
++    """
++    base = base_settings or {}
++    base_deny = base.get("permissions", {}).get("deny", [])
++    profile_deny = profile.get("permissions", {}).get("deny", [])
++    # If profile defines its own deny list, every base entry must still be present.
++    if profile_deny and base_deny:
++        missing = [d for d in base_deny if d not in profile_deny]
++        if missing:
++            raise ValueError(
++                f"P103/MOL-410: profile '{profile.get('profile', '?')}' attempts to "
++                f"remove base deny rules: {missing}. Profiles are additive-only — "
++                f"deny rules can only be ADDED, never removed."
++            )
++    # Forbid any explicit allow that overlaps a base deny pattern.
++    profile_allow = profile.get("allowed_bash_patterns", [])
++    for pattern in profile_allow:
++        if pattern in base_deny:
++            raise ValueError(
++                f"P103/MOL-410: profile pattern '{pattern}' overlaps base deny. "
++                f"Profiles cannot grant access to denied operations."
++            )
++    # M2 review-fix: env_passthrough denylist enforcement.
++    profile_passthrough = profile.get("env_passthrough", [])
++    if isinstance(profile_passthrough, list):
++        leaked = [k for k in profile_passthrough if k in _P103_PROFILE_PASSTHROUGH_DENYLIST]
++        if leaked:
++            raise ValueError(
++                f"P103/MOL-410: profile '{profile.get('profile', '?')}' declares "
++                f"env_passthrough for denylisted secrets: {leaked}. These keys are "
++                f"NEVER allowed to reach a subprocess regardless of profile YAML "
++                f"(M2 review-fix). See _P103_PROFILE_PASSTHROUGH_DENYLIST."
++            )
++
++
++def _check_profile_session_consent(
++    profile_name: str, repo_path: str
++) -> Tuple[bool, str]:
++    """P103/MOL-410: HITL session-consent gate keyed by (profile, repo_path).
++
++    First-use-per-tuple per session prompts via Telegram; subsequent uses
++    within TTL bypass the prompt. v1 returns (True, "v1-auto-approve")
++    because the Telegram-prompt subsystem is shared with the gateway
++    long-poller (409-conflict if both poll). Full per-call HITL is
++    tracked at MOL-450.
++
++    P103/MOL-410 (#162 review I4): cache TTL is uptime-relative
++    (`time.monotonic()`), not wall-clock — immune to NTP correction and
++    macOS sleep/wake clock skew. The "session" semantic is process-bounded
++    anyway, so monotonic is the right primitive.
++
++    P103/MOL-410 (#162 review M8): cache mutations are guarded by
++    `_P103_CONSENT_LOCK`. v1 doesn't need it (no I/O between read and
++    write) but locking now removes a footgun from the v2 Telegram-prompt
++    wire-up where the read→prompt→write window would otherwise dual-prompt.
++
++    Returns (consented: bool, reason: str). When False, reason is a short
++    operator-surface message.
++    """
++    key = (profile_name, repo_path)
++    now = time.monotonic()
++    ttl_minutes = _P103_DEFAULT_CONSENT_TTL_MIN
++    with _P103_CONSENT_LOCK:
++        expiry = _P103_CONSENT_CACHE.get(key)
++        if expiry is not None and expiry > now:
++            return True, "cached"
++        _P103_CONSENT_CACHE[key] = now + ttl_minutes * 60
++    return True, "v1-auto-approve (MOL-450 follow-up)"
++
++
++def _emit_profile_audit(
++    profile: Dict[str, Any],
++    argv: List[str],
++    matched_rule: Optional[str] = None,
++    *,
++    caller: Optional[str] = None,
++    prompt: Optional[str] = None,
++    exit_code: Optional[int] = None,
++    cost_usd: Optional[float] = None,
++    turns_used: Optional[int] = None,
++) -> None:
++    """P103/MOL-410: write a per-profile audit JSONL record.
++
++    Path: ~/.hermes/logs/delegate-{profile}.log (per PATCHES.md§P103:6697).
++    Override via profile.audit.jsonl.
++
++    Fields: ts, profile, caller, prompt_hash, argv, exit_code, cost_usd,
++    turns_used, matched_rule. include_prompt is honored from profile.audit
++    (default false — only prompt_hash is recorded for forensics + privacy).
++
++    Fail-open: if the log path is unwritable (sandbox edge case), this
++    function emits a stderr warning and returns without raising. The
++    delegate_task call continues. MOL-474 closes when this function
++    fires on the coding profile and writes a non-empty record.
++    """
++    profile_name = profile.get("profile", "default") if isinstance(profile, dict) else "default"
++    audit_cfg = profile.get("audit", {}) if isinstance(profile, dict) else {}
++    log_path_str = audit_cfg.get("jsonl") if isinstance(audit_cfg, dict) else None
++    if log_path_str:
++        log_path = Path(log_path_str).expanduser()
++    else:
++        log_path = _P103_LOG_DIR / f"delegate-{profile_name}.log"
++
++    record: Dict[str, Any] = {
++        "ts": datetime.now(timezone.utc).isoformat(),
++        "profile": profile_name,
++        "caller": caller or "delegate_task",
++        "argv": argv,
++        "matched_rule": matched_rule,
++        "exit_code": exit_code,
++        "cost_usd": cost_usd,
++        "turns_used": turns_used,
++    }
++    if prompt is not None:
++        record["prompt_hash"] = hashlib.sha256(
++            prompt.encode("utf-8", errors="replace")
++        ).hexdigest()[:16]
++        if isinstance(audit_cfg, dict) and audit_cfg.get("include_prompt"):
++            record["prompt"] = prompt
++
++    try:
++        log_path.parent.mkdir(parents=True, exist_ok=True)
++        with log_path.open("a") as fp:
++            fp.write(json.dumps(record) + "\n")
++    except Exception as exc:  # noqa: BLE001 — fail-open per P103 contract
++        # P103/MOL-410 (#162 review CRITICAL-2): stderr is silent in cron
++        # context (gateway eats it). Loud failure path: stderr + logger.error
++        # (which routes to gateway.log via the gateway logger) + counter
++        # increment + tier-2 fallback to /tmp so audit isn't entirely lost.
++        global _P103_AUDIT_DROP_COUNT
++        _P103_AUDIT_DROP_COUNT += 1
++        msg = (
++            f"P103/MOL-410: _emit_profile_audit failed for profile={profile_name!r} "
++            f"(fail-open; drop_count={_P103_AUDIT_DROP_COUNT}): {exc}"
++        )
++        sys.stderr.write(f"[P103/MOL-410] {msg}\n")
++        try:
++            logger.error(msg)
++        except Exception:  # noqa: BLE001 — logger itself broken; nothing more to do
++            pass
++        # Tier-2 fallback: /tmp survives sandbox edge cases that block
++        # ~/.hermes/logs/. Best-effort — silent failure of THIS too is the
++        # final fail-open boundary.
++        try:
++            fallback = Path(f"/tmp/hermes-delegate-audit-{os.getpid()}.jsonl")
++            with fallback.open("a") as fp:
++                fp.write(json.dumps({**record, "audit_fallback": "tier2"}) + "\n")
++        except Exception:  # noqa: BLE001
++            pass
++
++
++def _build_claude_argv(
++    profile_cfg: Dict[str, Any],
++    repo_path: str,
++    prompt: str,
++    *,
++    extra_add_dirs: Optional[List[str]] = None,
++) -> List[str]:
++    """P103/MOL-410: construct claude -p argv from a coding-profile YAML.
++
++    Emits the CLI flags for max_turns, max_budget_usd, setting_sources,
++    add_dir, allowed_tools, denied_tools, append_system_prompt. The argv
++    is the source-of-truth payload that gets recorded in the audit log
++    AND (when the ACP wire-up is active) handed to the subprocess spawner.
++
++    Profile YAML schema (subset consumed here):
++      profile: <name>
++      max_turns: int  (mapped to --max-turns)
++      max_budget_usd: float  (mapped to --max-budget-usd)
++      add_dirs: [str]  (mapped to --add-dir, runtime-interpolated)
++      allowed_tools: [str]  (mapped to --allowedTools)
++      disallowed_tools: [str]  (mapped to --disallowedTools)
++      system_prompt_suffix: str  (mapped to --append-system-prompt)
++    """
++    argv: List[str] = ["claude", "-p"]
++    # --max-turns: per-subprocess iteration cap from profile (e.g. 100 for coding).
++    max_turns = profile_cfg.get("max_turns")
++    if max_turns is not None:
++        argv.extend(["--max-turns", str(max_turns)])
++    # --max-budget-usd: cost cap per subprocess.
++    max_budget = profile_cfg.get("max_budget_usd")
++    if max_budget is not None:
++        argv.extend(["--max-budget-usd", str(max_budget)])
++    # --setting-sources: control which settings layer the subprocess inherits.
++    # Default to user,project so inline --settings stacks ON TOP of inherited
++    # deny rules (additive-only — profiles can't remove denies).
++    argv.extend(["--setting-sources", "user,project"])
++    # --add-dir: each profile-declared add_dir gets interpolated with repo_path.
++    # P103/MOL-410 (#162 review CRITICAL-6): validate template field names via
++    # string.Formatter before .format() — typos like `{repo-path}` (hyphen)
++    # silently passed through unaltered in the prior implementation; format-spec
++    # injection like `{repo_path:>500}` produced bizarre argv. Now: only
++    # `{repo_path}` is honored; any other field name aborts the directory.
++    _formatter = string.Formatter()
++    add_dirs = list(profile_cfg.get("add_dirs", []))
++    for extra in (extra_add_dirs or []):
++        if extra not in add_dirs:
++            add_dirs.append(extra)
++    for raw_dir in add_dirs:
++        try:
++            field_names = {
++                f for _, f, _, _ in _formatter.parse(raw_dir)
++                if f is not None and f != ""
++            }
++        except (ValueError, IndexError):
++            logger.warning(
++                "P103/MOL-410: add_dir %r has malformed template; skipping", raw_dir
++            )
++            continue
++        unknown = field_names - {"repo_path"}
++        if unknown:
++            logger.warning(
++                "P103/MOL-410: add_dir %r references unknown fields %s; skipping",
++                raw_dir, sorted(unknown),
++            )
++            continue
++        try:
++            resolved = raw_dir.format(repo_path=repo_path) if field_names else raw_dir
++        except (KeyError, IndexError, ValueError) as exc:
++            logger.warning(
++                "P103/MOL-410: add_dir %r format failed: %s; skipping", raw_dir, exc
++            )
++            continue
++        argv.extend(["--add-dir", resolved])
++    # --allowedTools: profile's allowed tools list.
++    allowed_tools = profile_cfg.get("allowed_tools")
++    if allowed_tools:
++        argv.extend(["--allowedTools", ",".join(allowed_tools)])
++    # --disallowedTools: optional inverse list (informational; deny rules
++    # are enforced at sandbox layer regardless).
++    disallowed = profile_cfg.get("disallowed_tools")
++    if disallowed:
++        argv.extend(["--disallowedTools", ",".join(disallowed)])
++    # --append-system-prompt: profile-specific system prompt suffix.
++    suffix = profile_cfg.get("system_prompt_suffix")
++    if suffix:
++        argv.extend(["--append-system-prompt", suffix])
++    # Final positional: the prompt itself.
++    argv.append(prompt)
++    return argv
++
++
++# ============================================================================
++# End P103/MOL-410 helpers
++# ============================================================================
++
++
+ DEFAULT_MAX_ITERATIONS = 50
+ DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
+ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
+@@ -1899,6 +2332,7 @@ def delegate_task(
+     acp_command: Optional[str] = None,
+     acp_args: Optional[List[str]] = None,
+     role: Optional[str] = None,
++    profile: str = "default",  # P103/MOL-410 — coding-profile elevation
+     parent_agent=None,
+ ) -> str:
+     """
+@@ -1913,8 +2347,99 @@ def delegate_task(
+     toolset and can spawn its own workers, bounded by
+     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+ 
++    The 'profile' parameter (P103/MOL-410) selects a delegate profile YAML
++    from ~/.hermes/config/delegate-profiles/<profile>.yaml. The default
++    profile is fail-closed (no elevation). The 'coding' profile elevates
++    for end-to-end Jira coding tickets (push to feature/*, open PR,
++    Jira comment, transition). Profile resolution + audit emit fires
++    BEFORE the parent_agent check so smoke-mode invocations without a
++    parent still produce an audit record (closes MOL-474).
++
+     Returns JSON with results array, one entry per task.
+     """
++    # P103/MOL-410: profile resolution runs first — audit log records the
++    # invocation attempt regardless of downstream success/failure. This is
++    # what closes MOL-474 (delegate-coding.log audit gap).
++    #
++    # P103/MOL-410 (#162 review HIGH-3): when an explicit profile fails to
++    # load, return tool_error rather than silently downgrading to default.
++    # Silent downgrade would mask config bugs as no-op privilege changes.
++    profile_cfg: Optional[Dict[str, Any]] = None
++    if profile and profile != "default":
++        profile_cfg = _load_profile(profile)
++        if profile_cfg is None:
++            return tool_error(
++                f"P103/MOL-410: profile {profile!r} requested but YAML missing/malformed/rejected "
++                f"at {_P103_PROFILE_DIR}. Refusing to silently downgrade to default. "
++                f"Fix the YAML or invoke with profile='default'."
++            )
++        # Synthesize the smoke-friendly prompt + repo_path. Real Tier 1
++        # callers will pass these through richer plumbing; the smoke
++        # path needs SOMETHING here so the audit record is non-empty.
++        synth_prompt = goal or ""
++        if context:
++            synth_prompt = f"{synth_prompt}\n\n{context}" if synth_prompt else context
++        # P103/MOL-410 (#162 review HIGH-6): repo_path heuristic uses the
++        # pre-compiled _P103_REPO_PATH_RE (tighter character class — no
++        # trailing-punctuation capture), validates `os.path.isdir` post-match,
++        # and falls back to CWD only when nothing better is found.
++        synth_repo: Optional[str] = None
++        for blob in (goal or "", context or ""):
++            if "/Code/" not in blob:
++                continue
++            m = _P103_REPO_PATH_RE.search(blob)
++            if m:
++                candidate = os.path.expanduser(m.group(0))
++                if os.path.isdir(candidate):
++                    synth_repo = candidate
++                    break
++        if synth_repo is None:
++            synth_repo = os.getcwd()
++        # P103/MOL-410 (#162 review M10): pass base_settings if available
++        # so additive-only enforcement compares against the actual base
++        # settings, not the profile-self. Best-effort — log a warning if
++        # base settings aren't loadable so the operator knows enforcement
++        # is half-armed.
++        base_settings: Optional[Dict[str, Any]] = None
++        try:
++            base_settings_path = Path("~/.claude/settings.json").expanduser()
++            if base_settings_path.exists():
++                base_settings = json.loads(base_settings_path.read_text())
++        except (OSError, json.JSONDecodeError) as exc:
++            logger.warning(
++                "P103/MOL-410: could not load base settings.json for additive-only "
++                "validation (%s); validator will run profile-self only", exc,
++            )
++        try:
++            _validate_profile_additive_only(profile_cfg, base_settings)
++        except ValueError as exc:
++            # P103/MOL-410 (#162 review HIGH-4): emit audit BEFORE returning
++            # tool_error. Profile-rejection is the highest-value forensic
++            # event — operator needs the trace.
++            logger.error("P103/MOL-410: profile %r rejected: %s", profile, exc)
++            _emit_profile_audit(
++                profile_cfg,
++                argv=[],
++                matched_rule=f"profile={profile} REJECTED additive_violation: {exc}",
++                caller="delegate_task",
++                prompt=synth_prompt,
++                exit_code=-1,  # sentinel: rejected at validator
++            )
++            return tool_error(str(exc))
++        consented, consent_reason = _check_profile_session_consent(profile, synth_repo)
++        argv = _build_claude_argv(profile_cfg, synth_repo, synth_prompt)
++        _emit_profile_audit(
++            profile_cfg,
++            argv,
++            matched_rule=f"profile={profile} consent={consent_reason}",
++            caller="delegate_task",
++            prompt=synth_prompt,
++        )
++        if not consented:
++            return tool_error(
++                f"P103/MOL-410: HITL consent denied for ({profile}, {synth_repo}): {consent_reason}"
++            )
++
+     if parent_agent is None:
+         return tool_error("delegate_task requires a parent agent context.")
+ 
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index 985bf4bdc..9f40ded57 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -144,26 +144,46 @@ def _build_provider_env_blocklist() -> frozenset:
+ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+ 
+ 
+-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+-    """Filter Hermes-managed secrets from a subprocess environment."""
++def _sanitize_subprocess_env(
++    base_env: dict | None,
++    extra_env: dict | None = None,
++    profile_passthrough: set[str] | None = None,  # P103/MOL-410
++) -> dict:
++    """Filter Hermes-managed secrets from a subprocess environment.
++
++    P103/MOL-410: ``profile_passthrough`` is a per-call set of env var names
++    that the caller's profile YAML elevated for passthrough (e.g. coding
++    profile needs ``GH_TOKEN``, ``JIRA_API_TOKEN``). Merged into the global
++    ``is_env_passthrough`` check WITHOUT mutating the global blocklist —
++    additive-only semantics.
++    """
+     try:
+         from tools.env_passthrough import is_env_passthrough as _is_passthrough
+     except Exception:
+         _is_passthrough = lambda _: False  # noqa: E731
+ 
++    # P103/MOL-410: per-call passthrough predicate that combines the global
++    # is_env_passthrough with the profile's elevated set. Profile entries
++    # union with the global allowlist — they cannot remove from the
++    # blocklist (additive-only).
++    profile_set = profile_passthrough or set()
++
++    def _is_passthrough_with_profile(key: str) -> bool:
++        return key in profile_set or _is_passthrough(key)
++
+     sanitized: dict[str, str] = {}
+ 
+     for key, value in (base_env or {}).items():
+         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+             continue
+-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
++        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough_with_profile(key):
+             sanitized[key] = value
+ 
+     for key, value in (extra_env or {}).items():
+         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
+             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
+             sanitized[real_key] = value
+-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
++        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough_with_profile(key):
+             sanitized[key] = value
+ 
+     # Per-profile HOME isolation for background processes (same as _make_run_env).

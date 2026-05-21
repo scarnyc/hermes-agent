@@ -1,0 +1,72 @@
+--- a/scripts/distill_goal.py
++++ b/scripts/distill_goal.py
+@@ -41,8 +41,13 @@
+ # synonyms so the loop dispatches on real-world ticket prose. The slice
+ # semantics downstream are unchanged — the FIRST matching heading wins and
+ # the section extends to the next H2.
++# MOL-599 P232: leading whitespace tolerance — jira-cli `--plain` prepends
++# a 2-space visual margin to every Description line. The prior column-0
++# anchor (`^##`) silently rejected indented headings, aborting the symphony
++# loop at exit 3 (`no_ac_section`) before _emit_terminal could run. The
++# `^\s*` prefix matches the established `_AC_LINE_RE` convention below.
+ _AC_HEADING_RE = re.compile(
+-    r"^##\s+(?:"
++    r"^\s*##\s+(?:"
+     r"Acceptance\s+Criteria"
+     r"|Validation(?:\s+Needed)?"
+     r"|Definition\s+of\s+Done"
+@@ -51,8 +56,8 @@
+     r")\s*$",
+     re.IGNORECASE | re.MULTILINE,
+ )
+-_OUT_OF_SCOPE_RE = re.compile(r"^##\s+Out\s+of\s+scope\s*$", re.IGNORECASE | re.MULTILINE)
+-_NEXT_H2_RE = re.compile(r"^##\s+\S", re.MULTILINE)
++_OUT_OF_SCOPE_RE = re.compile(r"^\s*##\s+Out\s+of\s+scope\s*$", re.IGNORECASE | re.MULTILINE)
++_NEXT_H2_RE = re.compile(r"^\s*##\s+\S", re.MULTILINE)
+ _AC_LINE_RE = re.compile(r"^(?:\s*[-*]\s+|\s*\d+\.\s+)\S", re.MULTILINE)
+
+
+@@ -81,15 +86,20 @@
+
+
+ def _extract_body(text: str) -> str:
++    # MOL-599 P232: use lstrip().startswith() so jira-cli `--plain` 2-space
++    # margin doesn't shift H1 detection out from under the slice. Column-0
++    # anchor here was co-blocking with _AC_HEADING_RE — even with the regex
++    # fixed, body_start would still default to 0 against indented input.
+     lines = text.splitlines()
+     first_h1: Optional[int] = None
+     for i, line in enumerate(lines):
+-        if line.startswith("# ") and not line.startswith("## ") and first_h1 is None:
++        stripped = line.lstrip()
++        if stripped.startswith("# ") and not stripped.startswith("## ") and first_h1 is None:
+             first_h1 = i
+             break
+     body_start = (first_h1 + 1) if first_h1 is not None else 0
+     body_lines = []
+     for line in lines[body_start:]:
+-        if line.startswith("## "):
++        if line.lstrip().startswith("## "):
+             break
+         body_lines.append(line)
+     return "\n".join(body_lines).strip("\n")
+--- a/scripts/raw_intent.py
++++ b/scripts/raw_intent.py
+@@ -45,9 +45,14 @@
+
+ LOG_PATH = Path(os.path.expanduser("~/.hermes/logs/raw-intent.jsonl"))
+
+-_AC_HEADING_RE = re.compile(r"^##\s+Acceptance\s+Criteria\s*$", re.IGNORECASE | re.MULTILINE)
+-_NEXT_H2_RE = re.compile(r"^##\s+\S", re.MULTILINE)
+-_TITLE_H1_RE = re.compile(r"^#\s+\S", re.MULTILINE)
++# MOL-599 P232: leading whitespace tolerance — jira-cli `--plain` prepends
++# a 2-space visual margin to every Description line. Without `^\s*`, the
++# AC heading miss returns body-alone from _extract_body_plus_ac, and the
++# sha256 silently certifies a truncated payload across cycles 2/3, breaking
++# the load-bearing anti-drift invariant.
++_AC_HEADING_RE = re.compile(r"^\s*##\s+Acceptance\s+Criteria\s*$", re.IGNORECASE | re.MULTILINE)
++_NEXT_H2_RE = re.compile(r"^\s*##\s+\S", re.MULTILINE)
++_TITLE_H1_RE = re.compile(r"^\s*#\s+\S", re.MULTILINE)
+
+
+ def _log_event(**fields) -> None:

@@ -1,0 +1,78 @@
+--- a/scripts/symphony_bridge.py	2026-05-12 10:09:21
++++ b/scripts/symphony_bridge.py	2026-05-12 10:11:51
+@@ -1024,12 +1024,17 @@
+     # for 600s when spawned by the launchd daemon. (2) -- separator before
+     # the prompt terminates --add-dir's variadic <directories...> consumption
+     # so the prompt isn't eaten as an additional directory path.
++    # P164/MOL-549: explicit --model deepseek-v4-pro bypasses CC's env-var
++    # resolution chain (ANTHROPIC_DEFAULT_OPUS_MODEL was leaking the bracketed
++    # alias "claude-opus-4-7[1m]" to the DS /anthropic endpoint, which rejected
++    # with 404). Pinning the clean DS slug eliminates env-var leakage.
+     argv = [
+         CLAUDE_BIN, "-p", "--bare",
+         "--permission-mode", permission_mode,
+         "--max-turns", str(max_turns),
+         "--output-format", "json",
+         "--no-session-persistence",
++        "--model", "deepseek-v4-pro",
+         "--add-dir", repo_path, "--",
+         prompt,
+     ]
+@@ -1374,8 +1379,12 @@
+     _log(f"Tier 2 failed: {result.get('error', 'unknown')[:150]}")
+ 
+     # Tier 3: Hermes Swarm + DeepSeek
++    # P164/MOL-549: model slug must be "deepseek-v4-pro" (no [1m] suffix).
++    # Probe matrix 2026-05-12 proved the bracketed form silently breaks
++    # `hermes -z`: agent.chat() returns empty, oneshot.py writes nothing,
++    # subprocess exits 0 with empty stdout — no diagnostic surfaces.
+     result = _attempt_tier_with_retry(
+-        lambda: _run_hermes_swarm(prompt, "deepseek", "deepseek-v4-pro[1m]",
++        lambda: _run_hermes_swarm(prompt, "deepseek", "deepseek-v4-pro",
+                                   repo_path, timeout_secs, tier=3),
+         tier_num=3, phase_name=phase_name,
+         tracker=tracker, tier_timeout=timeout_secs,
+@@ -1430,6 +1439,12 @@
+     if result["success"]:
+         if plan_file.exists() and plan_file.stat().st_size > 100:
+             _log(f"Phase 1 OK: plan written ({plan_file.stat().st_size} bytes)")
++            # P164/MOL-549 S5: artifact-path event — Phase 1 reads from disk,
++            # so observability needs the path + size per tick to detect drift.
++            _log_event("phase_artifact_path", phase="planner", key=key,
++                       path=str(plan_file),
++                       size_bytes=plan_file.stat().st_size,
++                       tier=result["tier"])
+             plan_content = plan_file.read_text()
+             return {"ok": True, "plan_content": plan_content, "tier": result["tier"]}
+         else:
+@@ -1472,6 +1487,15 @@
+     verdict_match = re.search(r"VERDICT:\s*(SHIP IT|REVISE|RETHINK)", output)
+     verdict = verdict_match.group(1) if verdict_match else None
+ 
++    # P164/MOL-549 S5: exit=0 + empty output is the signature of the model-slug
++    # silent-fail bug (and of any future "agent ran but emitted nothing" class).
++    # Emit a distinct event so the next instance surfaces on day 1 instead of
++    # after a full S6 dispatch.
++    if result["success"] and not output:
++        _log_event("phase_empty_output_anomaly", phase="skeptic",
++                   key=key, tier=result["tier"],
++                   hint="exit=0 but stdout empty — check model slug + agent prompt")
++
+     _log(f"Phase 2 verdict: {verdict or 'MISSING'}")
+     return {"ok": True, "verdict": verdict, "output": output,
+             "tier": result["tier"]}
+@@ -1507,6 +1531,14 @@
+     pr_match = re.search(r"PR_NUM=(\d+)", output)
+     pr_num = pr_match.group(1) if pr_match else None
+ 
++    # P164/MOL-549 S5: empty-output anomaly logging — same rationale as
++    # phase_skeptic above. exit=0 + empty stdout is the model-slug silent-fail
++    # signature; emit a distinct event for early surfacing of future regressions.
++    if result["success"] and not output:
++        _log_event("phase_empty_output_anomaly", phase="builder",
++                   key=key, tier=result["tier"],
++                   hint="exit=0 but stdout empty — check model slug + agent prompt")
++
+     if result["success"] and pr_num:
+         _log(f"Phase 3 OK: PR #{pr_num} (tier {result['tier']})")
+         return {"ok": True, "pr_num": pr_num, "output": output,

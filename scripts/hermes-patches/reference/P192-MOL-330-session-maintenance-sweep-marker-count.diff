@@ -1,0 +1,28 @@
+--- /tmp/pre-P192/session_maintenance_sweep.py	2026-05-19 09:13:10
++++ /Users/wills_mac_mini/.hermes/scripts/session_maintenance_sweep.py	2026-05-19 09:07:20
+@@ -89,12 +89,25 @@
+     return True
+ 
+ 
++def _count_pending_markers() -> int:
++    """P192/MOL-330: defensive observability — count pending markers at run
++    start so cron output always carries the backlog signal even if downstream
++    queries fail. Pre-P192 the sweep produced no signal when the LLM short-
++    circuited with [SILENT], leaving operators blind to existing backlog."""
++    try:
++        return sum(1 for _ in _MARKER_DIR.glob("maintenance-pending-*.json"))
++    except OSError:
++        return -1
+ 
++
+ def main() -> int:
+     if not _STATE_DB.exists():
+         print(f"ERROR: {_STATE_DB} does not exist", file=sys.stderr)
+         return 2
+ 
++    pending_at_start = _count_pending_markers()
++    print(f"pending_markers_at_start={pending_at_start}")
++
+     cutoff = time.time() - (_LOOKBACK_HOURS * 3600)
+     print(f"db={_STATE_DB}")
+     print(f"marker_dir={_MARKER_DIR}")

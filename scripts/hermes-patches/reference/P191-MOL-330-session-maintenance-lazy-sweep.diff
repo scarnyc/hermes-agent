@@ -1,0 +1,153 @@
+--- /tmp/pre-P191/__init__.py	2026-05-19 09:11:20
++++ /Users/wills_mac_mini/.hermes/plugins/session-maintenance/__init__.py	2026-05-19 09:12:17
+@@ -279,6 +279,141 @@
+     except Exception as exc:
+         logger.error(
+             "[P190/MOL-330] on_session_start failed (fail-open): %s (%s)",
++            exc, type(exc).__name__,
++        )
++
++
++# P191/MOL-330: lazy-sweep reconciler.
++# Programmatic complement to P189's LLM-prompt consumer (which prepends
++# instructions to the next interactive session). The LLM path runs the
++# diary → revise-context → remember chain end-to-end; this Python callback
++# handles only the bookkeeping the LLM can't see:
++#   - stale claim files (`processing-<sid>.<pid>.json`) left behind by
++#     crashed gateway processes → renamed back to `maintenance-pending-*`
++#     after `_LAZY_STALE_CLAIM_SECS` so a future chain can pick them up.
++#   - orphan markers (a `maintenance-pending-*.json` whose session_id is
++#     already in `maintenance_runs`) → deleted (the chain already ran but
++#     the marker survived a crash mid-cleanup).
++#
++# Architectural note: Hermes skills are LLM-orchestrated markdown templates,
++# not Python callables — full chain execution from a plugin callback is not
++# architecturally available. The LLM (cron or interactive session) is the
++# only consumer that can actually run diary/revise-context/remember; P189
++# handles the interactive case, P192 hardens the cron case.
++_LAZY_STALE_CLAIM_SECS = 3600  # 1h — claims older than this are crashed
++_LAZY_AUDIT_LOG = Path(os.environ.get(
++    "HERMES_LOGS_DIR", str(Path.home() / ".hermes" / "logs")
++)) / "session-maintenance-lazy-sweep.jsonl"
++
++
++def _append_lazy_audit(record: dict) -> None:
++    try:
++        _LAZY_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
++        with _LAZY_AUDIT_LOG.open("a") as fh:
++            fh.write(json.dumps(record) + "\n")
++    except OSError as exc:
++        logger.warning("[P191/MOL-330] lazy-sweep audit write failed: %s", exc)
++
++
++def _reconcile_stale_claims() -> int:
++    """Rename processing-*.json older than _LAZY_STALE_CLAIM_SECS back to
++    maintenance-pending-*.json so a future LLM consumer can drain them.
++    Returns the number of claims recovered."""
++    recovered = 0
++    now = time.time()
++    try:
++        candidates = list(_MARKER_DIR.glob("processing-*.json"))
++    except OSError:
++        return 0
++    for claim in candidates:
++        try:
++            age = now - claim.stat().st_mtime
++        except OSError:
++            continue
++        if age < _LAZY_STALE_CLAIM_SECS:
++            continue
++        # processing-<sid>.<pid>.json → maintenance-pending-<sid>.json
++        stem = claim.name[len("processing-"):-len(".json")]  # "<sid>.<pid>"
++        sid = stem.rsplit(".", 1)[0] if "." in stem else stem
++        target = _MARKER_DIR / f"maintenance-pending-{sid}.json"
++        if target.exists():
++            # The original marker reappeared; the stale claim is redundant.
++            try:
++                claim.unlink()
++            except OSError:
++                continue
++            recovered += 1
++            continue
++        try:
++            os.rename(claim, target)
++        except OSError as exc:
++            logger.warning("[P191/MOL-330] rename %s → %s failed: %s", claim, target, exc)
++            continue
++        recovered += 1
++    return recovered
++
++
++def _reconcile_orphan_markers() -> int:
++    """Delete maintenance-pending-*.json whose session_id is already in
++    maintenance_runs. Returns the number of orphans deleted."""
++    if not _STATE_DB.exists():
++        return 0
++    try:
++        candidates = list(_MARKER_DIR.glob("maintenance-pending-*.json"))
++    except OSError:
++        return 0
++    if not candidates:
++        return 0
++    deleted = 0
++    try:
++        conn = sqlite3.connect(str(_STATE_DB), timeout=5)
++    except sqlite3.Error:
++        return 0
++    try:
++        for marker in candidates:
++            sid = marker.name[len("maintenance-pending-"):-len(".json")]
++            try:
++                row = conn.execute(
++                    "SELECT 1 FROM maintenance_runs WHERE session_id = ?", (sid,)
++                ).fetchone()
++            except sqlite3.Error:
++                continue
++            if row is None:
++                continue
++            try:
++                marker.unlink()
++            except OSError:
++                continue
++            deleted += 1
++    finally:
++        conn.close()
++    return deleted
++
++
++def lazy_sweep_at_session_start(**kwargs) -> None:
++    """Programmatic orphan-reconciliation at session start — fail-open.
++
++    Race-guard: rename is atomic on POSIX. Concurrent gateways executing
++    `_reconcile_stale_claims` see the loser ENOENT and move on. Concurrent
++    `_reconcile_orphan_markers` deletes are idempotent (second unlink raises
++    OSError which the loop swallows)."""
++    try:
++        recovered = _reconcile_stale_claims()
++        deleted = _reconcile_orphan_markers()
++        if recovered or deleted:
++            _append_lazy_audit({
++                "ts": time.time(),
++                "recovered_claims": recovered,
++                "deleted_orphans": deleted,
++                "session_id": kwargs.get("session_id"),
++            })
++            logger.info(
++                "[P191/MOL-330] lazy-sweep: recovered=%d deleted=%d",
++                recovered, deleted,
++            )
++    except Exception as exc:
++        logger.error(
++            "[P191/MOL-330] lazy_sweep_at_session_start failed (fail-open): %s (%s)",
+             exc, type(exc).__name__,
+         )
+ 
+@@ -288,3 +423,8 @@
+     ctx.register_hook("on_session_finalize", on_session_finalize)
+     # P190/MOL-330: pileup alarm fires at session start (throttled).
+     ctx.register_hook("on_session_start", on_session_start)
++    # P191/MOL-330: lazy-sweep reconciler fires at session start.
++    # Plugin loader (~/.hermes/hermes-agent/hermes_cli/plugins.py:557) uses
++    # setdefault(hook, []).append(cb), so two callbacks for the same hook
++    # both fire — order is registration order.
++    ctx.register_hook("on_session_start", lazy_sweep_at_session_start)

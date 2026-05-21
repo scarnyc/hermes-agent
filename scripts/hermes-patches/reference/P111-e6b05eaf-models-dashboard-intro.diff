@@ -1,0 +1,723 @@
+commit e6b05eaf6398aed80c3a4022b7bfebd66f195426
+Author: Alex Yates <43525405+yatesjalex@users.noreply.github.com>
+Date:   Wed Apr 29 20:34:22 2026 -0700
+
+    feat: add Models dashboard tab with rich per-model analytics
+    
+    - New /models page in left nav (after Analytics)
+    - New /api/analytics/models endpoint with per-model token/cost/session
+      breakdown, cache read/reasoning tokens, tool calls, avg tokens/session,
+      and capabilities from models.dev (vision/tools/reasoning/context window)
+    - Model cards with stacked token distribution bar, capability badges,
+      provider badges, cost info, and relative time
+    - Summary stats bar (models used, total tokens, est. cost, sessions)
+    - Period selector (7d/30d/90d) with refresh
+    - i18n support (en + zh)
+
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index a398f3cc2..eed817099 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -2299,6 +2299,99 @@ async def get_usage_analytics(days: int = 30):
+         db.close()
+ 
+ 
++@app.get("/api/analytics/models")
++async def get_models_analytics(days: int = 30):
++    """Rich per-model analytics for the Models dashboard page.
++
++    Returns token/cost/session breakdown per model plus capability metadata
++    from models.dev (context window, vision, tools, reasoning, etc.).
++    """
++    from hermes_state import SessionDB
++
++    db = SessionDB()
++    try:
++        cutoff = time.time() - (days * 86400)
++
++        cur = db._conn.execute("""
++            SELECT model,
++                   billing_provider,
++                   SUM(input_tokens) as input_tokens,
++                   SUM(output_tokens) as output_tokens,
++                   SUM(cache_read_tokens) as cache_read_tokens,
++                   SUM(reasoning_tokens) as reasoning_tokens,
++                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
++                   COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
++                   COUNT(*) as sessions,
++                   SUM(COALESCE(api_call_count, 0)) as api_calls,
++                   SUM(tool_call_count) as tool_calls,
++                   MAX(started_at) as last_used_at,
++                   AVG(input_tokens + output_tokens) as avg_tokens_per_session
++            FROM sessions WHERE started_at > ? AND model IS NOT NULL
++            GROUP BY model, billing_provider
++            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
++        """, (cutoff,))
++        rows = [dict(r) for r in cur.fetchall()]
++
++        models = []
++        for row in rows:
++            provider = row.get("billing_provider") or ""
++            model_name = row["model"]
++            caps = {}
++            try:
++                from agent.models_dev import get_model_capabilities
++                mc = get_model_capabilities(provider=provider, model=model_name)
++                if mc is not None:
++                    caps = {
++                        "supports_tools": mc.supports_tools,
++                        "supports_vision": mc.supports_vision,
++                        "supports_reasoning": mc.supports_reasoning,
++                        "context_window": mc.context_window,
++                        "max_output_tokens": mc.max_output_tokens,
++                        "model_family": mc.model_family,
++                    }
++            except Exception:
++                pass
++
++            models.append({
++                "model": model_name,
++                "provider": provider,
++                "input_tokens": row["input_tokens"],
++                "output_tokens": row["output_tokens"],
++                "cache_read_tokens": row["cache_read_tokens"],
++                "reasoning_tokens": row["reasoning_tokens"],
++                "estimated_cost": row["estimated_cost"],
++                "actual_cost": row["actual_cost"],
++                "sessions": row["sessions"],
++                "api_calls": row["api_calls"],
++                "tool_calls": row["tool_calls"],
++                "last_used_at": row["last_used_at"],
++                "avg_tokens_per_session": row["avg_tokens_per_session"],
++                "capabilities": caps,
++            })
++
++        totals_cur = db._conn.execute("""
++            SELECT COUNT(DISTINCT model) as distinct_models,
++                   SUM(input_tokens) as total_input,
++                   SUM(output_tokens) as total_output,
++                   SUM(cache_read_tokens) as total_cache_read,
++                   SUM(reasoning_tokens) as total_reasoning,
++                   COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
++                   COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
++                   COUNT(*) as total_sessions,
++                   SUM(COALESCE(api_call_count, 0)) as total_api_calls
++            FROM sessions WHERE started_at > ? AND model IS NOT NULL
++        """, (cutoff,))
++        totals = dict(totals_cur.fetchone())
++
++        return {
++            "models": models,
++            "totals": totals,
++            "period_days": days,
++        }
++    finally:
++        db.close()
++
++
+ # ---------------------------------------------------------------------------
+ # /api/pty — PTY-over-WebSocket bridge for the dashboard "Chat" tab.
+ #
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 3acb886d9..4be497acb 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -20,6 +20,7 @@ import {
+   BookOpen,
+   Clock,
+   Code,
++  Cpu,
+   Database,
+   Download,
+   Eye,
+@@ -61,6 +62,7 @@ import EnvPage from "@/pages/EnvPage";
+ import SessionsPage from "@/pages/SessionsPage";
+ import LogsPage from "@/pages/LogsPage";
+ import AnalyticsPage from "@/pages/AnalyticsPage";
++import ModelsPage from "@/pages/ModelsPage";
+ import CronPage from "@/pages/CronPage";
+ import SkillsPage from "@/pages/SkillsPage";
+ import ChatPage from "@/pages/ChatPage";
+@@ -96,6 +98,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
+   "/": RootRedirect,
+   "/sessions": SessionsPage,
+   "/analytics": AnalyticsPage,
++  "/models": ModelsPage,
+   "/logs": LogsPage,
+   "/cron": CronPage,
+   "/skills": SkillsPage,
+@@ -125,6 +128,12 @@ const BUILTIN_NAV_REST: NavItem[] = [
+     label: "Analytics",
+     icon: BarChart3,
+   },
++  {
++    path: "/models",
++    labelKey: "models",
++    label: "Models",
++    icon: Cpu,
++  },
+   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
+   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
+   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
+@@ -142,6 +151,7 @@ const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
+   Activity,
+   BarChart3,
+   Clock,
++  Cpu,
+   FileText,
+   KeyRound,
+   MessageSquare,
+diff --git a/web/src/i18n/en.ts b/web/src/i18n/en.ts
+index bf8b34356..9fed7cb83 100644
+--- a/web/src/i18n/en.ts
++++ b/web/src/i18n/en.ts
+@@ -74,6 +74,7 @@ export const en: Translations = {
+       documentation: "Documentation",
+       keys: "Keys",
+       logs: "Logs",
++      models: "Models",
+       sessions: "Sessions",
+       skills: "Skills",
+     },
+@@ -172,6 +173,18 @@ export const en: Translations = {
+     inOut: "{input} in / {output} out",
+   },
+ 
++  models: {
++    modelsUsed: "Models Used",
++    estimatedCost: "Est. Cost",
++    tokens: "tokens",
++    sessions: "sessions",
++    avgPerSession: "avg/session",
++    apiCalls: "API calls",
++    toolCalls: "tool calls",
++    noModelsData: "No model usage data for this period",
++    startSession: "Start a session to see model data here",
++  },
++
+   logs: {
+     title: "Logs",
+     autoRefresh: "Auto-refresh",
+diff --git a/web/src/i18n/types.ts b/web/src/i18n/types.ts
+index 718115e97..04c67cdad 100644
+--- a/web/src/i18n/types.ts
++++ b/web/src/i18n/types.ts
+@@ -74,6 +74,7 @@ export interface Translations {
+       documentation: string;
+       keys: string;
+       logs: string;
++      models: string;
+       sessions: string;
+       skills: string;
+     };
+@@ -174,6 +175,19 @@ export interface Translations {
+     inOut: string;
+   };
+ 
++  // ── Models page ──
++  models: {
++    modelsUsed: string;
++    estimatedCost: string;
++    tokens: string;
++    sessions: string;
++    avgPerSession: string;
++    apiCalls: string;
++    toolCalls: string;
++    noModelsData: string;
++    startSession: string;
++  };
++
+   // ── Logs page ──
+   logs: {
+     title: string;
+diff --git a/web/src/i18n/zh.ts b/web/src/i18n/zh.ts
+index ff8f3a279..caec8c861 100644
+--- a/web/src/i18n/zh.ts
++++ b/web/src/i18n/zh.ts
+@@ -73,6 +73,7 @@ export const zh: Translations = {
+       documentation: "文档",
+       keys: "密钥",
+       logs: "日志",
++      models: "模型",
+       sessions: "会话",
+       skills: "技能",
+     },
+@@ -170,6 +171,18 @@ export const zh: Translations = {
+     inOut: "输入 {input} / 输出 {output}",
+   },
+ 
++  models: {
++    modelsUsed: "使用模型数",
++    estimatedCost: "预估费用",
++    tokens: "Token",
++    sessions: "会话",
++    avgPerSession: "平均/会话",
++    apiCalls: "API 调用",
++    toolCalls: "工具调用",
++    noModelsData: "该时间段暂无模型使用数据",
++    startSession: "开始会话后将在此显示模型数据",
++  },
++
+   logs: {
+     title: "日志",
+     autoRefresh: "自动刷新",
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index b4790f267..4d101a3d9 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -63,6 +63,8 @@ export const api = {
+   },
+   getAnalytics: (days: number) =>
+     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
++  getModelsAnalytics: (days: number) =>
++    fetchJSON<ModelsAnalyticsResponse>(`/api/analytics/models?days=${days}`),
+   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
+   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
+   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
+@@ -370,6 +372,46 @@ export interface AnalyticsResponse {
+   };
+ }
+ 
++export interface ModelsAnalyticsModelEntry {
++  model: string;
++  provider: string;
++  input_tokens: number;
++  output_tokens: number;
++  cache_read_tokens: number;
++  reasoning_tokens: number;
++  estimated_cost: number;
++  actual_cost: number;
++  sessions: number;
++  api_calls: number;
++  tool_calls: number;
++  last_used_at: number;
++  avg_tokens_per_session: number;
++  capabilities: {
++    supports_tools?: boolean;
++    supports_vision?: boolean;
++    supports_reasoning?: boolean;
++    context_window?: number;
++    max_output_tokens?: number;
++    model_family?: string;
++  };
++}
++
++export interface ModelsAnalyticsResponse {
++  models: ModelsAnalyticsModelEntry[];
++  totals: {
++    distinct_models: number;
++    total_input: number;
++    total_output: number;
++    total_cache_read: number;
++    total_reasoning: number;
++    total_estimated_cost: number;
++    total_actual_cost: number;
++    total_sessions: number;
++    total_api_calls: number;
++  };
++  period_days: number;
++}
++
+ export interface CronJob {
+   id: string;
+   name?: string;
+diff --git a/web/src/pages/ModelsPage.tsx b/web/src/pages/ModelsPage.tsx
+new file mode 100644
+index 000000000..4e1880e54
+--- /dev/null
++++ b/web/src/pages/ModelsPage.tsx
+@@ -0,0 +1,394 @@
++import { useCallback, useEffect, useLayoutEffect, useState } from "react";
++import {
++  Brain,
++  Cpu,
++  DollarSign,
++  Eye,
++  RefreshCw,
++  Wrench,
++  Zap,
++} from "lucide-react";
++import { api } from "@/lib/api";
++import type { ModelsAnalyticsModelEntry, ModelsAnalyticsResponse } from "@/lib/api";
++import { timeAgo } from "@/lib/utils";
++import { formatTokenCount } from "@/lib/format";
++import { Button, Spinner, Stats } from "@nous-research/ui";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { Badge } from "@nous-research/ui";
++import { usePageHeader } from "@/contexts/usePageHeader";
++import { useI18n } from "@/i18n";
++import { PluginSlot } from "@/plugins";
++
++const PERIODS = [
++  { label: "7d", days: 7 },
++  { label: "30d", days: 30 },
++  { label: "90d", days: 90 },
++] as const;
++
++function formatTokens(n: number): string {
++  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
++  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
++  return String(n);
++}
++
++function formatCost(n: number): string {
++  if (n >= 1) return `$${n.toFixed(2)}`;
++  if (n >= 0.01) return `$${n.toFixed(3)}`;
++  if (n > 0) return `$${n.toFixed(4)}`;
++  return "$0";
++}
++
++/** Short model name: strip provider prefix like "openrouter/" or "anthropic/". */
++function shortModelName(model: string): string {
++  const slashIdx = model.indexOf("/");
++  if (slashIdx > 0 && slashIdx < 20) return model.slice(slashIdx + 1);
++  return model;
++}
++
++/** Extract provider from model string like "openrouter/gemini-2.5-pro" → "openrouter" */
++function modelProvider(model: string, fallback?: string): string {
++  const slashIdx = model.indexOf("/");
++  if (slashIdx > 0 && slashIdx < 20) return model.slice(0, slashIdx);
++  return fallback || "";
++}
++
++function TokenBar({
++  input,
++  output,
++  cacheRead,
++  reasoning,
++}: {
++  input: number;
++  output: number;
++  cacheRead: number;
++  reasoning: number;
++}) {
++  const total = input + output + cacheRead + reasoning;
++  if (total === 0) return null;
++
++  const segments = [
++    { value: cacheRead, color: "bg-blue-400/60", label: "Cache Read" },
++    { value: reasoning, color: "bg-purple-400/60", label: "Reasoning" },
++    { value: input, color: "bg-[#ffe6cb]/70", label: "Input" },
++    { value: output, color: "bg-emerald-500/70", label: "Output" },
++  ].filter((s) => s.value > 0);
++
++  return (
++    <div className="space-y-1">
++      <div className="flex h-2 w-full overflow-hidden rounded-sm bg-muted/30">
++        {segments.map((s, i) => (
++          <div
++            key={i}
++            className={`${s.color} transition-all duration-300`}
++            style={{ width: `${(s.value / total) * 100}%` }}
++          />
++        ))}
++      </div>
++      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
++        {segments.map((s, i) => (
++          <span key={i} className="flex items-center gap-1">
++            <span className={`inline-block h-1.5 w-1.5 rounded-full ${s.color}`} />
++            {s.label} {formatTokens(s.value)}
++          </span>
++        ))}
++      </div>
++    </div>
++  );
++}
++
++function CapabilityBadges({
++  capabilities,
++}: {
++  capabilities: ModelsAnalyticsModelEntry["capabilities"];
++}) {
++  const hasAny =
++    capabilities.supports_tools ||
++    capabilities.supports_vision ||
++    capabilities.supports_reasoning ||
++    capabilities.model_family;
++  if (!hasAny) return null;
++
++  return (
++    <div className="flex flex-wrap items-center gap-1.5">
++      {capabilities.supports_tools && (
++        <span className="inline-flex items-center gap-1 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
++          <Wrench className="h-2.5 w-2.5" /> Tools
++        </span>
++      )}
++      {capabilities.supports_vision && (
++        <span className="inline-flex items-center gap-1 bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
++          <Eye className="h-2.5 w-2.5" /> Vision
++        </span>
++      )}
++      {capabilities.supports_reasoning && (
++        <span className="inline-flex items-center gap-1 bg-purple-500/10 px-1.5 py-0.5 text-[10px] font-medium text-purple-600 dark:text-purple-400">
++          <Brain className="h-2.5 w-2.5" /> Reasoning
++        </span>
++      )}
++      {capabilities.model_family && (
++        <span className="inline-flex items-center bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
++          {capabilities.model_family}
++        </span>
++      )}
++    </div>
++  );
++}
++
++function ModelCard({
++  entry,
++  rank,
++}: {
++  entry: ModelsAnalyticsModelEntry;
++  rank: number;
++}) {
++  const { t } = useI18n();
++  const provider = entry.provider || modelProvider(entry.model);
++  const totalTokens = entry.input_tokens + entry.output_tokens;
++  const caps = entry.capabilities;
++
++  return (
++    <Card>
++      <CardHeader className="pb-3">
++        <div className="flex items-start justify-between gap-2">
++          <div className="min-w-0 flex-1">
++            <div className="flex items-center gap-2">
++              <span className="text-muted-foreground/50 text-xs font-mono">
++                #{rank}
++              </span>
++              <CardTitle className="text-sm font-mono-ui truncate">
++                {shortModelName(entry.model)}
++              </CardTitle>
++            </div>
++            <div className="flex items-center gap-2 mt-1">
++              {provider && (
++                <Badge tone="secondary" className="text-[9px]">
++                  {provider}
++                </Badge>
++              )}
++              {caps.context_window && caps.context_window > 0 && (
++                <span className="text-[10px] text-muted-foreground">
++                  {formatTokenCount(caps.context_window)} ctx
++                </span>
++              )}
++              {caps.max_output_tokens && caps.max_output_tokens > 0 && (
++                <span className="text-[10px] text-muted-foreground">
++                  {formatTokenCount(caps.max_output_tokens)} out
++                </span>
++              )}
++            </div>
++          </div>
++          <div className="text-right shrink-0">
++            <div className="text-xs font-mono font-semibold">
++              {formatTokens(totalTokens)}
++            </div>
++            <div className="text-[10px] text-muted-foreground">
++              {t.models.tokens}
++            </div>
++          </div>
++        </div>
++      </CardHeader>
++      <CardContent className="space-y-3 pt-0">
++        <TokenBar
++          input={entry.input_tokens}
++          output={entry.output_tokens}
++          cacheRead={entry.cache_read_tokens}
++          reasoning={entry.reasoning_tokens}
++        />
++
++        <div className="grid grid-cols-3 gap-2 text-xs">
++          <div className="text-center">
++            <div className="font-mono font-semibold">{entry.sessions}</div>
++            <div className="text-[10px] text-muted-foreground">
++              {t.models.sessions}
++            </div>
++          </div>
++          <div className="text-center">
++            <div className="font-mono font-semibold">
++              {formatTokens(entry.avg_tokens_per_session)}
++            </div>
++            <div className="text-[10px] text-muted-foreground">
++              {t.models.avgPerSession}
++            </div>
++          </div>
++          <div className="text-center">
++            <div className="font-mono font-semibold">
++              {entry.api_calls > 0 ? formatTokens(entry.api_calls) : "—"}
++            </div>
++            <div className="text-[10px] text-muted-foreground">
++              {t.models.apiCalls}
++            </div>
++          </div>
++        </div>
++
++        <div className="flex items-center justify-between text-[10px] text-muted-foreground border-t border-border/30 pt-2">
++          <div className="flex items-center gap-3">
++            {entry.estimated_cost > 0 && (
++              <span className="flex items-center gap-0.5">
++                <DollarSign className="h-2.5 w-2.5" />
++                {formatCost(entry.estimated_cost)}
++              </span>
++            )}
++            {entry.tool_calls > 0 && (
++              <span className="flex items-center gap-0.5">
++                <Zap className="h-2.5 w-2.5" />
++                {entry.tool_calls} {t.models.toolCalls}
++              </span>
++            )}
++          </div>
++          {entry.last_used_at > 0 && (
++            <span>{timeAgo(entry.last_used_at)}</span>
++          )}
++        </div>
++
++        <CapabilityBadges capabilities={entry.capabilities} />
++      </CardContent>
++    </Card>
++  );
++}
++
++export default function ModelsPage() {
++  const [days, setDays] = useState(30);
++  const [data, setData] = useState<ModelsAnalyticsResponse | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState<string | null>(null);
++  const { t } = useI18n();
++  const { setAfterTitle, setEnd } = usePageHeader();
++
++  const load = useCallback(() => {
++    setLoading(true);
++    setError(null);
++    api
++      .getModelsAnalytics(days)
++      .then(setData)
++      .catch((err) => setError(String(err)))
++      .finally(() => setLoading(false));
++  }, [days]);
++
++  useLayoutEffect(() => {
++    const periodLabel =
++      PERIODS.find((p) => p.days === days)?.label ?? `${days}d`;
++    setAfterTitle(
++      <span className="flex items-center gap-2">
++        {loading && <Spinner className="shrink-0 text-base text-primary" />}
++        <Badge tone="secondary" className="text-[10px]">
++          {periodLabel}
++        </Badge>
++      </span>,
++    );
++    setEnd(
++      <div className="flex w-full min-w-0 flex-wrap items-center justify-end gap-2 sm:gap-2">
++        <div className="flex flex-wrap items-center gap-1.5">
++          {PERIODS.map((p) => (
++            <Button
++              key={p.label}
++              type="button"
++              size="sm"
++              outlined={days !== p.days}
++              onClick={() => setDays(p.days)}
++            >
++              {p.label}
++            </Button>
++          ))}
++        </div>
++        <Button
++          type="button"
++          size="sm"
++          outlined
++          onClick={load}
++          disabled={loading}
++          prefix={loading ? <Spinner /> : <RefreshCw />}
++        >
++          {t.common.refresh}
++        </Button>
++      </div>,
++    );
++    return () => {
++      setAfterTitle(null);
++      setEnd(null);
++    };
++  }, [days, loading, load, setAfterTitle, setEnd, t.common.refresh]);
++
++  useEffect(() => {
++    load();
++  }, [load]);
++
++  return (
++    <div className="flex flex-col gap-6">
++      <PluginSlot name="models:top" />
++      {loading && !data && (
++        <div className="flex items-center justify-center py-24">
++          <Spinner className="text-2xl text-primary" />
++        </div>
++      )}
++
++      {error && (
++        <Card>
++          <CardContent className="py-6">
++            <p className="text-sm text-destructive text-center">{error}</p>
++          </CardContent>
++        </Card>
++      )}
++
++      {data && (
++        <>
++          <Card>
++            <CardContent className="py-6">
++              <Stats
++                items={[
++                  {
++                    label: t.models.modelsUsed,
++                    value: String(data.totals.distinct_models),
++                  },
++                  {
++                    label: t.analytics.totalTokens,
++                    value: formatTokens(
++                      data.totals.total_input + data.totals.total_output,
++                    ),
++                  },
++                  {
++                    label: t.analytics.input,
++                    value: formatTokens(data.totals.total_input),
++                  },
++                  {
++                    label: t.analytics.output,
++                    value: formatTokens(data.totals.total_output),
++                  },
++                  {
++                    label: t.models.estimatedCost,
++                    value: formatCost(data.totals.total_estimated_cost),
++                  },
++                  {
++                    label: t.analytics.totalSessions,
++                    value: String(data.totals.total_sessions),
++                  },
++                ]}
++              />
++            </CardContent>
++          </Card>
++
++          {data.models.length > 0 ? (
++            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
++              {data.models.map((m, i) => (
++                <ModelCard key={`${m.model}:${m.provider}`} entry={m} rank={i + 1} />
++              ))}
++            </div>
++          ) : (
++            <Card>
++              <CardContent className="py-12">
++                <div className="flex flex-col items-center text-muted-foreground">
++                  <Cpu className="h-8 w-8 mb-3 opacity-40" />
++                  <p className="text-sm font-medium">{t.models.noModelsData}</p>
++                  <p className="text-xs mt-1 text-muted-foreground/60">
++                    {t.models.startSession}
++                  </p>
++                </div>
++              </CardContent>
++            </Card>
++          )}
++        </>
++      )}
++
++      <PluginSlot name="models:bottom" />
++    </div>
++  );
++}
