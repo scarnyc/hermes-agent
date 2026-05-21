@@ -1,0 +1,57 @@
+commit 51dc98d314000d7b326b341bb2b95f23ac6814d4
+Author: thchen <pama0227@gmail.com>
+Date:   Sat Apr 25 13:02:27 2026 +0000
+
+    fix(agent): detect Qwen3/Ollama inline thinking after tool calls
+    
+    Ollama serves Qwen3 thinking inside the content field as <think>...</think>
+    blocks rather than in the API-level reasoning_content field.  This means
+    _has_structured was False for these responses, so an empty-looking reply
+    after a tool call triggered the nudge instead of the prefill continuation,
+    causing a double-response loop.
+    
+    Fix: detect <think>/<thinking>/<reasoning> in final_response and:
+      1. Skip the nudge when thinking is present (model is still reasoning)
+      2. Include _has_inline_thinking in _has_structured so prefill kicks in
+
+diff --git a/run_agent.py b/run_agent.py
+index 482878019..6d604f9b5 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -13438,9 +13438,22 @@ class AIAgent:
+                             m.get("role") == "tool"
+                             for m in messages[-5:]  # check recent messages
+                         )
++                        # Detect Qwen3/Ollama-style in-content thinking blocks.
++                        # Ollama puts <think> in the content field (not in
++                        # reasoning_content), so _has_structured below would
++                        # miss it.  We check here so thinking-only responses
++                        # after tool calls route to prefill instead of nudge.
++                        _has_inline_thinking = bool(
++                            re.search(
++                                r'<think>|<thinking>|<reasoning>',
++                                final_response or "",
++                                re.IGNORECASE,
++                            )
++                        )
+                         if (
+                             _prior_was_tool
+                             and not getattr(self, "_post_tool_empty_retried", False)
++                            and not _has_inline_thinking  # thinking model still working — let prefill handle
+                         ):
+                             self._post_tool_empty_retried = True
+                             # Clear stale narration so it doesn't resurface
+@@ -13480,10 +13493,13 @@ class AIAgent:
+                         # continue — the model will see its own reasoning
+                         # on the next turn and produce the text portion.
+                         # Inspired by clawdbot's "incomplete-text" recovery.
++                        # Also covers Qwen3/Ollama in-content <think> blocks
++                        # (detected above as _has_inline_thinking).
+                         _has_structured = bool(
+                             getattr(assistant_message, "reasoning", None)
+                             or getattr(assistant_message, "reasoning_content", None)
+                             or getattr(assistant_message, "reasoning_details", None)
++                            or _has_inline_thinking
+                         )
+                         if _has_structured and self._thinking_prefill_retries < 2:
+                             self._thinking_prefill_retries += 1

@@ -1,0 +1,91 @@
+--- /tmp/pre-P190/__init__.py	2026-05-19 08:50:10
++++ /Users/wills_mac_mini/.hermes/plugins/session-maintenance/__init__.py	2026-05-19 08:46:30
+@@ -203,7 +203,88 @@
+         )
+ 
+ 
++# P190/MOL-330: pileup alarm.
++# Closes the silent-failure surface that let the May 18 marker sit unconsumed
++# through a 03:00 sweep. Fires on every session start (throttled to one alert
++# per `_PILEUP_THROTTLE_SECS` via reused MOL-245/P45-P48 telegram helper).
++# Audit log always writes — operator-side `tail -f` is the secondary check
++# even when Telegram is down.
++_PILEUP_THRESHOLD = 3
++_PILEUP_THROTTLE_SECS = 6 * 3600
++_PILEUP_AUDIT_LOG = Path(os.environ.get(
++    "HERMES_LOGS_DIR", str(Path.home() / ".hermes" / "logs")
++)) / "session-maintenance-pileup.jsonl"
+ 
++
++def _count_pending_markers() -> int:
++    try:
++        return sum(
++            1 for _ in _MARKER_DIR.glob("maintenance-pending-*.json")
++        )
++    except OSError:
++        return 0
++
++
++def _append_pileup_audit(record: dict) -> None:
++    try:
++        _PILEUP_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
++        with _PILEUP_AUDIT_LOG.open("a") as fh:
++            fh.write(json.dumps(record) + "\n")
++    except OSError as exc:
++        logger.warning("[P190/MOL-330] pileup audit write failed: %s", exc)
++
++
++def _send_pileup_alert(marker_count: int) -> str:
++    """Send Telegram alert via the MOL-245/P45-P48 rate-limited helper.
++
++    Returns the helper's status string ('sent' | 'throttled' | 'skipped:...'
++    | 'error:...'). Never raises — caller logs and continues.
++    """
++    try:
++        from tools.runtime_fingerprint import telegram_alert_rate_limited
++    except ImportError as exc:
++        return f"error:import_{exc.__class__.__name__}"
++    message = (
++        f"[Hermes] session-maintenance pileup: {marker_count} pending markers "
++        f"(threshold={_PILEUP_THRESHOLD}). Markers in ~/.hermes/state/. "
++        f"Next interactive session start will surface them via prompt_builder "
++        f"(P189/MOL-330) and run the diary → revise-context → remember chain."
++    )
++    try:
++        return telegram_alert_rate_limited(
++            "session-maint-pileup", message, throttle_seconds=_PILEUP_THROTTLE_SECS,
++        )
++    except Exception as exc:
++        return f"error:{exc.__class__.__name__}"
++
++
++def on_session_start(**kwargs) -> None:
++    """Pileup alarm — fail-open. Throttled inside _send_pileup_alert."""
++    try:
++        marker_count = _count_pending_markers()
++        if marker_count < _PILEUP_THRESHOLD:
++            return
++        status = _send_pileup_alert(marker_count)
++        _append_pileup_audit({
++            "ts": time.time(),
++            "marker_count": marker_count,
++            "threshold": _PILEUP_THRESHOLD,
++            "telegram_status": status,
++            "session_id": kwargs.get("session_id"),
++        })
++        logger.info(
++            "[P190/MOL-330] pileup alarm: markers=%d status=%s",
++            marker_count, status,
++        )
++    except Exception as exc:
++        logger.error(
++            "[P190/MOL-330] on_session_start failed (fail-open): %s (%s)",
++            exc, type(exc).__name__,
++        )
++
++
+ def register(ctx) -> None:
+     """Hermes plugin entry point."""
+     ctx.register_hook("on_session_finalize", on_session_finalize)
++    # P190/MOL-330: pileup alarm fires at session start (throttled).
++    ctx.register_hook("on_session_start", on_session_start)

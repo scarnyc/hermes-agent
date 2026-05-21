@@ -1,0 +1,282 @@
+commit 83c288da01ebe48a64016d744abef166ef98d1fb
+Author: Teknium <127238744+teknium1@users.noreply.github.com>
+Date:   Wed Apr 29 06:35:42 2026 -0700
+
+    fix(anthropic): broaden Kimi thinking-suppression to custom endpoints (#17455)
+    
+    The guard that drops Anthropic's `thinking` kwarg for Kimi endpoints was
+    matched on `https://api.kimi.com/coding` only.  Users configuring a
+    custom Kimi-compatible gateway (or an official Moonshot host) with
+    `api_mode: anthropic_messages` fall through to the generic third-party
+    path, which strips thinking blocks AND still sends
+    `thinking={enabled,...}` → upstream rejects with HTTP 400
+    "reasoning_content is missing in assistant tool call message at index N"
+    on the next request after a tool call.
+    
+    Replace `_is_kimi_coding_endpoint` callers (history replay + thinking
+    kwarg gate) with `_is_kimi_family_endpoint(base_url, model)` that also
+    matches the `api.kimi.com` / `moonshot.ai` / `moonshot.cn` hosts and
+    Kimi/Moonshot family model names (`kimi-`, `moonshot-`, `k1.`, `k2.`,
+    …) for custom / proxied endpoints.  Keeps the UA-header check in
+    `build_anthropic_client` URL-only — the `claude-code/0.1.0` header is
+    an official-Kimi contract.
+    
+    Plumbs optional `model` through `convert_messages_to_anthropic` so
+    the unsigned reasoning_content→thinking block synthesised for Kimi's
+    history validation survives the third-party signature-stripping pass
+    on custom hosts too.
+    
+    Closes #17057.
+
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index 740986203..1b8e13976 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -20,7 +20,7 @@ from pathlib import Path
+ 
+ from hermes_constants import get_hermes_home
+ from typing import Any, Dict, List, Optional, Tuple
+-from utils import normalize_proxy_env_vars
++from utils import base_url_host_matches, normalize_proxy_env_vars
+ 
+ # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
+ # ~220 ms of imports (anthropic.types, anthropic.lib.tools._beta_runner, etc.)
+@@ -365,6 +365,61 @@ def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
+     return normalized.rstrip("/").lower().startswith("https://api.kimi.com/coding")
+ 
+ 
++# Model-name prefixes that identify the Kimi / Moonshot family.  Covers
++# - official slugs: ``kimi-k2.5``, ``kimi_thinking``, ``moonshot-v1-8k``
++# - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``
++# Matched case-insensitively against the post-``normalize_model_name`` form,
++# so a caller's ``provider/vendor/model`` slug is handled the same as a
++# bare name.
++_KIMI_FAMILY_MODEL_PREFIXES = (
++    "kimi-", "kimi_",
++    "moonshot-", "moonshot_",
++    "k1.", "k1-",
++    "k2.", "k2-",
++    "k25", "k2.5",
++)
++
++
++def _model_name_is_kimi_family(model: str | None) -> bool:
++    if not isinstance(model, str):
++        return False
++    m = model.strip().lower()
++    if not m:
++        return False
++    # Strip vendor prefix (e.g. ``moonshotai/kimi-k2.5`` → ``kimi-k2.5``)
++    if "/" in m:
++        m = m.rsplit("/", 1)[-1]
++    return m.startswith(_KIMI_FAMILY_MODEL_PREFIXES)
++
++
++def _is_kimi_family_endpoint(base_url: str | None, model: str | None = None) -> bool:
++    """Return True for any Kimi / Moonshot Anthropic-Messages-speaking endpoint.
++
++    Broader than ``_is_kimi_coding_endpoint`` — matches:
++
++    - Kimi's official ``/coding`` URL (legacy check, preserved)
++    - Any ``api.kimi.com`` / ``moonshot.ai`` / ``moonshot.cn`` host
++    - Custom or proxied endpoints whose *model* name is in the Kimi / Moonshot
++      family (``kimi-*``, ``moonshot-*``, ``k1.*``, ``k2.*``, …).  Users with
++      ``api_mode: anthropic_messages`` on a private gateway fronting Kimi
++      fall into this branch — the upstream still enforces Kimi's thinking
++      semantics (reasoning_content required on every replayed tool-call
++      message) regardless of the gateway's hostname.
++
++    Used to decide whether to drop Anthropic's ``thinking`` kwarg and to
++    preserve unsigned reasoning_content-derived thinking blocks on replay.
++    See hermes-agent#13848, #17057.
++    """
++    if _is_kimi_coding_endpoint(base_url):
++        return True
++    for _domain in ("api.kimi.com", "moonshot.ai", "moonshot.cn"):
++        if base_url_host_matches(base_url or "", _domain):
++            return True
++    if _model_name_is_kimi_family(model):
++        return True
++    return False
++
++
+ def _requires_bearer_auth(base_url: str | None) -> bool:
+     """Return True for Anthropic-compatible providers that require Bearer auth.
+ 
+@@ -1268,6 +1323,7 @@ def _convert_content_to_anthropic(content: Any) -> Any:
+ def convert_messages_to_anthropic(
+     messages: List[Dict],
+     base_url: str | None = None,
++    model: str | None = None,
+ ) -> Tuple[Optional[Any], List[Dict]]:
+     """Convert OpenAI-format messages to Anthropic format.
+ 
+@@ -1279,6 +1335,12 @@ def convert_messages_to_anthropic(
+     endpoint, all thinking block signatures are stripped.  Signatures are
+     Anthropic-proprietary — third-party endpoints cannot validate them and will
+     reject them with HTTP 400 "Invalid signature in thinking block".
++
++    When *model* is provided and matches the Kimi / Moonshot family (or
++    *base_url* is a Kimi / Moonshot host), unsigned thinking blocks
++    synthesised from ``reasoning_content`` are preserved on replayed
++    assistant tool-call messages — Kimi requires the field to exist, even
++    if empty.
+     """
+     system = None
+     result = []
+@@ -1507,7 +1569,7 @@ def convert_messages_to_anthropic(
+     #    cache markers can interfere with signature validation.
+     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
+     _is_third_party = _is_third_party_anthropic_endpoint(base_url)
+-    _is_kimi = _is_kimi_coding_endpoint(base_url)
++    _is_kimi = _is_kimi_family_endpoint(base_url, model)
+ 
+     last_assistant_idx = None
+     for i in range(len(result) - 1, -1, -1):
+@@ -1630,7 +1692,9 @@ def build_anthropic_kwargs(
+     Currently only supported on native Anthropic endpoints (not third-party
+     compatible ones).
+     """
+-    system, anthropic_messages = convert_messages_to_anthropic(messages, base_url=base_url)
++    system, anthropic_messages = convert_messages_to_anthropic(
++        messages, base_url=base_url, model=model
++    )
+     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
+ 
+     model = normalize_model_name(model, preserve_dots=preserve_dots)
+@@ -1736,7 +1800,7 @@ def build_anthropic_kwargs(
+     # silently hides reasoning text that Hermes surfaces in its CLI. We
+     # request "summarized" so the reasoning blocks stay populated — matching
+     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
+-    _is_kimi_coding = _is_kimi_coding_endpoint(base_url)
++    _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
+     if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
+         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
+             effort = str(reasoning_config.get("effort", "medium")).lower()
+diff --git a/tests/agent/test_kimi_coding_anthropic_thinking.py b/tests/agent/test_kimi_coding_anthropic_thinking.py
+index 706f7e0e1..89872cc2f 100644
+--- a/tests/agent/test_kimi_coding_anthropic_thinking.py
++++ b/tests/agent/test_kimi_coding_anthropic_thinking.py
+@@ -94,13 +94,16 @@ class TestKimiCodingSkipsAnthropicThinking:
+         )
+         assert "thinking" in kwargs
+ 
+-    def test_kimi_root_endpoint_unaffected(self) -> None:
+-        """Only the /coding route is special-cased — plain api.kimi.com is not.
+-
+-        ``api.kimi.com`` without ``/coding`` uses the chat_completions transport
+-        (see runtime_provider._detect_api_mode_for_url); build_anthropic_kwargs
+-        should never see it, but if it somehow does we should not suppress
+-        thinking there — that path has different semantics.
++    def test_kimi_root_endpoint_via_anthropic_transport_omits_thinking(self) -> None:
++        """Plain ``api.kimi.com`` hit via the Anthropic transport also omits thinking.
++
++        Auto-detection routes ``api.kimi.com/v1`` to ``chat_completions`` by
++        default, but users can explicitly configure
++        ``api_mode: anthropic_messages`` against any Kimi host.  The upstream
++        validation (reasoning_content required on replayed tool-call
++        messages) is the same regardless of URL path, so the thinking
++        suppression must apply to every Kimi host, not just ``/coding``.
++        See #17057.
+         """
+         from agent.anthropic_adapter import build_anthropic_kwargs
+ 
+@@ -112,4 +115,98 @@ class TestKimiCodingSkipsAnthropicThinking:
+             reasoning_config={"enabled": True, "effort": "medium"},
+             base_url="https://api.kimi.com/v1",
+         )
++        assert "thinking" not in kwargs
++
++    # ── #17057: custom / proxied Kimi-compatible endpoints ──────────
++    @pytest.mark.parametrize(
++        "base_url,model",
++        [
++            # Custom host with Kimi-family model — the reporter's case
++            ("http://my-kimi-proxy.internal", "kimi-2.6"),
++            ("https://llm.example.com/anthropic", "kimi-k2.5"),
++            ("https://llm.example.com/anthropic", "moonshot-v1-8k"),
++            ("https://llm.example.com/anthropic", "kimi_thinking"),
++            ("https://llm.example.com/anthropic", "moonshotai/kimi-k2.5"),
++            # Official Moonshot host (previously uncovered)
++            ("https://api.moonshot.ai/anthropic", "moonshot-v1-32k"),
++            ("https://api.moonshot.cn/anthropic", "moonshot-v1-32k"),
++        ],
++    )
++    def test_kimi_family_custom_endpoint_omits_thinking(
++        self, base_url: str, model: str
++    ) -> None:
++        """Custom / proxied Kimi endpoints must also strip Anthropic thinking."""
++        from agent.anthropic_adapter import build_anthropic_kwargs
++
++        kwargs = build_anthropic_kwargs(
++            model=model,
++            messages=[{"role": "user", "content": "hello"}],
++            tools=None,
++            max_tokens=4096,
++            reasoning_config={"enabled": True, "effort": "medium"},
++            base_url=base_url,
++        )
++        assert "thinking" not in kwargs, (
++            f"Kimi-family endpoint ({base_url}, {model}) must not receive "
++            f"Anthropic thinking — upstream validates reasoning_content on "
++            f"replayed tool-call history we don't preserve."
++        )
++        assert "output_config" not in kwargs
++
++    def test_custom_endpoint_non_kimi_model_keeps_thinking(self) -> None:
++        """Custom endpoint with a non-Kimi model must keep thinking intact.
++
++        Guards against over-broad model-family matching — only model names
++        starting with a Kimi/Moonshot prefix should trigger suppression.
++        """
++        from agent.anthropic_adapter import build_anthropic_kwargs
++
++        kwargs = build_anthropic_kwargs(
++            model="MiniMax-M2.7",
++            messages=[{"role": "user", "content": "hello"}],
++            tools=None,
++            max_tokens=4096,
++            reasoning_config={"enabled": True, "effort": "medium"},
++            base_url="https://my-llm-proxy.example.com/anthropic",
++        )
+         assert "thinking" in kwargs
++        assert kwargs["thinking"]["type"] == "enabled"
++
++    def test_kimi_family_replay_preserves_unsigned_thinking(self) -> None:
++        """On a custom Kimi endpoint, unsigned reasoning_content thinking
++        blocks must survive the third-party signature-stripping pass so
++        the upstream's message-history validation passes.
++        """
++        from agent.anthropic_adapter import convert_messages_to_anthropic
++
++        messages = [
++            {"role": "user", "content": "hi"},
++            {
++                "role": "assistant",
++                "reasoning_content": "planning the tool call",
++                "tool_calls": [
++                    {
++                        "id": "call_1",
++                        "type": "function",
++                        "function": {"name": "skill_view", "arguments": "{}"},
++                    }
++                ],
++            },
++            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
++        ]
++        _, converted = convert_messages_to_anthropic(
++            messages,
++            base_url="http://my-kimi-proxy.internal",
++            model="kimi-2.6",
++        )
++        # The assistant message still carries the unsigned thinking block
++        # synthesised from reasoning_content (required by Kimi's history
++        # validation).  A plain third-party endpoint would have stripped it.
++        assistant_msg = next(m for m in converted if m["role"] == "assistant")
++        assistant_blocks = assistant_msg["content"]
++        thinking_blocks = [
++            b for b in assistant_blocks
++            if isinstance(b, dict) and b.get("type") == "thinking"
++        ]
++        assert len(thinking_blocks) == 1
++        assert thinking_blocks[0]["thinking"] == "planning the tool call"

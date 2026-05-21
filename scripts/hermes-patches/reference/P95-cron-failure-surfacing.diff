@@ -1,0 +1,178 @@
+commit f54935738c6885cfaa7062aefcdb6541e2ada105
+Author: briandevans <252620095+briandevans@users.noreply.github.com>
+Date:   Thu Apr 30 02:13:06 2026 -0700
+
+    fix(cron): surface agent run_conversation failure flags as job failure
+    
+    run_job() ignored the result's `failed=True` / `completed=False` flags
+    that agent.run_conversation populates on API exhaustion, mid-run
+    interrupts, and model aborts. Because final_response on those paths is
+    often a non-empty error string ("API call failed after 3 retries:
+    Request timed out."), the existing empty-response soft-fail in
+    _process_job did not trip either: the error text was delivered as if it
+    were the agent's reply and last_status was set to "ok" with no error
+    notification. Detect those flags right after the dict-shape guard and
+    raise so the existing except handler builds the proper failure tuple,
+    preserving the agent's error message via result["error"].
+    
+    Adds a parametrized regression covering: API-retry-exhausted with error
+    text in final_response, completed=False with no final_response,
+    completed=False without an explicit failed flag, and the partial-reply
+    plus failed=True case. Plus a guard that a normal completed=True success
+    result is still treated as success.
+    
+    Fixes #17855
+    
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 08d73c1be..4672b24ba 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1150,6 +1150,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
+             )
+ 
++        # If the agent itself reported failure (e.g. all retries exhausted on
++        # API errors, model abort, mid-run interrupt), do not silently mark the
++        # job as successful. run_agent populates `failed=True`/`completed=False`
++        # on these paths and may put the error into `final_response`, which
++        # would otherwise be delivered as if it were the agent's reply and the
++        # job's `last_status` set to "ok". Raise so the except handler below
++        # builds the proper failure tuple. (issue #17855)
++        if result.get("failed") is True or result.get("completed") is False:
++            _err_text = (
++                result.get("error")
++                or (result.get("final_response") or "").strip()
++                or "agent reported failure"
++            )
++            raise RuntimeError(_err_text)
++
+         final_response = result.get("final_response", "") or ""
+         # Strip leaked placeholder text that upstream may inject on empty completions.
+         if final_response.strip() == "(No response generated)":
+diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+index 638146989..a5bcd4bf9 100644
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -935,6 +935,120 @@ class TestRunJobSessionPersistence:
+         # But the output log should show the placeholder
+         assert "(No response generated)" in output
+ 
++    @pytest.mark.parametrize(
++        "agent_result,expected_err_substring",
++        [
++            (
++                {
++                    "final_response": "API call failed after 3 retries: Request timed out.",
++                    "failed": True,
++                    "completed": False,
++                    "error": "API call failed after 3 retries: Request timed out.",
++                },
++                "API call failed",
++            ),
++            (
++                {"final_response": None, "completed": False, "failed": True},
++                "agent reported failure",
++            ),
++            (
++                {"final_response": "", "completed": False},
++                "agent reported failure",
++            ),
++            (
++                {
++                    "final_response": "partial reply before crash",
++                    "failed": True,
++                    "completed": False,
++                    "error": "model abort: connection reset",
++                },
++                "model abort",
++            ),
++        ],
++    )
++    def test_run_job_treats_agent_failure_flag_as_failure(
++        self, tmp_path, agent_result, expected_err_substring
++    ):
++        """Issue #17855: run_conversation returns ``failed=True``/``completed=False``
++        when the agent's API call exhausts retries or aborts mid-run. run_job
++        must surface this as success=False so cron's last_status reflects the
++        failure and the user gets an error notification, instead of treating
++        the (often non-empty) error string in final_response as a legitimate
++        agent reply.
++        """
++        job = {
++            "id": "failing-api-job",
++            "name": "failing api",
++            "prompt": "do something",
++        }
++        fake_db = MagicMock()
++
++        with patch("cron.scheduler._hermes_home", tmp_path), \
++             patch("cron.scheduler._resolve_origin", return_value=None), \
++             patch("dotenv.load_dotenv"), \
++             patch("hermes_state.SessionDB", return_value=fake_db), \
++             patch(
++                 "hermes_cli.runtime_provider.resolve_runtime_provider",
++                 return_value={
++                     "api_key": "***",
++                     "base_url": "https://example.invalid/v1",
++                     "provider": "openrouter",
++                     "api_mode": "chat_completions",
++                 },
++             ), \
++             patch("run_agent.AIAgent") as mock_agent_cls:
++            mock_agent = MagicMock()
++            mock_agent.run_conversation.return_value = agent_result
++            mock_agent_cls.return_value = mock_agent
++
++            success, output, final_response, error = run_job(job)
++
++        assert success is False
++        assert final_response == ""
++        assert error is not None and expected_err_substring in error
++        # Output should be the FAILED template, not the success template.
++        assert "(FAILED)" in output
++        # Ephemeral cron agent must still be closed even on agent-flagged failure.
++        mock_agent.close.assert_called_once()
++
++    def test_run_job_completed_true_without_failed_flag_succeeds(self, tmp_path):
++        """Regression guard: a normal success result (``completed=True``,
++        ``failed`` absent) must not trip the failure-flag check.
++        """
++        job = {
++            "id": "ok-job",
++            "name": "ok",
++            "prompt": "hello",
++        }
++        fake_db = MagicMock()
++
++        with patch("cron.scheduler._hermes_home", tmp_path), \
++             patch("cron.scheduler._resolve_origin", return_value=None), \
++             patch("dotenv.load_dotenv"), \
++             patch("hermes_state.SessionDB", return_value=fake_db), \
++             patch(
++                 "hermes_cli.runtime_provider.resolve_runtime_provider",
++                 return_value={
++                     "api_key": "***",
++                     "base_url": "https://example.invalid/v1",
++                     "provider": "openrouter",
++                     "api_mode": "chat_completions",
++                 },
++             ), \
++             patch("run_agent.AIAgent") as mock_agent_cls:
++            mock_agent = MagicMock()
++            mock_agent.run_conversation.return_value = {
++                "final_response": "all good",
++                "completed": True,
++            }
++            mock_agent_cls.return_value = mock_agent
++
++            success, output, final_response, error = run_job(job)
++
++        assert success is True
++        assert error is None
++        assert final_response == "all good"
++
+     def test_tick_marks_empty_response_as_error(self, tmp_path):
+         """When run_job returns success=True but final_response is empty,
+         tick() should mark the job as error so last_status != 'ok'.

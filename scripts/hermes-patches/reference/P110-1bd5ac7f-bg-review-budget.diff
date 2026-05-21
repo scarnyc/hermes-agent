@@ -1,0 +1,62 @@
+commit 1bd5ac7f2f839cd047366749ebbbf901220c7afe
+Author: Teknium <127238744+teknium1@users.noreply.github.com>
+Date:   Mon May 4 04:53:44 2026 -0700
+
+    fix(self-improvement-loop): bump background-review budget to 16 and suppress status leaks (#19710)
+    
+    The background memory/skill review fork had two user-visible issues:
+    
+    1. max_iterations=8 was too tight for multi-step reviews. A review that
+       needs to skill_view one or two candidate skills, add a memory entry,
+       and patch a skill routinely blew the budget — surfacing an 'Iteration
+       budget exhausted (8/8)' warning to the user and leaving the review
+       half-finished.
+    
+    2. Mid-review lifecycle messages leaked into the user's terminal past the
+       existing quiet_mode + redirect_stdout/stderr guards. _emit_status and
+       _emit_warning route through _vprint(force=True) -> _print_fn /
+       status_callback, which bypass sys.stdout entirely. The stdout redirect
+       only catches raw print() calls.
+    
+    Changes:
+    - Bump the review fork's max_iterations from 8 to 16.
+    - Set review_agent.suppress_status_output = True on the fork. This
+      short-circuits _vprint unconditionally so _emit_status/_emit_warning
+      emissions (iteration-budget warnings, rate-limit retries, compression
+      messages) never reach the user. The only user-visible output remains
+      the compact final summary line ('💾 Self-improvement review: ...')
+      which is printed via self._safe_print on the *main* agent (outside
+      the fork's redirect/suppress scope).
+    
+    Summarizer filter is already correct — _summarize_background_review_actions
+    only surfaces tool calls with data.get('success') is truthy, so failed
+    attempts and reasoning text never reach the summary line.
+
+diff --git a/run_agent.py b/run_agent.py
+index e3823551d..17b8b01db 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3611,7 +3611,7 @@ class AIAgent:
+                     _parent_runtime = self._current_main_runtime()
+                     review_agent = AIAgent(
+                         model=self.model,
+-                        max_iterations=8,
++                        max_iterations=16,
+                         quiet_mode=True,
+                         platform=self.platform,
+                         provider=self.provider,
+@@ -3629,6 +3629,14 @@ class AIAgent:
+                     review_agent._user_profile_enabled = self._user_profile_enabled
+                     review_agent._memory_nudge_interval = 0
+                     review_agent._skill_nudge_interval = 0
++                    # Suppress all status/warning emits from the fork so the
++                    # user only sees the final successful-action summary.
++                    # Without this, mid-review "Iteration budget exhausted",
++                    # rate-limit retries, compression warnings, and other
++                    # lifecycle messages bubble up through _emit_status ->
++                    # _vprint and leak past the stdout redirect (they go via
++                    # _print_fn/status_callback, which bypass sys.stdout).
++                    review_agent.suppress_status_output = True
+ 
+                     review_agent.run_conversation(
+                         user_message=prompt,

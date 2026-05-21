@@ -1,0 +1,54 @@
+--- a/scripts/symphony_bridge.py
++++ b/scripts/symphony_bridge.py
+@@ -1413,6 +1413,11 @@
+                   repo_path: str,
+                   tracker: "BudgetTracker") -> dict:
+     """Phase 1: Write implementation plan."""
++    # P165/MOL-550: capture phase-start timestamp so we can detect stale plan
++    # files (existing on disk from a prior dispatch) that would otherwise be
++    # misread as "Phase 1 OK". The file's mtime must be >= phase_start_ts for
++    # us to trust it as fresh output from THIS run.
++    phase_start_ts = time.time()
+     plan_file = PLANS_DIR / f"{key}.md"
+     PLANS_DIR.mkdir(parents=True, exist_ok=True)
+ 
+@@ -1437,16 +1442,36 @@
+     )
+ 
+     if result["success"]:
+-        if plan_file.exists() and plan_file.stat().st_size > 100:
+-            _log(f"Phase 1 OK: plan written ({plan_file.stat().st_size} bytes)")
++        # P165/MOL-550: mtime guard — only trust the file if it was written by
++        # THIS dispatch. A stale file (e.g. ~/.hermes/symphony/plans/MOL-481.md
++        # from May 11) would otherwise be silently accepted as proof of success.
++        plan_exists = plan_file.exists()
++        plan_size = plan_file.stat().st_size if plan_exists else 0
++        plan_mtime = plan_file.stat().st_mtime if plan_exists else 0.0
++        plan_is_fresh = plan_exists and plan_mtime >= phase_start_ts
++
++        if plan_exists and plan_size > 100 and plan_is_fresh:
++            _log(f"Phase 1 OK: plan written ({plan_size} bytes)")
+             # P164/MOL-549 S5: artifact-path event — Phase 1 reads from disk,
+             # so observability needs the path + size per tick to detect drift.
+             _log_event("phase_artifact_path", phase="planner", key=key,
+                        path=str(plan_file),
+-                       size_bytes=plan_file.stat().st_size,
++                       size_bytes=plan_size,
+                        tier=result["tier"])
+             plan_content = plan_file.read_text()
+             return {"ok": True, "plan_content": plan_content, "tier": result["tier"]}
++        elif plan_exists and not plan_is_fresh:
++            # P165/MOL-550: stale-plan-trap fired — file predates this dispatch.
++            _log(f"Phase 1 FAILED: stale plan file (mtime={plan_mtime:.0f} < "
++                 f"phase_start_ts={phase_start_ts:.0f}, size={plan_size}B)")
++            _log_event("phase_stale_artifact_detected", phase="planner", key=key,
++                       path=str(plan_file),
++                       old_mtime=plan_mtime,
++                       size_bytes=plan_size,
++                       phase_start_ts=phase_start_ts,
++                       tier=result["tier"])
++            return {"ok": False, "error": "stale plan file from prior dispatch",
++                    "tier": result["tier"]}
+         else:
+             _log("Phase 1 FAILED: plan file missing or empty")
+             return {"ok": False, "error": "plan file missing or empty",

@@ -1,0 +1,127 @@
+--- /tmp/symphony_bridge.pre-p225.py	2026-05-19 19:06:20
++++ /Users/wills_mac_mini/.hermes/scripts/symphony_bridge.py	2026-05-19 19:07:06
+@@ -1952,6 +1952,106 @@
+     print(banner)
+ 
+ 
++# ── P225/MOL-623 AC-17: three-agent-loop routing gate ─────────────────────
++#
++# Reads `role_routing.use_three_agent_loop` from hermes config and routes the
++# ticket to `symphony_loop.run_loop` instead of the legacy 4-phase bridge when
++# the gate is `True`. Values:
++#
++#   False    (default)  — legacy bridge unchanged; loop never invoked
++#   "shadow"            — legacy bridge runs; routing telemetry records that
++#                         this ticket WOULD have routed to the loop. No
++#                         side-by-side dispatch (Builder side effects make a
++#                         literal A/B run unsafe).
++#   True                — legacy bridge bypassed; symphony_loop.run_loop runs
++#                         in-process and its terminal verdict maps to RunResult.
++#
++# Fail-closed: any config-load error returns False — legacy is the safe path.
++# This is the AC-17 surface; no other call site reads the gate.
++
++def _ensure_hermes_path() -> None:  # type: ignore[no-redef]
++    """Make `hermes_cli` importable when run from ~/.hermes/scripts/.
++
++    Mirrors symphony_loop._ensure_hermes_path and symphony_builder's helper.
++    Defined here (not imported) so the gate-read path has no cross-script
++    import dependency at module load."""
++    runtime = HOME / ".hermes" / "hermes-agent"
++    runtime_str = str(runtime)
++    if runtime.is_dir() and runtime_str not in sys.path:
++        sys.path.insert(0, runtime_str)
++
++
++def _three_agent_loop_gate() -> "bool | str":
++    """Return the current `role_routing.use_three_agent_loop` value.
++
++    Loads hermes config lazily so a broken/missing config.yaml degrades to
++    legacy routing instead of crashing the bridge tick. Recognized values:
++    `True`, `"shadow"`, `False` — anything else falls through to False with
++    a telemetry breadcrumb so unrecognized values don't silently route.
++    """
++    try:
++        _ensure_hermes_path()
++        from hermes_cli.config import load_config  # type: ignore
++        cfg = load_config()
++    except Exception as exc:  # broad: config failures must not block dispatch
++        _log_event("routing_gate_unreadable",
++                   exc_type=type(exc).__name__, exc=str(exc)[:200])
++        return False
++
++    raw = (cfg.get("role_routing") or {}).get("use_three_agent_loop", False)
++    if raw is True:
++        return True
++    if isinstance(raw, str) and raw.lower() == "shadow":
++        return "shadow"
++    if raw is False:
++        return False
++    _log_event("routing_gate_unrecognized", value=repr(raw))
++    return False
++
++
++def _dispatch_three_agent_loop(key: str, state: dict,
++                               ticket_body: str) -> RunResult:
++    """Route this ticket through symphony_loop.run_loop and translate the
++    terminal payload into a RunResult."""
++    repo_path = extract_repo(ticket_body)
++    _log_event("three_agent_loop_dispatch_start",
++               key=key, repo_path=repo_path)
++
++    try:
++        _ensure_hermes_path()
++        from symphony_loop import run_loop  # type: ignore
++        payload = run_loop(ticket_key=key, repo_path=repo_path)
++    except Exception as exc:
++        state["last_status"] = "failed"
++        state["attempt_count"] = state.get("attempt_count", 0) + 1
++        _safe_write_state(key, state, where="three_agent_loop_exception")
++        _log_event("three_agent_loop_exception", key=key,
++                   exc_type=type(exc).__name__, exc=str(exc)[:300])
++        return RunResult(dispatched=True, final_status="failed",
++                         error=f"three_agent_loop: {type(exc).__name__}: "
++                               f"{str(exc)[:200]}")
++
++    verdict = payload.get("verdict", "")
++    pr_num = str(payload.get("pr_number") or "") or None
++    _log_event("three_agent_loop_dispatch_complete",
++               key=key, verdict=verdict, pr_number=pr_num,
++               cycles_run=payload.get("cycles_run"),
++               total_cost_usd=payload.get("total_cost_usd"))
++
++    if verdict == "ALL_PASS" and pr_num:
++        state["last_status"] = "succeeded"
++        _safe_write_state(key, state, where="three_agent_loop_succeeded")
++        return RunResult(dispatched=True, final_status="succeeded",
++                         pr_num=pr_num, pr_state="merged")
++
++    state["last_status"] = "incomplete"
++    state["attempt_count"] = state.get("attempt_count", 0) + 1
++    _safe_write_state(key, state, where="three_agent_loop_incomplete")
++    return RunResult(dispatched=True, final_status="incomplete",
++                     pr_num=pr_num,
++                     error=f"three_agent_loop verdict={verdict}")
++
++
+ def run_one(key: str, *, dry_run: bool = False) -> RunResult:
+     """Execute the symphony pipeline for a single ticket.
+ 
+@@ -2055,6 +2155,17 @@
+     ticket_body = get_ticket_body(key)
+     repo_path = extract_repo(ticket_body)
+     summary = get_ticket_summary(key, ticket_body)
++
++    # ── P225/MOL-623 AC-17: three-agent-loop routing gate ──────────
++    # Read role_routing.use_three_agent_loop AFTER ticket extraction so
++    # the loop dispatch has repo_path/ticket_body available without a
++    # second jira fetch. shadow mode emits telemetry then falls through
++    # to the legacy bridge.
++    _gate = _three_agent_loop_gate()
++    _log_event("routing_decision", key=key, gate=str(_gate),
++               chosen=("three_agent_loop" if _gate is True else "legacy"))
++    if _gate is True:
++        return _dispatch_three_agent_loop(key, state, ticket_body)
+     _log(f"  Repo: {repo_path}")
+     _log(f"  Summary: {summary[:100]}")
+ 

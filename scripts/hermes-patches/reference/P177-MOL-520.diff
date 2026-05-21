@@ -1,0 +1,342 @@
+--- a/.hermes/scripts/symphony_telegram.py
++++ b/.hermes/scripts/symphony_telegram.py
+@@ -0,0 +1,186 @@
++"""Symphony Telegram alerts — warning-class event notifier.
++PATCH: P177/MOL-520.
++
++Wires the symphony daemon to push plain-text alerts to Telegram when a
++ticket exits the dispatch pipeline in a non-success state. Throttled
++per-(key, event) via JSON map stored in tickets.last_telegram_alert_ts.
++
++Designed for the daemon path only — the cron-path (symphony_bridge run as
++script) keeps its existing print-warning lines as log-only signal.
++
++Fail-open: HTTP errors, missing env vars, malformed throttle JSON, and
++queue.db errors all log and return without raising. A broken alerter
++must NOT block the dispatch loop.
++
++Public API:
++    notify(event, key, detail, *, queue_db=None, throttle_seconds=3600)
++        → "sent" | "throttled" | "skipped:<reason>" | "error:<msg>"
++
++Event constants (daemon imports from here):
++    EVENT_BLOCKED            — ticket flipped to "blocked" (max attempts)
++    EVENT_FAILED             — terminal "failed" (incl. incomplete status)
++    EVENT_RUN_ONE_EXCEPTION  — bridge raised unhandled exception
++    EVENT_DAEMON_CRASH_SWEEP — startup sweep flipped a running row → failed
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import sys
++import urllib.parse
++import urllib.request
++from datetime import datetime, timezone
++from pathlib import Path
++
++EVENT_BLOCKED = "blocked"
++EVENT_FAILED = "failed"
++EVENT_RUN_ONE_EXCEPTION = "run_one_exception"
++EVENT_DAEMON_CRASH_SWEEP = "daemon_crash_sweep"
++
++_DEFAULT_QUEUE_DB = Path.home() / ".hermes" / "symphony" / "queue.db"
++_JIRA_BROWSE_PREFIX = "https://deep-agent-one.atlassian.net/browse/"
++_LOG_PATH = "~/.hermes/logs/symphony_bridge.log"
++_HTTP_TIMEOUT_SECS = 15
++
++
++def _now_iso() -> str:
++    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
++def _parse_iso(s: str) -> datetime | None:
++    try:
++        # Accept both "Z" and "+00:00" suffixes.
++        if s.endswith("Z"):
++            s = s[:-1] + "+00:00"
++        return datetime.fromisoformat(s)
++    except (ValueError, AttributeError):
++        return None
++
++
++def _log(msg: str) -> None:
++    print(f"[{_now_iso()}] [symphony_telegram] {msg}", flush=True, file=sys.stderr)
++
++
++def _format(event: str, key: str, detail: str) -> str:
++    detail = (detail or "").strip()
++    detail_line = f" — {detail}" if detail else ""
++    return (
++        f"⚠️  {key}: {event}{detail_line}\n"
++        f"{_JIRA_BROWSE_PREFIX}{key}\n"
++        f"log: {_LOG_PATH}"
++    )
++
++
++def _load_alert_map(conn: sqlite3.Connection, key: str) -> dict[str, str]:
++    """Return the per-event ISO-timestamp map for this ticket.
++
++    Stored as JSON object in tickets.last_telegram_alert_ts (TEXT, nullable).
++    Malformed JSON or legacy single-string values are treated as empty —
++    we'd rather over-alert once than swallow events forever.
++    """
++    row = conn.execute(
++        "SELECT last_telegram_alert_ts FROM tickets WHERE key = ?", (key,)
++    ).fetchone()
++    if row is None:
++        return {}
++    raw = row[0] if isinstance(row, tuple) else row["last_telegram_alert_ts"]
++    if not raw:
++        return {}
++    try:
++        parsed = json.loads(raw)
++    except (json.JSONDecodeError, TypeError):
++        return {}
++    return parsed if isinstance(parsed, dict) else {}
++
++
++def _save_alert_map(conn: sqlite3.Connection, key: str, alert_map: dict[str, str]) -> None:
++    conn.execute(
++        "UPDATE tickets SET last_telegram_alert_ts = ? WHERE key = ?",
++        (json.dumps(alert_map, separators=(",", ":")), key),
++    )
++
++
++def _is_throttled(alert_map: dict[str, str], event: str, throttle_seconds: int) -> bool:
++    last_iso = alert_map.get(event)
++    if not last_iso:
++        return False
++    last_dt = _parse_iso(last_iso)
++    if last_dt is None:
++        return False
++    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
++    return elapsed < throttle_seconds
++
++
++def _send_telegram(text: str) -> tuple[bool, str]:
++    """Return (ok, status). Fail-open on any error."""
++    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
++    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
++    if not token or not chat_id:
++        return False, "skipped:TELEGRAM_BOT_TOKEN_or_TELEGRAM_CHAT_ID_unset"
++    url = f"https://api.telegram.org/bot{token}/sendMessage"
++    payload = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
++    try:
++        with urllib.request.urlopen(url, data=payload, timeout=_HTTP_TIMEOUT_SECS) as resp:
++            body = resp.read().decode("utf-8", errors="replace")
++            return (200 <= resp.status < 300), f"http {resp.status}: {body[:120]}"
++    except Exception as e:  # urllib raises many subclasses; one catch is enough here
++        return False, f"telegram_error: {e}"
++
++
++def notify(
++    event: str,
++    key: str,
++    detail: str = "",
++    *,
++    queue_db: str | Path | None = None,
++    throttle_seconds: int = 3600,
++) -> str:
++    """Send a Telegram alert for a warning-class symphony event.
++
++    Per-(key, event) throttling: if the same (key, event) pair fired within
++    `throttle_seconds`, this returns "throttled" without sending. Different
++    events for the same key alert independently.
++
++    Returns a short status string for logging. Never raises.
++    """
++    db_path = Path(queue_db) if queue_db else _DEFAULT_QUEUE_DB
++    if not db_path.exists():
++        _log(f"queue.db missing at {db_path} — sending without throttle check")
++        ok, status = _send_telegram(_format(event, key, detail))
++        return ("sent" if ok else f"error:{status}") + " (no-throttle)"
++
++    conn: sqlite3.Connection | None = None
++    try:
++        conn = sqlite3.connect(str(db_path), timeout=10.0, isolation_level=None)
++        conn.row_factory = sqlite3.Row
++        alert_map = _load_alert_map(conn, key)
++        if _is_throttled(alert_map, event, throttle_seconds):
++            return "throttled"
++        ok, status = _send_telegram(_format(event, key, detail))
++        if ok:
++            alert_map[event] = _now_iso()
++            _save_alert_map(conn, key, alert_map)
++            return "sent"
++        _log(f"send failed for {key}/{event}: {status}")
++        return f"error:{status}"
++    except sqlite3.Error as e:
++        _log(f"sqlite error for {key}/{event}: {e}")
++        # Still attempt to send so we don't lose the alert to a DB issue.
++        try:
++            ok, status = _send_telegram(_format(event, key, detail))
++            return ("sent" if ok else f"error:{status}") + " (db-error)"
++        except Exception as send_e:
++            _log(f"send raised after db-error for {key}/{event}: {send_e}")
++            return f"error:{send_e} (db-error)"
++    except Exception as e:
++        # Contract: notify() must NEVER raise. A broken alerter must not block the dispatch loop.
++        _log(f"unexpected error in notify for {key}/{event}: {e}")
++        return f"error:{e}"
++    finally:
++        if conn is not None:
++            try:
++                conn.close()
++            except Exception:
++                pass
+--- a/.hermes/scripts/symphony_daemon.py
++++ b/.hermes/scripts/symphony_daemon.py
+@@ -57,6 +57,7 @@
+ sys.path.insert(0, str(Path(__file__).parent))
+ import symphony_queue as sq  # noqa: E402
+ import symphony_bridge  # noqa: E402
++import symphony_telegram as st  # noqa: E402  # PATCH P177/MOL-520
+ 
+ _ET = ZoneInfo("America/New_York")
+ _HERMES_HOME = Path.home() / ".hermes"
+@@ -158,7 +159,7 @@
+     _HEARTBEAT_FILE.write_text(_now_iso())
+ 
+ 
+-def startup_sweep(queue_db: Path = _QUEUE_DB) -> int:
++def startup_sweep(queue_db: Path = _QUEUE_DB) -> list[str]:
+     """Flip orphan queue.db 'running' rows to 'failed' at daemon start.
+ 
+     Reason — daemon is the ONLY writer of queue.db 'running' state during
+@@ -167,12 +168,21 @@
+     migrate_state_to_queue.py's docstring punts to 'daemon or USE_DAEMON
+     wire-up' (post-renumber: this file or P159 — Phase 4e).
+ 
+-    Returns the row count flipped. Does NOT raise on empty sweep —
+-    rowcount==0 is the happy path on first boot.
++    Returns the list of ticket keys flipped. Empty list is the happy path
++    on first boot. The daemon is single-writer for 'running' so the
++    SELECT-then-UPDATE pair is race-safe without explicit transaction
++    (P177/MOL-520 — caller iterates the returned keys to fire one
++    Telegram notify per orphan).
+     """
+     now = _now_iso()
+     with sqlite3.connect(queue_db, isolation_level=None) as conn:
+-        cur = conn.execute(
++        rows = conn.execute(
++            "SELECT key FROM tickets WHERE state = 'running'"
++        ).fetchall()
++        keys = [r[0] for r in rows]
++        if not keys:
++            return []
++        conn.execute(
+             """
+             UPDATE tickets
+                SET state = 'failed',
+@@ -192,7 +202,7 @@
+             """,
+             (now, now),
+         )
+-        return cur.rowcount
++        return keys
+ 
+ 
+ def _map_result_to_queue_state(
+@@ -224,6 +234,30 @@
+     return (datetime.now(_ET) + timedelta(seconds=delay)).isoformat()
+ 
+ 
++def _notify_terminal(
++    key: str,
++    final_status: str,
++    final_state: str,
++    error_class: str | None,
++) -> None:
++    """Telegram alert for warning-class terminal states. PATCH P177/MOL-520.
++
++    Fires per-(key, event) throttled alerts via symphony_telegram.notify.
++    Never raises — notify() is fail-open by contract.
++    """
++    if final_state == "blocked":
++        event = st.EVENT_BLOCKED
++    elif final_state == "failed":
++        event = st.EVENT_FAILED
++    else:
++        return
++    detail = f"final_status={final_status}"
++    if error_class:
++        detail += f" error_class={error_class}"
++    status = st.notify(event, key, detail)
++    _log(f"telegram({key}, {event}) → {status}")
++
++
+ def _release_after_dispatch(
+     queue_db: Path,
+     key: str,
+@@ -252,10 +286,12 @@
+             last_pr_url=pr_url,
+             next_attempt_at=next_attempt_at,
+         )
+-        suffix = f" next_at={next_attempt_at}" if next_attempt_at else ""
+-        _log(f"released {key} → {final_state} (outcome={last_outcome}){suffix}")
+     except (sqlite3.Error, RuntimeError, ValueError) as exc:
+         _log(f"release_ticket failed for {key}: {exc!r}")
++        return  # PATCH P177/MOL-520 — skip notify if release didn't land
++    suffix = f" next_at={next_attempt_at}" if next_attempt_at else ""
++    _log(f"released {key} → {final_state} (outcome={last_outcome}){suffix}")
++    _notify_terminal(key, result.final_status, final_state, error_class)
+ 
+ 
+ def run_loop(
+@@ -345,6 +381,7 @@
+             result = symphony_bridge.run_one(key, dry_run=False)
+         except Exception as exc:
+             _log(f"run_one raised for {key}: {exc!r}; releasing as failed")
++            inner_released = False
+             try:
+                 sq.release_ticket(
+                     queue_db,
+@@ -353,10 +390,18 @@
+                     last_outcome="fail",
+                     last_error_class="run_one_exception",
+                 )
++                inner_released = True
+             except (sqlite3.Error, RuntimeError, ValueError) as inner:
+                 _log(
+                     f"release after run_one exception also failed: {inner!r}"
+                 )
++            # PATCH P177/MOL-520 — Telegram alert only if release landed,
++            # otherwise the orphan-sweep on next daemon start will catch it.
++            if inner_released:
++                tg_status = st.notify(
++                    st.EVENT_RUN_ONE_EXCEPTION, key, repr(exc)[:200]
++                )
++                _log(f"telegram({key}, {st.EVENT_RUN_ONE_EXCEPTION}) → {tg_status}")
+             sleep_fn(_FAILURE_SLEEP_SECS)
+             iterations += 1
+             if max_iterations is not None and iterations >= max_iterations:
+@@ -408,11 +453,23 @@
+         )
+         return 1
+ 
+-    flipped = startup_sweep(_QUEUE_DB)
+-    if flipped:
++    flipped_keys = startup_sweep(_QUEUE_DB)
++    if flipped_keys:
+         _log(
+-            f"startup sweep: flipped {flipped} orphan running row(s) to failed"
++            f"startup sweep: flipped {len(flipped_keys)} orphan running "
++            f"row(s) to failed"
+         )
++        # PATCH P177/MOL-520 — one Telegram notify per orphan key.
++        for orphan_key in flipped_keys:
++            tg_status = st.notify(
++                st.EVENT_DAEMON_CRASH_SWEEP,
++                orphan_key,
++                "orphan running row flipped at daemon startup",
++            )
++            _log(
++                f"telegram({orphan_key}, {st.EVENT_DAEMON_CRASH_SWEEP}) → "
++                f"{tg_status}"
++            )
+     else:
+         _log("startup sweep: no orphan running rows")
+ 

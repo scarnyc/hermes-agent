@@ -1,0 +1,29 @@
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -3633,6 +3633,24 @@ def cmd_update(args):
+     if is_managed():
+         managed_error("update Hermes Agent")
+         return
+
++    # P93/MOL-283: Block updates on patched trees.
++    # `hermes update` (git pull --ff-only + pip install) and the ZIP-based
++    # fallback both discard uncommitted local patches.  Detect the sentinel
++    # marker that is created when patches are first applied and refuse to
++    # proceed until the operator explicitly removes it.
++    _patched_marker = PROJECT_ROOT.parent / ".patched-tree"
++    if _patched_marker.exists():
++        print("✗ This Hermes installation has local patches applied (P03–P86+).")
++        print("  `hermes update` is destructive — it will discard all patches.")
++        print()
++        print("  To upgrade safely, follow the MOL-283 migration workflow:")
++        print("    https://deep-agent-one.atlassian.net/browse/MOL-283")
++        print()
++        print("  If you are SURE you want to discard all local patches:")
++        print(f"    rm {_patched_marker}")
++        print("    hermes update")
++        sys.exit(1)
++
+     gateway_mode = getattr(args, "gateway", False)
+     # In gateway mode, use file-based IPC for prompts instead of stdin
+     gw_input_fn = (lambda prompt, default="": _gateway_prompt(prompt, default)) if gateway_mode else None

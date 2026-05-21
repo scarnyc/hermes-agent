@@ -1,0 +1,639 @@
+--- /tmp/symphony_bridge.py.pre-p148	2026-05-11 07:49:35
++++ /Users/wills_mac_mini/.hermes/scripts/symphony_bridge.py	2026-05-11 08:08:48
+@@ -18,6 +18,7 @@
+ import os
+ import re
+ import shlex
++import signal
+ import subprocess
+ import sys
+ import time
+@@ -33,12 +34,25 @@
+ PAUSED_FILE = SYMPHONY_DIR / "PAUSED"
+ DRY_RUN_FILE = SYMPHONY_DIR / "DRY_RUN"
+ 
++# P148/MOL-498: JSONL diagnostic log for observability into tier failures + SIGKILL recovery.
++LOG_DIR = HOME / ".hermes" / "logs"
++LOG_FILE = LOG_DIR / "symphony_bridge.log"
++
+ CLAUDE_BIN = os.path.expanduser("~/.local/bin/claude")
+ 
+ DEEPSEEK_ENDPOINT = "https://api.deepseek.com/anthropic/v1/messages"
+ 
+ _TOTAL_TIMEOUT_SECONDS = 3300  # 55 minutes — stay within 60-min cron window
+ 
++# P148/MOL-498: stderr tail cap to bound log file size (Tier-1 silence is most likely in the tail).
++_STDERR_TAIL_MAX = 50_000
++
++# P148/MOL-498: env vars worth recording per tier attempt (logged as SET/UNSET, never values).
++_TRACKED_ENV_KEYS = [
++    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
++    "DEEPSEEK_API_KEY", "KIMI_API_KEY", "OPENROUTER_API_KEY",
++]
++
+ # Per-phase timeouts in seconds
+ _PHASE_TIMEOUTS = {
+     "planner": 600,    # 10 min
+@@ -72,10 +86,68 @@
+ 
+ 
+ def _log(msg: str) -> None:
++    """Human-readable stderr log; also emits a `legacy_log` JSONL record."""
+     ts = datetime.now().strftime("%H:%M:%S")
+     print(f"[symphony-bridge {ts}] {msg}", file=sys.stderr)
++    _log_event("legacy_log", msg=msg)
+ 
+ 
++def _log_event(event: str, **fields) -> None:
++    """P148/MOL-498: append a structured JSONL record to ~/.hermes/logs/symphony_bridge.log.
++
++    Fail-open: never raise. ISO 8601 UTC timestamp with Z suffix.
++    """
++    record = {"ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
++              "event": event, **fields}
++    try:
++        LOG_DIR.mkdir(parents=True, exist_ok=True)
++        with LOG_FILE.open("a") as fh:
++            fh.write(json.dumps(record, default=str) + "\n")
++            fh.flush()
++            os.fsync(fh.fileno())
++    except OSError:
++        pass
++
++
++def _stderr_tail(s: str) -> str:
++    """P148/MOL-498: cap stderr at last _STDERR_TAIL_MAX bytes to bound JSONL log size."""
++    if not s:
++        return ""
++    return s[-_STDERR_TAIL_MAX:]
++
++
++def _env_snapshot(env: dict[str, str], keys: list[str] | None = None) -> dict[str, str]:
++    """P148/MOL-498: redacted env-var snapshot. Logs SET/UNSET only — never values."""
++    if keys is None:
++        keys = _TRACKED_ENV_KEYS
++    return {k: ("SET" if env.get(k) else "UNSET") for k in keys}
++
++
++def _kill_process_group(proc: subprocess.Popen) -> None:
++    """P148/MOL-498: kill the entire process group of `proc`.
++
++    Required because `proc.kill()` only signals the immediate child — but `claude -p`
++    spawns subprocesses that survive parent death and re-attach to launchd as orphans.
++    The 5/10 zombie (PID 87220, 12h+ runtime, MOL-481) was created exactly this way.
++
++    Pairs with `start_new_session=True` at Popen time so the child has its own pgid.
++    """
++    try:
++        pgid = os.getpgid(proc.pid)
++        os.killpg(pgid, signal.SIGTERM)
++        # Give the group 2s to exit gracefully, then SIGKILL.
++        try:
++            proc.wait(timeout=2)
++        except subprocess.TimeoutExpired:
++            os.killpg(pgid, signal.SIGKILL)
++    except (OSError, ProcessLookupError):
++        # Process group already gone — fall back to direct kill.
++        try:
++            proc.kill()
++        except OSError:
++            pass
++
++
+ def _is_rate_limited(text: str) -> bool:
+     low = text.lower()
+     return any(p in low for p in _RATE_LIMIT_PATTERNS)
+@@ -189,11 +261,168 @@
+ 
+ 
+ def write_state(key: str, data: dict) -> None:
++    """P148/MOL-498: atomic state write via .tmp + os.replace (prevents truncation on crash)."""
+     STATE_DIR.mkdir(parents=True, exist_ok=True)
+     state_file = STATE_DIR / f"{key}.json"
+-    state_file.write_text(json.dumps(data, indent=2) + "\n")
++    tmp = state_file.with_suffix(".tmp")
++    tmp.write_text(json.dumps(data, indent=2) + "\n")
++    os.replace(tmp, state_file)
++
++
++def _set_checkpoint(state: dict, phase: str) -> None:
++    """P148/MOL-498: stamp last_checkpoint_phase + last_checkpoint_ts on the state dict.
++
++    Caller is responsible for writing. Phase values: dispatch_start | planner_done |
++    skeptic_done | builder_done | reviewer_done.
++    """
++    state["last_checkpoint_phase"] = phase
++    state["last_checkpoint_ts"] = _now_et_iso()
++
++
++def _detect_orphan_claude_processes() -> list[dict]:
++    """P148/MOL-498: detect orphaned `claude -p` processes parented to launchd (PPID 1).
++
++    The 5/10 MOL-481 zombie (PID 87220, 12h+ runtime, `~/.local/bin/claude -p ...`)
++    proved cron's SIGKILL doesn't propagate to descendants. New spawn paths use
++    start_new_session=True + killpg, but pre-P148 orphans may still be running.
++    Log them so operators can kill manually.
++
++    Read-only; does NOT kill anything (the orphan might be doing legitimate work).
++
++    Tight match: full command must include `bin/claude` and start with `-p` args
++    pattern. Rejects false positives like `free-claude-code/.venv/bin/python`.
++    """
++    found: list[dict] = []
++    try:
++        r = subprocess.run(
++            ["ps", "-Ao", "pid=,ppid=,etime=,args="],
++            capture_output=True, text=True, timeout=5,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        return found
++    for line in r.stdout.splitlines():
++        parts = line.split(None, 3)
++        if len(parts) < 4:
++            continue
++        pid, ppid, etime, args = parts
++        if not pid.isdigit() or not ppid.isdigit():
++            continue
++        if int(ppid) != 1:
++            continue
++        # Match the actual claude binary spawn (~/.local/bin/claude or /opt/.../claude)
++        # AND require `-p ` flag (print mode = the cron path). Excludes interactive
++        # claude sessions (no -p) and unrelated processes with "claude" in the path.
++        if "bin/claude" not in args:
++            continue
++        if " -p " not in args and not args.endswith(" -p"):
++            continue
++        # Reject `python` processes whose path contains "claude" (e.g. free-claude-code).
++        first_token = args.split()[0] if args.split() else ""
++        if first_token.endswith("/python") or first_token.endswith("/python3"):
++            continue
++        found.append({"pid": int(pid), "ppid": int(ppid),
++                      "etime": etime, "args_head": args[:200]})
++    return found
+ 
+ 
++def _sigkill_recovery_sweep() -> int:
++    """P148/MOL-498: detect state files stuck `last_status=running` past 60 min and
++    flip to `failed` + increment attempt_count. Required because SIGKILL (e.g. cron's
++    3600s hard kill) bypasses main()'s exception handler entirely.
++
++    Also logs any orphaned `claude -p` processes parented to launchd (zombie detection).
++
++    Returns count of recovered state files.
++    """
++    # Orphan detection (log only; never auto-kill — operators decide).
++    orphans = _detect_orphan_claude_processes()
++    for o in orphans:
++        _log_event("orphan_claude_detected", pid=o["pid"], ppid=o["ppid"],
++                   etime=o["etime"], args_head=o["args_head"],
++                   note="parented to launchd; likely SIGKILL-orphaned from a prior cron tick. "
++                        "Manual investigation recommended.")
++    if orphans:
++        _log(f"WARN: {len(orphans)} orphaned claude process(es) detected — see "
++             f"symphony_bridge.log event=orphan_claude_detected. Manual review.")
++
++    # State-file recovery sweep.
++    if not STATE_DIR.exists():
++        return 0
++    recovered = 0
++    now = datetime.now(timezone.utc)
++    for sf in sorted(STATE_DIR.glob("MOL-*.json")):
++        try:
++            state = json.loads(sf.read_text())
++        except (json.JSONDecodeError, OSError):
++            continue
++        if state.get("last_status") != "running":
++            continue
++        last_ts = state.get("last_attempt_ts")
++        if not last_ts:
++            continue
++        try:
++            last_dt = datetime.fromisoformat(last_ts)
++            age = (now - last_dt).total_seconds()
++        except (ValueError, TypeError):
++            continue
++        # Within the 60-min window: legitimate in-flight, skip.
++        if age <= 3600:
++            continue
++        # Past 60-min: SIGKILL-recovered stale state.
++        prev_phase = state.get("last_checkpoint_phase", "unknown")
++        state["last_status"] = "failed"
++        state["attempt_count"] = state.get("attempt_count", 0) + 1
++        state["sigkill_recovered_at"] = _now_et_iso()
++        try:
++            tmp = sf.with_suffix(".tmp")
++            tmp.write_text(json.dumps(state, indent=2) + "\n")
++            os.replace(tmp, sf)
++        except OSError:
++            continue
++        _log_event("sigkill_recovery", key=state.get("key", sf.stem),
++                   last_checkpoint_phase=prev_phase,
++                   stale_minutes=int(age / 60),
++                   new_attempt_count=state["attempt_count"])
++        _log(f"sigkill_recovery: {state.get('key', sf.stem)} stale {int(age/60)}m at "
++             f"phase={prev_phase}; attempt_count -> {state['attempt_count']}")
++        recovered += 1
++    return recovered
++
++
++def _preflight_probe() -> None:
++    """P148/MOL-498: baseline parent-process reachability data point for api.deepseek.com.
++
++    NOT a gate (gate ships in Phase 2 / MOL-501). Answers 'can the parent process reach
++    DeepSeek?' which is independent of whether the `claude -p` child subprocess can —
++    child-process probe is Phase 2's job.
++    """
++    ds_key = _get_api_key("DEEPSEEK_API_KEY")
++    start = time.monotonic()
++    headers = []
++    if ds_key:
++        headers = ["-H", f"Authorization: Bearer {ds_key}"]
++    try:
++        r = subprocess.run(
++            ["curl", "--max-time", "5", "-sS", "-o", "/dev/null",
++             "-w", "%{http_code}", DEEPSEEK_ENDPOINT,
++             "-X", "POST", "-H", "Content-Type: application/json",
++             *headers, "-d", "{}"],
++            capture_output=True, text=True, timeout=8,
++        )
++        elapsed_ms = int((time.monotonic() - start) * 1000)
++        _log_event("preflight_probe", endpoint=DEEPSEEK_ENDPOINT,
++                   http_code=r.stdout.strip(), elapsed_ms=elapsed_ms,
++                   curl_stderr=_stderr_tail(r.stderr),
++                   key_available=bool(ds_key),
++                   probe_note="parent-process reachability baseline; not a gate")
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        elapsed_ms = int((time.monotonic() - start) * 1000)
++        _log_event("preflight_probe", endpoint=DEEPSEEK_ENDPOINT,
++                   http_code=None, elapsed_ms=elapsed_ms,
++                   error=str(exc), key_available=bool(ds_key),
++                   probe_note="parent-process probe failed; tick proceeds")
++
++
+ # ── Tier 1: Claude Code + DeepSeek direct ──────────────────────────────────
+ 
+ def _run_cc_deepseek(prompt: str, repo_path: str, permission_mode: str,
+@@ -221,31 +450,71 @@
+     _log(f"Tier 1 (CC+DS): spawning claude -p --permission-mode {permission_mode} "
+          f"max_turns={max_turns} timeout={timeout_secs}s")
+ 
++    # P148/MOL-498: capture per-tier diagnostic record on every code path + process-group
++    # management so timeout-kills propagate to descendants (zombie-orphan prevention).
++    start_ts = time.monotonic()
++    env_snap = _env_snapshot(env)
++    stdout = ""
++    stderr = ""
++    exit_code: int | None = None
++    signal_name: str | None = None
++
+     try:
+         proc = subprocess.Popen(
+             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+             text=True, cwd=repo_path, env=env,
++            start_new_session=True,  # P148/MOL-498: own pgid → killpg can reap descendants
+         )
+         stdout, stderr = proc.communicate(timeout=timeout_secs)
++        exit_code = proc.returncode
+     except subprocess.TimeoutExpired:
++        _kill_process_group(proc)  # P148/MOL-498: SIGTERM then SIGKILL the whole group
+         try:
+-            proc.kill()
+-        except OSError:
+-            pass
+-        stdout, stderr = proc.communicate()
++            stdout, stderr = proc.communicate(timeout=5)
++        except subprocess.TimeoutExpired:
++            stdout = stdout or ""
++            stderr = stderr or ""
++        signal_name = "SIGKILL"
++        elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++        _log_event("tier_attempt", tier=1, engine="cc+ds", endpoint=DEEPSEEK_ENDPOINT,
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=exit_code, signal=signal_name,
++                   stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": 1,
+-                "error": f"timeout after {timeout_secs}s", "rate_limited": False}
++                "error": f"timeout after {timeout_secs}s",
++                "stderr_tail": _stderr_tail(stderr), "rate_limited": False}
+     except OSError as exc:
++        elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++        _log_event("tier_attempt", tier=1, engine="cc+ds", endpoint=DEEPSEEK_ENDPOINT,
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=None, signal=None, env_vars=env_snap,
++                   error=str(exc), outcome="spawn_error")
+         return {"success": False, "output": "", "tier": 1,
+                 "error": f"failed to start claude: {exc}", "rate_limited": False}
+ 
+-    if proc.returncode != 0:
+-        combined = f"{proc.returncode} {stderr}".lower()
++    elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++
++    if exit_code != 0:
++        combined = f"{exit_code} {stderr}".lower()
+         rate_limited = _is_rate_limited(combined)
++        _log_event("tier_attempt", tier=1, engine="cc+ds", endpoint=DEEPSEEK_ENDPOINT,
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=exit_code, signal=None,
++                   stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   env_vars=env_snap, rate_limited=rate_limited,
++                   outcome="rate_limited" if rate_limited else "nonzero_exit")
+         return {"success": False, "output": stdout, "tier": 1,
+-                "error": f"exit {proc.returncode}: {stderr[:300]}",
++                "error": f"exit {exit_code}: {stderr[:300]}",
++                "stderr_tail": _stderr_tail(stderr),
+                 "rate_limited": rate_limited}
+ 
++    _log_event("tier_attempt", tier=1, engine="cc+ds", endpoint=DEEPSEEK_ENDPOINT,
++               timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++               exit_code=0, signal=None, stdout_head=stdout[:500],
++               stderr_tail=_stderr_tail(stderr), env_vars=env_snap,
++               outcome="success")
++
+     try:
+         result = json.loads(stdout)
+     except json.JSONDecodeError:
+@@ -278,31 +547,74 @@
+     _log(f"Tier 2 (CC+Anthropic): spawning claude -p --permission-mode {permission_mode} "
+          f"max_turns={max_turns} timeout={timeout_secs}s")
+ 
++    # P148/MOL-498: per-tier diagnostic record + process-group mgmt (see Tier 1 for rationale).
++    start_ts = time.monotonic()
++    env_snap = _env_snapshot(env)
++    stdout = ""
++    stderr = ""
++    exit_code: int | None = None
++    signal_name: str | None = None
++
+     try:
+         proc = subprocess.Popen(
+             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+             text=True, cwd=repo_path, env=env,
++            start_new_session=True,  # P148/MOL-498: own pgid for killpg
+         )
+         stdout, stderr = proc.communicate(timeout=timeout_secs)
++        exit_code = proc.returncode
+     except subprocess.TimeoutExpired:
++        _kill_process_group(proc)
+         try:
+-            proc.kill()
+-        except OSError:
+-            pass
+-        stdout, stderr = proc.communicate()
++            stdout, stderr = proc.communicate(timeout=5)
++        except subprocess.TimeoutExpired:
++            stdout = stdout or ""
++            stderr = stderr or ""
++        signal_name = "SIGKILL"
++        elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++        _log_event("tier_attempt", tier=2, engine="cc+anthropic",
++                   endpoint="https://api.anthropic.com",
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=exit_code, signal=signal_name,
++                   stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": 2,
+-                "error": f"timeout after {timeout_secs}s", "rate_limited": False}
++                "error": f"timeout after {timeout_secs}s",
++                "stderr_tail": _stderr_tail(stderr), "rate_limited": False}
+     except OSError as exc:
++        elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++        _log_event("tier_attempt", tier=2, engine="cc+anthropic",
++                   endpoint="https://api.anthropic.com",
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=None, signal=None, env_vars=env_snap,
++                   error=str(exc), outcome="spawn_error")
+         return {"success": False, "output": "", "tier": 2,
+                 "error": f"failed to start claude: {exc}", "rate_limited": False}
+ 
+-    if proc.returncode != 0:
+-        combined = f"{proc.returncode} {stderr}".lower()
++    elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++
++    if exit_code != 0:
++        combined = f"{exit_code} {stderr}".lower()
+         rate_limited = _is_rate_limited(combined)
++        _log_event("tier_attempt", tier=2, engine="cc+anthropic",
++                   endpoint="https://api.anthropic.com",
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=exit_code, signal=None,
++                   stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   env_vars=env_snap, rate_limited=rate_limited,
++                   outcome="rate_limited" if rate_limited else "nonzero_exit")
+         return {"success": False, "output": stdout, "tier": 2,
+-                "error": f"exit {proc.returncode}: {stderr[:300]}",
++                "error": f"exit {exit_code}: {stderr[:300]}",
++                "stderr_tail": _stderr_tail(stderr),
+                 "rate_limited": rate_limited}
+ 
++    _log_event("tier_attempt", tier=2, engine="cc+anthropic",
++               endpoint="https://api.anthropic.com",
++               timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++               exit_code=0, signal=None, stdout_head=stdout[:500],
++               stderr_tail=_stderr_tail(stderr), env_vars=env_snap,
++               outcome="success")
++
+     try:
+         result = json.loads(stdout)
+     except json.JSONDecodeError:
+@@ -346,28 +658,75 @@
+     _log(f"Tier {tier} (Swarm+{provider}): spawning hermes -z "
+          f"timeout={timeout_secs}s")
+ 
+-    try:
+-        r = subprocess.run(
+-            argv, capture_output=True, text=True,
+-            timeout=timeout_secs, cwd=repo_path, env=env,
++    # P148/MOL-498: switch from subprocess.run(capture_output) to Popen + process-group
++    # so timeout-kills propagate to descendants (Tier 3/4 ran as black boxes pre-P148).
++    engine = f"hermes+{provider}"
++    start_ts = time.monotonic()
++    env_snap = _env_snapshot(env)
++    stdout = ""
++    stderr = ""
++    exit_code: int | None = None
++    signal_name: str | None = None
++
++    try:
++        proc = subprocess.Popen(
++            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++            text=True, cwd=repo_path, env=env,
++            start_new_session=True,  # P148/MOL-498: own pgid for killpg
+         )
++        stdout, stderr = proc.communicate(timeout=timeout_secs)
++        exit_code = proc.returncode
+     except subprocess.TimeoutExpired:
++        _kill_process_group(proc)
++        try:
++            stdout, stderr = proc.communicate(timeout=5)
++        except subprocess.TimeoutExpired:
++            stdout = stdout or ""
++            stderr = stderr or ""
++        signal_name = "SIGKILL"
++        elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++        _log_event("tier_attempt", tier=tier, engine=engine, provider=provider,
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=exit_code, signal=signal_name,
++                   stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": tier,
+-                "error": f"timeout after {timeout_secs}s", "rate_limited": False}
++                "error": f"timeout after {timeout_secs}s",
++                "stderr_tail": _stderr_tail(stderr), "rate_limited": False}
+     except OSError as exc:
++        elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++        _log_event("tier_attempt", tier=tier, engine=engine, provider=provider,
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=None, signal=None, env_vars=env_snap,
++                   error=str(exc), outcome="spawn_error")
+         return {"success": False, "output": "", "tier": tier,
+                 "error": f"failed to start hermes: {exc}", "rate_limited": False}
+ 
+-    if r.returncode != 0:
+-        combined = f"{r.returncode} {r.stderr}".lower()
++    elapsed_ms = int((time.monotonic() - start_ts) * 1000)
++
++    if exit_code != 0:
++        combined = f"{exit_code} {stderr}".lower()
+         rate_limited = _is_rate_limited(combined)
+-        return {"success": False, "output": r.stdout, "tier": tier,
+-                "error": f"exit {r.returncode}: {r.stderr[:300]}",
++        _log_event("tier_attempt", tier=tier, engine=engine, provider=provider,
++                   timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++                   exit_code=exit_code, signal=None,
++                   stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   env_vars=env_snap, rate_limited=rate_limited,
++                   outcome="rate_limited" if rate_limited else "nonzero_exit")
++        return {"success": False, "output": stdout, "tier": tier,
++                "error": f"exit {exit_code}: {stderr[:300]}",
++                "stderr_tail": _stderr_tail(stderr),
+                 "rate_limited": rate_limited}
+ 
+-    return {"success": True, "output": r.stdout, "tier": tier, "error": None}
++    _log_event("tier_attempt", tier=tier, engine=engine, provider=provider,
++               timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
++               exit_code=0, signal=None, stdout_head=stdout[:500],
++               stderr_tail=_stderr_tail(stderr), env_vars=env_snap,
++               outcome="success")
+ 
++    return {"success": True, "output": stdout, "tier": tier, "error": None}
+ 
++
+ # ── Fallback orchestrator ──────────────────────────────────────────────────
+ 
+ def run_phase_with_fallback(prompt: str, repo_path: str, permission_mode: str,
+@@ -587,6 +946,21 @@
+     STATE_DIR.mkdir(parents=True, exist_ok=True)
+     PLANS_DIR.mkdir(parents=True, exist_ok=True)
+ 
++    # P148/MOL-498: emit a per-tick boot record so log readers can correlate phases to ticks.
++    _log_event("tick_start", dry_run=dry_run, total_timeout_secs=_TOTAL_TIMEOUT_SECONDS)
++
++    # P148/MOL-498: SIGKILL recovery — flip stale `running` state files (>60 min old) to
++    # `failed` + increment attempt_count. Also detects orphaned claude -p processes
++    # parented to launchd (zombie warning, no auto-kill). Runs in DRY_RUN too — the
++    # symptoms need cleanup regardless of mode.
++    recovered = _sigkill_recovery_sweep()
++    if recovered:
++        _log(f"SIGKILL recovery: {recovered} state file(s) flipped running→failed")
++
++    # P148/MOL-498: baseline reachability probe (NOT a gate — Phase 2 ships the gate).
++    # Read-only network call; safe to run in DRY_RUN for diagnostic value.
++    _preflight_probe()
++
+     # ── Step 1: Query Jira ──────────────────────────────────────────────
+     _log("Querying Jira for eligible tickets...")
+     keys = query_jira()
+@@ -666,9 +1040,14 @@
+         # LIVE dispatch
+         state["last_status"] = "running"
+         state["last_attempt_ts"] = _now_et_iso()
++        # P148/MOL-498: stamp dispatch_start checkpoint BEFORE first phase so SIGKILL
++        # recovery on next tick can name the phase that died.
++        _set_checkpoint(state, "dispatch_start")
+         write_state(key, state)
+ 
+         _log(f"Dispatching {key} (attempt {state['attempt_count'] + 1})")
++        _log_event("dispatch_start", key=key,
++                   attempt_count=state["attempt_count"] + 1)
+ 
+         # Step 1.5: Extract repo + ticket info
+         ticket_body = get_ticket_body(key)
+@@ -685,11 +1064,16 @@
+             state["attempt_count"] += 1
+             write_state(key, state)
+             _log(f"DISPATCH FAILED: {key} Phase 1 failed: {p1.get('error')}")
++            _log_event("phase_failed", key=key, phase="planner",
++                       error=str(p1.get("error", ""))[:300], tier=p1.get("tier"))
+             dispatched_status = "failed"
+             dispatched += 1
+             break
+ 
+         plan_content = p1["plan_content"]
++        _set_checkpoint(state, "planner_done")
++        write_state(key, state)
++        _log_event("phase_complete", key=key, phase="planner", tier=p1.get("tier"))
+ 
+         # ── Phase 2: Skeptic ───────────────────────────────────────────
+         _log("── Phase 2 (Skeptic) ──")
+@@ -726,12 +1110,19 @@
+                 state["attempt_count"] += 1
+                 write_state(key, state)
+                 _log(f"DISPATCH INCOMPLETE: {key} Phase 2 retry: {p2['verdict']}")
++                _log_event("phase_failed", key=key, phase="skeptic_retry",
++                           verdict=p2.get("verdict"), tier=p2.get("tier"))
+                 print(f"⚠️ {key}: plan-skeptic {p2['verdict']} "
+                       f"after retry — plan needs manual revision")
+                 dispatched_status = "incomplete"
+                 dispatched += 1
+                 break
+ 
++        _set_checkpoint(state, "skeptic_done")
++        write_state(key, state)
++        _log_event("phase_complete", key=key, phase="skeptic",
++                   verdict=p2.get("verdict"), tier=p2.get("tier"))
++
+         # ── Phase 3: Builder ───────────────────────────────────────────
+         _log("── Phase 3 (Builder) ──")
+         p3 = phase_builder(key, plan_content, repo_path)
+@@ -742,10 +1133,17 @@
+             state["attempt_count"] += 1
+             write_state(key, state)
+             _log(f"DISPATCH INCOMPLETE: {key} Phase 3 failed or no PR")
++            _log_event("phase_failed", key=key, phase="builder",
++                       error=str(p3.get("error", ""))[:300], tier=p3.get("tier"))
+             dispatched_status = "incomplete"
+             dispatched += 1
+             break
+ 
++        _set_checkpoint(state, "builder_done")
++        write_state(key, state)
++        _log_event("phase_complete", key=key, phase="builder",
++                   pr_num=pr_num, tier=p3.get("tier"))
++
+         # ── Phase 4: Reviewer ──────────────────────────────────────────
+         _log("── Phase 4 (Reviewer) ──")
+         p4 = phase_reviewer(key, pr_num, repo_path)
+@@ -765,6 +1163,11 @@
+         else:
+             pr_state = "open"
+ 
++        _set_checkpoint(state, "reviewer_done")
++        _log_event("phase_complete", key=key, phase="reviewer",
++                   passed=p4.get("passed"), gate=p4.get("gate"),
++                   pr_state=pr_state, tier=p4.get("tier"))
++
+         # ── Update state ──────────────────────────────────────────────
+         if p4["passed"] and pr_state == "merged":
+             state["last_status"] = "succeeded"
+@@ -777,6 +1180,10 @@
+ 
+         _log(f"DISPATCH COMPLETE: {key} status={state['last_status']} "
+              f"pr_state={pr_state}")
++        _log_event("dispatch_complete", key=key,
++                   final_status=state["last_status"],
++                   pr_state=pr_state, pr_num=pr_num,
++                   attempt_count=state["attempt_count"])
+         dispatched_status = state["last_status"]
+         dispatched += 1
+         break  # 1-per-tick cap

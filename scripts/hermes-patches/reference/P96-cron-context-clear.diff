@@ -1,0 +1,132 @@
+commit ffa65291d1ca13c99dc6041f756feb8a1364d324
+Author: simbam99 <simbamax99@gmail.com>
+Date:   Wed Apr 29 18:43:07 2026 +0300
+
+    fix(cron): clear auto-delivery thread context between jobs
+
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 941aff3a3..b90270138 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -860,6 +860,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+         chat_id=str(origin["chat_id"]) if origin else "",
+         chat_name=origin.get("chat_name", "") if origin else "",
+     )
++    _cron_delivery_vars = (
++        "HERMES_CRON_AUTO_DELIVER_PLATFORM",
++        "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
++        "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
++    )
++    for _var_name in _cron_delivery_vars:
++        _VAR_MAP[_var_name].set("")
+ 
+     # Per-job working directory.  When set (and validated at create/update
+     # time), we point TERMINAL_CWD at it so:
+@@ -898,8 +905,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+         if delivery_target:
+             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
+             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+-            if delivery_target.get("thread_id") is not None:
+-                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(str(delivery_target["thread_id"]))
++            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
++                ""
++                if delivery_target.get("thread_id") is None
++                else str(delivery_target["thread_id"])
++            )
+ 
+         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+ 
+@@ -1198,6 +1208,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
+         # Clean up ContextVar session/delivery state for this job.
+         clear_session_vars(_ctx_tokens)
++        for _var_name in _cron_delivery_vars:
++            _VAR_MAP[_var_name].set("")
+         if _session_db:
+             try:
+                 _session_db.end_session(_cron_session_id, "cron_complete")
+diff --git a/tests/cron/test_scheduler.py b/tests/cron/test_scheduler.py
+index b5754bd8c..6170228c2 100644
+--- a/tests/cron/test_scheduler.py
++++ b/tests/cron/test_scheduler.py
+@@ -1027,6 +1027,80 @@ class TestRunJobSessionPersistence:
+         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
+         fake_db.close.assert_called_once()
+ 
++    def test_run_job_clears_stale_auto_delivery_thread_id_between_jobs(self, tmp_path, monkeypatch):
++        jobs = [
++            {
++                "id": "threaded-job",
++                "name": "threaded",
++                "prompt": "hello",
++                "deliver": "telegram:-1001:42",
++            },
++            {
++                "id": "threadless-job",
++                "name": "threadless",
++                "prompt": "hello again",
++                "deliver": "telegram:-2002",
++            },
++        ]
++        fake_db = MagicMock()
++        seen = []
++
++        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_PLATFORM", raising=False)
++        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID", raising=False)
++        monkeypatch.delenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID", raising=False)
++
++        class FakeAgent:
++            def __init__(self, *args, **kwargs):
++                pass
++
++            def run_conversation(self, *args, **kwargs):
++                from gateway.session_context import get_session_env
++
++                seen.append(
++                    {
++                        "platform": get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM") or None,
++                        "chat_id": get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID") or None,
++                        "thread_id": get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None,
++                    }
++                )
++                return {"final_response": "ok"}
++
++        with patch("cron.scheduler._hermes_home", tmp_path), \
++             patch("hermes_state.SessionDB", return_value=fake_db), \
++             patch(
++                 "hermes_cli.runtime_provider.resolve_runtime_provider",
++                 return_value={
++                     "api_key": "***",
++                     "base_url": "https://example.invalid/v1",
++                     "provider": "openrouter",
++                     "api_mode": "chat_completions",
++                 },
++             ), \
++             patch("run_agent.AIAgent", FakeAgent):
++            for job in jobs:
++                success, output, final_response, error = run_job(job)
++                assert success is True
++                assert error is None
++                assert final_response == "ok"
++                assert "ok" in output
++
++        assert seen == [
++            {
++                "platform": "telegram",
++                "chat_id": "-1001",
++                "thread_id": "42",
++            },
++            {
++                "platform": "telegram",
++                "chat_id": "-2002",
++                "thread_id": None,
++            },
++        ]
++        assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
++        assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
++        assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
++        assert fake_db.close.call_count == 2
++
+ 
+ class TestRunJobConfigLogging:
+     """Verify that config.yaml parse failures are logged, not silently swallowed."""

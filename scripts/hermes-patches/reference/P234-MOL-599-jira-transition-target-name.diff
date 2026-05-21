@@ -1,0 +1,31 @@
+--- a/scripts/symphony_loop.py
++++ b/scripts/symphony_loop.py
+@@ -585,6 +585,12 @@
+ # MOL-668: P231 — auto-transition Jira based on terminal verdict. Imports
+ # `_run_jira` from symphony_jira (P227 lift) to avoid loop↔bridge cyclical
+ # import. Fail-open: a Jira outage must NEVER block the loop verdict.
++# MOL-599 P234: target name corrected to match the MOL project workflow
++# ("Testing", not "In Testing"). The first live MOL-599 re-smoke after
++# P232+P233 unblocked the parser surfaced this name mismatch — the
++# pre-flight correctly logged `jira_transition_skipped reason=not_in_workflow`
++# (fail-open held), but no transition fired. This is the live-fail-mode
++# the MOL-668 deferred-proof gate was designed to catch.
+ def _transition_jira(state: LoopState, verdict: str, payload: Dict[str, Any]) -> None:
+     """Auto-transition Jira ticket based on terminal verdict.
+
+@@ -597,7 +603,7 @@
+     ALL_PASS + clean (drift==[] + clawpatch!=CRITICAL + ac_met)  → Done
+-    Builder ran + (drift!=[] OR ac_met==False)                   → In Testing
++    Builder ran + (drift!=[] OR ac_met==False)                   → Testing
+     BUDGET_EXHAUSTED / MAX_CYCLES / GOAL_*                        → comment only
+     """
+
+@@ -616,7 +622,7 @@
+         if verdict == VERDICT_ALL_PASS and ac_met and not drift and clawpatch != "CRITICAL":
+             target = "Done"
+         elif verdict == VERDICT_ALL_PASS or (payload.get("cycles_run", 0) > 0 and (drift or not ac_met)):
+-            target = "In Testing"
++            target = "Testing"
+
+         if target:
+             _ok_pf, stdout_pf, _err_pf = _run_jira(["jira", "issue", "move", key], timeout=15)

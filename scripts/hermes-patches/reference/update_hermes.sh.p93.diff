@@ -1,0 +1,29 @@
+diff --git a/scripts/hermes-patches/update_hermes.sh b/scripts/hermes-patches/update_hermes.sh
+--- a/scripts/hermes-patches/update_hermes.sh
++++ b/scripts/hermes-patches/update_hermes.sh
+@@ -36,6 +36,25 @@ bold "=== Pre-flight checks ==="
+ # 1. Pre-flight checks
+ # -------------------------------------------------------------------
+ bold "=== Pre-flight checks ==="
++
++# P93/MOL-283: Block updates on patched trees.
++# This script does `git checkout -- .` + `git clean -fd` which discards
++# uncommitted local patches.  After migration to a clean upstream tree
++# the fast-forward protection from founding commits disappears, so we
++# need an explicit sentinel check.
++PATCHED_MARKER="$HERMES_HOME/.patched-tree"
++if [ -f "$PATCHED_MARKER" ]; then
++    die "Patched tree detected ($PATCHED_MARKER exists).
++
++This script discards all local patches with 'git checkout -- .'.
++To upgrade safely, follow the MOL-283 migration workflow:
++  https://deep-agent-one.atlassian.net/browse/MOL-283
++
++If you are SURE you want to discard all patches:
++  rm $PATCHED_MARKER
++  bash scripts/hermes-patches/update_hermes.sh"
++fi
++
+ [ -d "$HERMES_AGENT/.git" ] || die "$HERMES_AGENT is not a git repo"
+
+ cd "$HERMES_AGENT"

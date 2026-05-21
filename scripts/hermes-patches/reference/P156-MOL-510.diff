@@ -1,0 +1,709 @@
+diff --git a/.hermes/scripts/symphony_queue.py b/.hermes/scripts/symphony_queue.py
+new file mode 100644
+index 0000000..0000001
+--- /dev/null
++++ b/.hermes/scripts/symphony_queue.py
+@@ -0,0 +1,480 @@
++"""SQLite-backed task queue for symphony-bridge. PATCH: P156/MOL-510.
++
++Phase 4b of Symphony v2: provides a single source-of-truth for ticket state
++across the (future) launchd daemon AND the existing cron-fallback runner.
++The atomic-claim primitive eliminates the daemon↔cron race identified in
++the MOL-510 plan: both runners use the same
++`BEGIN IMMEDIATE; UPDATE WHERE state='pending'` transaction, so the
++runner whose UPDATE returns rowcount==1 has uncontested ownership.
++
++Plan reference: `~/.claude/plans/in-layman-s-terms-are-abstract-wreath.md`
++(Symphony v2, Phase 4b, Round-5 HIGH-1 finding).
++
++Schema (single table):
++    tickets (
++      key TEXT PRIMARY KEY,
++      state TEXT NOT NULL CHECK(state IN (<VALID_STATES>)),
++      priority INTEGER DEFAULT 0,
++      attempt_count INTEGER DEFAULT 0,
++      next_attempt_at TEXT,                 -- ISO 8601 ET; nullable.
++                                            -- Compared via julianday() so
++                                            -- mixed-TZ-offset timestamps
++                                            -- collate by instant, not string.
++      last_outcome TEXT,                    -- pass | fail | abort | null
++      last_error_class TEXT,                -- transient|rate_limit|deterministic
++                                            -- |budget|health|unknown|null
++      ticket_body_hash TEXT,                -- sha256 of ticket body; nullable
++      last_pr_url TEXT,
++      last_telegram_alert_ts TEXT,          -- throttle; nullable
++      runs_log TEXT NOT NULL DEFAULT '[]',  -- JSON list, bounded to _RUNS_LOG_CAP
++      first_seen TEXT NOT NULL,
++      updated_at TEXT NOT NULL
++    )
++
++Deviation from MOL-510 plan: plan says "flock + UPDATE"; we use SQLite's
++BEGIN IMMEDIATE which acquires a RESERVED lock serializing writers
++without needing a separate file lock. `rowcount==1` from the conditional
++UPDATE is the actual mutual-exclusion primitive — flock would be
++redundant on top of BEGIN IMMEDIATE.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import sys
++from datetime import datetime
++from pathlib import Path
++from typing import Any, Literal, get_args
++from zoneinfo import ZoneInfo
++
++_DB_PATH_DEFAULT = Path.home() / ".hermes" / "symphony" / "queue.db"
++_ET = ZoneInfo("America/New_York")
++_RUNS_LOG_CAP = 20
++
++# State vocabulary — closed Literal type matching the P153/P154 pattern.
++# Adding/removing a state requires updating CHECK_CONSTRAINT_VALUES below
++# AND the verify_patches.sh state-vocabulary lock-ins.
++State = Literal[
++    "pending",
++    "running",
++    "succeeded",
++    "failed",
++    "blocked",
++    "aborted_budget",
++    "aborted_health",
++]
++VALID_STATES: frozenset[str] = frozenset(get_args(State))
++
++# Terminal states: lifecycle-final. `failed` is deliberately NOT terminal —
++# the retry-cadence policy (P157/MOL-512) flips it back to `pending`. The
++# `aborted_*` states are run-terminal but not lifecycle-terminal (a fresh
++# tick can re-attempt them).
++TerminalState = Literal["succeeded", "blocked"]
++TERMINAL_STATES: frozenset[str] = frozenset(get_args(TerminalState))
++
++# Invariant: terminal must be a subset of valid. A typo in TERMINAL_STATES
++# would silently misclassify state lifecycle, so assert at import time.
++assert TERMINAL_STATES <= VALID_STATES, (
++    f"TERMINAL_STATES {TERMINAL_STATES - VALID_STATES} not in VALID_STATES"
++)
++
++# String list for the SQL CHECK constraint. Quotes built explicitly so the
++# generated DDL is reviewable from the schema definition site.
++_CHECK_STATES_SQL = ", ".join(f"'{s}'" for s in sorted(VALID_STATES))
++
++
++def _now_iso() -> str:
++    """ISO 8601 with ET offset (e.g. `2026-MM-DDTHH:MM:SS.ffffff-04:00`).
++    Matches the JSON state-file convention; see any file under
++    `~/.hermes/symphony/state/*.json` for examples."""
++    return datetime.now(_ET).isoformat()
++
++
++def _connect(db_path: Path) -> sqlite3.Connection:
++    """Open with isolation_level=None so explicit BEGIN works; row_factory
++    for dict-style access on reads."""
++    conn = sqlite3.connect(db_path, isolation_level=None, timeout=30.0)
++    conn.row_factory = sqlite3.Row
++    return conn
++
++
++def init_queue(db_path: Path = _DB_PATH_DEFAULT) -> None:
++    """Idempotent: create db, table, indexes, set WAL mode. Safe to call
++    every daemon start + every cron tick.
++
++    Raises `RuntimeError` if WAL mode could not be enabled — the queue's
++    daemon↔cron concurrency guarantees depend on WAL semantics, so a
++    silent fallback to rollback-journal mode is treated as a hard error.
++    Common cause: db on a non-local FS (NFS, SMB, encrypted overlay).
++    """
++    db_path.parent.mkdir(parents=True, exist_ok=True)
++    with _connect(db_path) as conn:
++        actual_mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
++        if actual_mode.lower() != "wal":
++            raise RuntimeError(
++                f"queue.db requires WAL journal mode; got {actual_mode!r}. "
++                f"Likely cause: db_path on NFS/SMB/encrypted FS. "
++                f"Move {db_path} to a local APFS volume."
++            )
++        conn.execute("PRAGMA synchronous=NORMAL")
++        conn.execute(
++            f"""
++            CREATE TABLE IF NOT EXISTS tickets (
++                key TEXT PRIMARY KEY,
++                state TEXT NOT NULL
++                    CHECK(state IN ({_CHECK_STATES_SQL})),
++                priority INTEGER NOT NULL DEFAULT 0,
++                attempt_count INTEGER NOT NULL DEFAULT 0,
++                next_attempt_at TEXT,
++                last_outcome TEXT,
++                last_error_class TEXT,
++                ticket_body_hash TEXT,
++                last_pr_url TEXT,
++                last_telegram_alert_ts TEXT,
++                runs_log TEXT NOT NULL DEFAULT '[]',
++                first_seen TEXT NOT NULL,
++                updated_at TEXT NOT NULL
++            )
++            """
++        )
++        conn.execute("CREATE INDEX IF NOT EXISTS idx_state ON tickets(state)")
++        conn.execute(
++            "CREATE INDEX IF NOT EXISTS idx_state_priority "
++            "ON tickets(state, priority DESC, first_seen ASC)"
++        )
++
++
++def add_ticket(
++    db_path: Path,
++    key: str,
++    *,
++    priority: int = 0,
++    ticket_body_hash: str | None = None,
++    initial_state: State = "pending",
++) -> bool:
++    """INSERT OR IGNORE — returns True if the row was new, False if a row
++    for `key` already existed (no-op).
++
++    `initial_state` defaults to `pending`. `running` is technically valid
++    here (for an operator-initiated direct-write path) but the normal
++    lifecycle reaches `running` only via `claim_ticket`. Callers wanting
++    to enqueue work should always pass `pending` or omit the parameter."""
++    if initial_state not in VALID_STATES:
++        raise ValueError(f"initial_state={initial_state!r} not in {VALID_STATES}")
++    now = _now_iso()
++    with _connect(db_path) as conn:
++        cur = conn.execute(
++            """
++            INSERT OR IGNORE INTO tickets
++              (key, state, priority, ticket_body_hash, first_seen, updated_at)
++            VALUES (?, ?, ?, ?, ?, ?)
++            """,
++            (key, initial_state, priority, ticket_body_hash, now, now),
++        )
++        return cur.rowcount == 1
++
++
++def claim_ticket(
++    db_path: Path,
++    key: str,
++    runner_id: str,
++) -> bool:
++    """Atomic claim: returns True iff this caller transitioned `key` from
++    `pending` → `running`. Loser observes rowcount==0 and should sleep.
++
++    Caller contract:
++      - `True`  → caller owns the claim; MUST eventually call
++                  `release_ticket(...)`.
++      - `False` → lost the race OR ticket isn't in `pending`. Caller
++                  should call `get_next_claimable()` for a different
++                  ticket; if also None, sleep ≥30s before re-polling.
++      - `sqlite3.OperationalError` (escapes uncaught) → could not even
++                  attempt the claim (lock timeout, disk I/O, corruption).
++                  This is distinct from "lost the race". Caller MUST
++                  treat as transient and back off — see callers in
++                  symphony_bridge.run_one for the canonical pattern.
++
++    `runner_id` ("daemon" | "cron-fallback" | custom) is metadata recorded
++    in runs_log for debugging; it does NOT participate in mutual exclusion.
++
++    Implementation: BEGIN IMMEDIATE acquires a RESERVED lock, serializing
++    writers. The conditional UPDATE WHERE state='pending' is what actually
++    prevents double-claim; rowcount distinguishes winner from loser."""
++    now = _now_iso()
++    with _connect(db_path) as conn:
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            cur = conn.execute(
++                """
++                UPDATE tickets
++                   SET state = 'running',
++                       attempt_count = attempt_count + 1,
++                       updated_at = ?,
++                       runs_log = json(
++                         CASE
++                           WHEN json_array_length(runs_log) >= ?
++                             THEN json_remove(runs_log, '$[0]')
++                           ELSE runs_log
++                         END
++                       )
++                 WHERE key = ?
++                   AND state = 'pending'
++                """,
++                (now, _RUNS_LOG_CAP, key),
++            )
++            won = cur.rowcount == 1
++            if won:
++                conn.execute(
++                    """
++                    UPDATE tickets
++                       SET runs_log = json_insert(
++                         runs_log,
++                         '$[#]',
++                         json_object('ts', ?, 'runner', ?, 'event', 'claim')
++                       )
++                     WHERE key = ?
++                    """,
++                    (now, runner_id, key),
++                )
++            conn.execute("COMMIT")
++            return won
++        except sqlite3.Error:
++            try:
++                conn.execute("ROLLBACK")
++            except sqlite3.Error:
++                pass
++            raise
++
++
++def release_ticket(
++    db_path: Path,
++    key: str,
++    *,
++    final_state: State,
++    last_outcome: str | None = None,
++    last_error_class: str | None = None,
++    last_pr_url: str | None = None,
++    next_attempt_at: str | None = None,
++) -> None:
++    """Move a ticket out of `running` to a terminal/retry state. Called by
++    the runner that claimed it, after dispatch completes (success, fail,
++    or abort).
++
++    Raises `RuntimeError` if `key` is not in `running` state (the caller
++    either lost ownership or never owned it). Raises `ValueError` for
++    invalid `final_state` values.
++
++    Honors `_RUNS_LOG_CAP`: pre-trims the oldest entry if the log is full
++    BEFORE appending the release event, so the post-release length is
++    always ≤ `_RUNS_LOG_CAP`."""
++    if final_state not in VALID_STATES:
++        raise ValueError(f"final_state={final_state!r} not in {VALID_STATES}")
++    if final_state == "running":
++        raise ValueError("release_ticket cannot transition to 'running'")
++    now = _now_iso()
++    with _connect(db_path) as conn:
++        cur = conn.execute(
++            """
++            UPDATE tickets
++               SET state = ?,
++                   last_outcome = ?,
++                   last_error_class = ?,
++                   last_pr_url = COALESCE(?, last_pr_url),
++                   next_attempt_at = ?,
++                   updated_at = ?,
++                   runs_log = json_insert(
++                     json(
++                       CASE
++                         WHEN json_array_length(runs_log) >= ?
++                           THEN json_remove(runs_log, '$[0]')
++                         ELSE runs_log
++                       END
++                     ),
++                     '$[#]',
++                     json_object(
++                       'ts', ?,
++                       'event', 'release',
++                       'state', ?,
++                       'outcome', ?,
++                       'error_class', ?,
++                       'pr_url', ?
++                     )
++                   )
++             WHERE key = ?
++               AND state = 'running'
++            """,
++            (
++                final_state,
++                last_outcome,
++                last_error_class,
++                last_pr_url,
++                next_attempt_at,
++                now,
++                _RUNS_LOG_CAP,
++                now,
++                final_state,
++                last_outcome,
++                last_error_class,
++                last_pr_url,
++                key,
++            ),
++        )
++        if cur.rowcount != 1:
++            actual = conn.execute(
++                "SELECT state FROM tickets WHERE key = ?", (key,)
++            ).fetchone()
++            actual_state = actual[0] if actual else "<missing>"
++            raise RuntimeError(
++                f"release_ticket: expected to update exactly 1 row in 'running' "
++                f"state for key={key!r}, got rowcount={cur.rowcount}, "
++                f"actual_state={actual_state!r}. Caller did not own "
++                f"the claim, or state was already advanced."
++            )
++
++
++def get_ticket(db_path: Path, key: str) -> dict[str, Any] | None:
++    with _connect(db_path) as conn:
++        row = conn.execute(
++            "SELECT * FROM tickets WHERE key = ?", (key,)
++        ).fetchone()
++    if row is None:
++        return None
++    return _row_to_dict(row)
++
++
++def list_tickets(
++    db_path: Path,
++    *,
++    state: str | None = None,
++) -> list[dict[str, Any]]:
++    """Return all tickets, optionally filtered by `state`. Sorted by
++    priority DESC then first_seen ASC (the daemon dispatch order)."""
++    with _connect(db_path) as conn:
++        if state is None:
++            rows = conn.execute(
++                "SELECT * FROM tickets "
++                "ORDER BY priority DESC, first_seen ASC"
++            ).fetchall()
++        else:
++            rows = conn.execute(
++                "SELECT * FROM tickets WHERE state = ? "
++                "ORDER BY priority DESC, first_seen ASC",
++                (state,),
++            ).fetchall()
++    return [_row_to_dict(r) for r in rows]
++
++
++def get_next_claimable(db_path: Path) -> dict[str, Any] | None:
++    """Highest-priority `pending` ticket whose `next_attempt_at` is null or
++    in the past. Caller still must call `claim_ticket()` — this is just a
++    candidate. Race-safe by design: the claim's WHERE state='pending'
++    guard catches any concurrent advance.
++
++    Timestamp comparison uses SQLite's `julianday()` so that ISO 8601
++    strings with mixed timezone offsets collate by INSTANT, not by
++    lexicographic byte order. (Without this, a ts in `+00:00` offset
++    sorts as "later" than the same wall-clock instant in `-04:00`,
++    making retries silently unreachable.)"""
++    now = _now_iso()
++    with _connect(db_path) as conn:
++        row = conn.execute(
++            """
++            SELECT * FROM tickets
++             WHERE state = 'pending'
++               AND (next_attempt_at IS NULL
++                    OR julianday(next_attempt_at) <= julianday(?))
++             ORDER BY priority DESC, first_seen ASC
++             LIMIT 1
++            """,
++            (now,),
++        ).fetchone()
++    return _row_to_dict(row) if row else None
++
++
++def record_attempt_event(
++    db_path: Path,
++    key: str,
++    event: str,
++    **fields: Any,
++) -> None:
++    """Append a free-form event dict to runs_log. Caller-supplied `event`
++    string + arbitrary keyword fields. Used by the daemon for things like
++    'preflight_aborted', 'budget_warning', etc. that don't fit
++    claim/release. Bounded to _RUNS_LOG_CAP entries.
++
++    Raises `RuntimeError` if `key` does not exist — the event would
++    otherwise be silently lost (parity with `release_ticket` semantics)."""
++    now = _now_iso()
++    payload = json.dumps({"ts": now, "event": event, **fields})
++    with _connect(db_path) as conn:
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            conn.execute(
++                """
++                UPDATE tickets
++                   SET runs_log = json(
++                     CASE
++                       WHEN json_array_length(runs_log) >= ?
++                         THEN json_remove(runs_log, '$[0]')
++                       ELSE runs_log
++                     END
++                   )
++                 WHERE key = ?
++                """,
++                (_RUNS_LOG_CAP, key),
++            )
++            cur = conn.execute(
++                """
++                UPDATE tickets
++                   SET runs_log = json_insert(runs_log, '$[#]', json(?)),
++                       updated_at = ?
++                 WHERE key = ?
++                """,
++                (payload, now, key),
++            )
++            if cur.rowcount != 1:
++                conn.execute("ROLLBACK")
++                raise RuntimeError(
++                    f"record_attempt_event: key={key!r} does not exist; "
++                    f"event={event!r} dropped (no rows updated)."
++                )
++            conn.execute("COMMIT")
++        except sqlite3.Error:
++            try:
++                conn.execute("ROLLBACK")
++            except sqlite3.Error:
++                pass
++            raise
++
++
++def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
++    d = dict(row)
++    if "runs_log" in d and isinstance(d["runs_log"], str):
++        try:
++            d["runs_log"] = json.loads(d["runs_log"])
++        except json.JSONDecodeError as exc:
++            print(
++                f"WARNING: runs_log corrupt for key={d.get('key')!r}: {exc!r}. "
++                f"Returning [] to caller; row remains corrupt on disk.",
++                file=sys.stderr,
++            )
++            d["runs_log"] = []
++            d["runs_log_corrupt"] = True
++    return d
++
++
++__all__ = [
++    "State",
++    "TerminalState",
++    "VALID_STATES",
++    "TERMINAL_STATES",
++    "add_ticket",
++    "claim_ticket",
++    "get_next_claimable",
++    "get_ticket",
++    "init_queue",
++    "list_tickets",
++    "record_attempt_event",
++    "release_ticket",
++]
+diff --git a/.hermes/scripts/migrate_state_to_queue.py b/.hermes/scripts/migrate_state_to_queue.py
+new file mode 100644
+index 0000000..0000001
+--- /dev/null
++++ b/.hermes/scripts/migrate_state_to_queue.py
+@@ -0,0 +1,217 @@
++"""One-time migration: ~/.hermes/symphony/state/*.json → queue.db.
++PATCH: P156/MOL-510.
++
++Idempotent — uses INSERT OR IGNORE so re-running on a populated queue is
++a no-op for already-imported tickets. Existing queue rows are NEVER
++overwritten; the JSON files remain on disk as a rollback safety net
++until P158/MOL-513 (USE_DAEMON flag) explicitly retires them.
++
++Note on `running`: migrated `running` rows land in queue.db `running`
++state, but the existing P148 SIGKILL-recovery sweep operates on the
++JSON state files at `~/.hermes/symphony/state/*.json`, NOT on queue.db.
++Until P156/MOL-511 (daemon) or P158/MOL-513 (USE_DAEMON wire-up)
++extends recovery to queue.db, a migrated-then-stale `running` row will
++NOT auto-flip — operators must reset manually or wait for P156+.
++
++Mapping (json `last_status` → queue `state`):
++    unstarted                         → pending
++    succeeded                         → succeeded
++    running                           → running   (see note above)
++    failed                            → failed    (claimable for retry
++                                                    only after a retry-
++                                                    cadence policy flips
++                                                    back to pending —
++                                                    P157/MOL-512 territory)
++    incomplete + attempt_count >= _MAX_ATTEMPTS_LITERAL  → blocked
++    incomplete + attempt_count <  _MAX_ATTEMPTS_LITERAL  → pending
++    <anything else>                   → pending  (conservative;
++                                                   prints WARNING for
++                                                   operator visibility)
++
++DRY_RUN: set DRY_RUN=1 in the environment to print the proposed actions
++without touching the queue.
++
++Corruption handling: a JSON file that fails to decode (malformed, OSError
++during read, ValueError on int coercion of attempt_count, etc.) is
++renamed to `<key>.json.corrupt-<timestamp>` so the next run does not
++re-trip the same error AND the operator has a clear filesystem signal
++that the file needs attention.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import sys
++from pathlib import Path
++
++# sibling-module import works when ~/.hermes/scripts/ is on sys.path
++sys.path.insert(0, str(Path(__file__).parent))
++import symphony_queue as sq  # noqa: E402
++
++_STATE_DIR = Path.home() / ".hermes" / "symphony" / "state"
++_QUEUE_DB = Path.home() / ".hermes" / "symphony" / "queue.db"
++
++# The threshold mirrors symphony_bridge.py's run_one skip-logic, which
++# uses a bare literal `if attempt_count >= 3:` (no exported constant).
++# A bump on either side requires updating BOTH this value AND the
++# bridge's run_one literal; the verifier asserts this value as a
++# load-bearing structural check.
++_MAX_ATTEMPTS_LITERAL = 3
++
++
++def _map_state(json_status: str, attempt_count: int) -> str:
++    if json_status == "succeeded":
++        return "succeeded"
++    if json_status == "running":
++        return "running"
++    if json_status == "failed":
++        return "failed"
++    if json_status == "incomplete":
++        if attempt_count >= _MAX_ATTEMPTS_LITERAL:
++            return "blocked"
++        return "pending"
++    if json_status == "unstarted":
++        return "pending"
++    print(
++        f"WARNING: unknown json_status={json_status!r}; defaulting to 'pending'",
++        file=sys.stderr,
++    )
++    return "pending"
++
++
++def _quarantine(path: Path) -> Path:
++    """Rename a corrupt JSON file with a `.corrupt-<ts>` suffix so the
++    next migration run does not trip on it again. Returns the new path."""
++    from datetime import datetime as _dt
++
++    suffix = _dt.now().strftime(".corrupt-%Y%m%d-%H%M%S")
++    new_path = path.with_name(path.name + suffix)
++    try:
++        path.rename(new_path)
++        print(f"  quarantined: {path.name} → {new_path.name}", file=sys.stderr)
++    except OSError as exc:
++        print(
++            f"  WARNING: could not quarantine {path.name}: {exc!r}",
++            file=sys.stderr,
++        )
++        return path
++    return new_path
++
++
++def migrate(
++    state_dir: Path = _STATE_DIR,
++    queue_db: Path = _QUEUE_DB,
++    *,
++    dry_run: bool = False,
++) -> dict[str, object]:
++    """Returns counts: {imported, skipped_existing, errors, error_files}."""
++    counts: dict[str, object] = {
++        "imported": 0,
++        "skipped_existing": 0,
++        "errors": 0,
++        "error_files": [],
++    }
++    if not state_dir.exists():
++        print(f"state_dir does not exist: {state_dir}", file=sys.stderr)
++        return counts
++
++    if not dry_run:
++        sq.init_queue(queue_db)
++
++    for path in sorted(state_dir.glob("*.json")):
++        try:
++            data = json.loads(path.read_text())
++            key = data.get("key") or path.stem
++            last_status = data.get("last_status", "unstarted")
++            attempt_count = int(data.get("attempt_count", 0) or 0)
++        except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
++            print(f"ERROR reading {path.name}: {exc!r}", file=sys.stderr)
++            counts["errors"] = int(counts["errors"]) + 1  # type: ignore[assignment]
++            counts["error_files"].append(path.name)  # type: ignore[attr-defined]
++            if not dry_run:
++                _quarantine(path)
++            continue
++
++        target_state = _map_state(last_status, attempt_count)
++
++        if dry_run:
++            print(
++                f"DRY_RUN: {key:12s}  json={last_status:11s} attempts={attempt_count} "
++                f"→ queue state={target_state}"
++            )
++            continue
++
++        if sq.get_ticket(queue_db, key) is not None:
++            counts["skipped_existing"] = int(counts["skipped_existing"]) + 1  # type: ignore[assignment]
++            continue
++
++        sq.add_ticket(queue_db, key, initial_state=target_state)
++        # Backfill attempt_count + historical first_seen + last_outcome.
++        # add_ticket sets first_seen=now; we want to preserve the JSON's
++        # historical value where present, else fall back to a real
++        # timestamp (NEVER empty string — that would silently sort as
++        # oldest-possible in any future updated_at ordering).
++        historical_first_seen = data.get("first_seen") or sq._now_iso()
++        historical_updated_at = (
++            data.get("last_attempt_ts")
++            or data.get("first_seen")
++            or sq._now_iso()
++        )
++        with sqlite3.connect(queue_db, isolation_level=None) as conn:
++            cur = conn.execute(
++                """
++                UPDATE tickets
++                   SET attempt_count = ?,
++                       first_seen = ?,
++                       updated_at = ?,
++                       last_outcome = CASE
++                         WHEN ? = 'succeeded' THEN 'pass'
++                         WHEN ? IN ('failed','incomplete') THEN 'fail'
++                         ELSE NULL
++                       END
++                 WHERE key = ?
++                """,
++                (
++                    attempt_count,
++                    historical_first_seen,
++                    historical_updated_at,
++                    last_status,
++                    last_status,
++                    key,
++                ),
++            )
++            if cur.rowcount != 1:
++                print(
++                    f"  WARNING: backfill UPDATE for {key} matched "
++                    f"{cur.rowcount} rows (expected 1)",
++                    file=sys.stderr,
++                )
++        counts["imported"] = int(counts["imported"]) + 1  # type: ignore[assignment]
++        print(
++            f"imported: {key:12s}  json={last_status:11s} attempts={attempt_count} "
++            f"→ queue state={target_state}"
++        )
++
++    return counts
++
++
++def main(argv: list[str] | None = None) -> int:
++    dry_run = os.environ.get("DRY_RUN") == "1"
++    counts = migrate(dry_run=dry_run)
++    suffix = " (DRY_RUN)" if dry_run else ""
++    error_files = counts.get("error_files", [])
++    print(
++        f"\nDone{suffix}: imported={counts['imported']} "
++        f"skipped_existing={counts['skipped_existing']} errors={counts['errors']}"
++    )
++    if error_files:
++        print(f"  error_files (quarantined to *.corrupt-* if applicable):")
++        for f in error_files:
++            print(f"    - {f}")
++    return 1 if counts["errors"] else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

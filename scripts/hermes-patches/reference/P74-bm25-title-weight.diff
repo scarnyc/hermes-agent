@@ -1,0 +1,21 @@
+--- /tmp/store.py.pre-P74	2026-04-25 17:21:05
++++ /Users/wills_mac_mini/.hermes/hermes-agent/plugins/memory/tiered/store.py	2026-04-25 17:23:58
+@@ -366,7 +366,8 @@
+ 
+             rows = self._conn.execute(f"""
+                 SELECT me.id, me.title, me.content, me.category, me.created_at,
+-                       me.wing, me.room, me.superseded_by, rank AS fts_rank
++                       me.wing, me.room, me.superseded_by,
++                       bm25(memory_fts, 5.0, 1.0) AS fts_rank
+                 FROM memory_fts
+                 JOIN memory_entries me ON me.rowid = memory_fts.rowid
+                 WHERE memory_fts MATCH ?
+@@ -375,7 +376,7 @@
+                   AND (? IS NULL OR me.category = ?)
+                   AND (? IS NULL OR me.wing = ?)
+                   AND (? IS NULL OR me.room = ?)
+-                ORDER BY rank
++                ORDER BY bm25(memory_fts, 5.0, 1.0)
+                 LIMIT ?
+             """, (escaped, category, category, wing, wing, room, room, limit)).fetchall()
+ 

@@ -1,0 +1,91 @@
+# P83 / MOL-367 — Per-token-scoped completion marker for supersession
+#
+# Affected files:
+#   - plugins/memory/tiered/supersession.py (helper + per-token gate)
+#   - plugins/memory/tiered/tests/test_supersession.py (TestTokenScopeMOL367)
+#
+# Summary of changes:
+#
+# === supersession.py ===
+#
+# 1. Add module constant after _COMPLETION_RE block:
+#
+#    # P83/MOL-367 — split content into sentence-sized chunks for per-token scoping.
+#    # Sentence terminators (. ! ?) plus newlines, so bullet lists and headers act
+#    # as boundaries too. A single completion keyword in one sentence must NOT
+#    # tombstone a token mentioned only in a different sentence.
+#    _SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
+#
+# 2. Update _has_completion_marker docstring to clarify it's now a fast-path:
+#
+#    def _has_completion_marker(text: str) -> bool:
+#        """Return True if text contains any completion keyword at a word boundary.
+#
+#        Used as a cheap project-level fast-path before the per-token scan.
+#        The authoritative check is _token_is_completed() — see MOL-367.
+#        """
+#        return bool(_COMPLETION_RE.search(text or ""))
+#
+# 3. Add new helper after _has_completion_marker:
+#
+#    def _token_is_completed(token: str, text: str) -> bool:
+#        """Return True iff `text` contains a sentence holding both `token`
+#        (word-bounded) and a completion keyword.
+#
+#        P83/MOL-367 — replaces the project-wide _has_completion_marker gate
+#        that wrongly tombstoned older chats whenever a project entry mentioned
+#        ANY completed ticket alongside unrelated tokens. Both sides are
+#        word-bounded: token-side prevents "MOL-1" matching "MOL-168";
+#        keyword-side prevents "closed" matching "disclosed".
+#        """
+#        if not text or not token:
+#            return False
+#        token_re = re.compile(rf"\b{re.escape(token)}\b")
+#        for chunk in _SENTENCE_SPLIT_RE.split(text):
+#            if token_re.search(chunk) and _COMPLETION_RE.search(chunk):
+#                return True
+#        return False
+#
+# 4. Inside run_supersession()'s `for token in tokens:` loop, FIRST line of the
+#    body becomes:
+#
+#        for token in tokens:
+#            # P83/MOL-367 — per-token scoping. Project entry must mark
+#            # THIS token completed in the same sentence, not just contain
+#            # any completion keyword somewhere in the body.
+#            if not _token_is_completed(token, project_content):
+#                continue
+#
+#            # ... existing LIKE scan + regex re-check unchanged below ...
+#
+#    The project-level `if not _has_completion_marker(project_content): continue`
+#    fast-path REMAINS unchanged immediately above the `_extract_mol_tokens()` call.
+#
+# === tests/test_supersession.py ===
+#
+# 1. Import _token_is_completed in the existing import block:
+#
+#    from plugins.memory.tiered.supersession import (
+#        COMPLETION_KEYWORDS, MOL_TOKEN_RE, _extract_mol_tokens,
+#        _has_completion_marker, _token_is_completed, run_supersession,
+#    )
+#
+# 2. Add new TestTokenScopeMOL367 class at end of file with 6 tests:
+#    - test_token_marker_same_sentence (positive: marker before+after token)
+#    - test_diary_overmatch_reproduction (negative: different sentences)
+#    - test_token_word_boundary_on_token_side (MOL-1 vs MOL-168)
+#    - test_full_diagnostic_diary_excerpt (multi-token realistic excerpt)
+#    - test_run_supersession_skips_overmatch_token (DB integration)
+#    - test_empty_inputs_return_false (defensive)
+#
+# Marker count contract (verify_patches.sh):
+#   "P83/MOL-367" — 3 occurrences in supersession.py:
+#     1. _SENTENCE_SPLIT_RE constant comment
+#     2. _token_is_completed docstring
+#     3. per-token gate comment inside run_supersession
+#
+# Re-apply procedure: edit ~/.hermes/hermes-agent/plugins/memory/tiered/supersession.py
+# per items 1-4 above, edit tests/test_supersession.py per items 1-2 above, run
+# `bash scripts/hermes-patches/verify_patches.sh --quiet` to confirm 4 P83 checks pass,
+# then `cd ~/.hermes/hermes-agent && PYTHONPATH=. ./venv/bin/python3 -m pytest \
+# plugins/memory/tiered/tests/test_supersession.py -v` to confirm 27 tests pass.

@@ -1,0 +1,140 @@
+--- a/scripts/symphony_bridge.py
++++ b/scripts/symphony_bridge.py
+@@ -1008,8 +1008,18 @@
+ # ── Tier 1: Claude Code + DeepSeek direct ──────────────────────────────────
+ 
+ def _run_cc_deepseek(prompt: str, repo_path: str, permission_mode: str,
+-                     max_turns: int, timeout_secs: int) -> dict:
+-    """Tier 1: claude -p pointed at api.deepseek.com."""
++                     max_turns: int, timeout_secs: int,
++                     extra_add_dirs: list[str] | None = None) -> dict:
++    """Tier 1: claude -p pointed at api.deepseek.com.
++
++    P171/MOL-550 S5: extra_add_dirs splices additional `--add-dir <path>`
++    pairs into argv after repo_path. Phase 2 (Skeptic) and Phase 3 (Builder)
++    pass [str(PLANS_DIR)] so the subprocess can Read the plan file at
++    ~/.hermes/symphony/plans/<KEY>.md — outside repo_path's scope.
++    Repeat-flag form chosen over multi-value (Step 1.1 probe 2026-05-12
++    confirmed both parse via Commander.js variadic; repeat-flag is more
++    explicit about per-dir intent).
++    """
+     ds_key = _get_api_key("DEEPSEEK_API_KEY")
+     if not ds_key:
+         # P149 PR #170 review: emit tier_attempt for missing-key early-exit so
+@@ -1036,13 +1046,19 @@
+     # in favor of the ANTHROPIC_DEFAULT_OPUS_MODEL env var below — the same
+     # path claude-deepseek-direct.sh uses successfully (CC accepts the env
+     # var without consulting its catalog).
++    # P171/MOL-550 S5: splice extra --add-dir pairs for downstream phase reads.
++    extra_add_dir_args: list[str] = []
++    for d in (extra_add_dirs or []):
++        extra_add_dir_args.extend(["--add-dir", d])
+     argv = [
+         CLAUDE_BIN, "-p", "--bare",
+         "--permission-mode", permission_mode,
+         "--max-turns", str(max_turns),
+         "--output-format", "json",
+         "--no-session-persistence",
+-        "--add-dir", repo_path, "--",
++        "--add-dir", repo_path,
++        *extra_add_dir_args,
++        "--",
+         prompt,
+     ]
+ 
+@@ -1143,8 +1159,14 @@
+ # ── Tier 2: Claude Code + Anthropic Native ─────────────────────────────────
+ 
+ def _run_cc_anthropic(prompt: str, repo_path: str, permission_mode: str,
+-                      max_turns: int, timeout_secs: int) -> dict:
+-    """Tier 2: claude -p with default Anthropic API."""
++                      max_turns: int, timeout_secs: int,
++                      extra_add_dirs: list[str] | None = None) -> dict:
++    """Tier 2: claude -p with default Anthropic API.
++
++    P171/MOL-550 S5: see _run_cc_deepseek for extra_add_dirs rationale —
++    same plumbing here so Skeptic/Builder on Tier 2 can also Read the
++    plan file outside repo_path scope.
++    """
+     # P161/MOL-521 + P166/MOL-550 S3c: see _run_cc_deepseek for `--` separator
+     # rationale. P161 originally added --bare here as a sledgehammer for the
+     # silent-stdin-hang init steps; that disabled Keychain reads and broke
+@@ -1153,13 +1175,19 @@
+     # stdin=subprocess.DEVNULL backbone fix on the Popen call (S3b). With
+     # Keychain reads restored, Claude Max OAuth resolves on Tier 2. This
+     # also absorbs MOL-547 (which planned to salvage Tier 2's OAuth path).
++    # P171/MOL-550 S5: splice extra --add-dir pairs for downstream phase reads.
++    extra_add_dir_args: list[str] = []
++    for d in (extra_add_dirs or []):
++        extra_add_dir_args.extend(["--add-dir", d])
+     argv = [
+         CLAUDE_BIN, "-p",
+         "--permission-mode", permission_mode,
+         "--max-turns", str(max_turns),
+         "--output-format", "json",
+         "--no-session-persistence",
+-        "--add-dir", repo_path, "--",
++        "--add-dir", repo_path,
++        *extra_add_dir_args,
++        "--",
+         prompt,
+     ]
+ 
+@@ -1368,7 +1396,8 @@
+ def run_phase_with_fallback(prompt: str, repo_path: str, permission_mode: str,
+                             max_turns: int, timeout_secs: int,
+                             phase_name: PhaseName,
+-                            tracker: "BudgetTracker") -> dict:
++                            tracker: "BudgetTracker",
++                            extra_add_dirs: list[str] | None = None) -> dict:
+     """Try Tier 1 → Tier 2 → Tier 3 → Tier 4. Return first successful result.
+ 
+     P149/MOL-499: each tier gets ≤2 attempts based on _classify_tier_failure
+@@ -1378,11 +1407,16 @@
+     global wall-clock budget is the single source of truth for "do we have
+     time for this retry?". The tracker is non-optional; callers thread the
+     dispatch-start tracker in.
++
++    P171/MOL-550 S5: extra_add_dirs forwards downstream-phase --add-dir
++    extras to Tier 1+2 (CC subprocess paths). Tier 3+4 (`_run_hermes_swarm`)
++    has no --add-dir constraint and ignores the kwarg.
+     """
+     # Tier 1: CC + DeepSeek
+     result = _attempt_tier_with_retry(
+         lambda: _run_cc_deepseek(prompt, repo_path, permission_mode,
+-                                 max_turns, timeout_secs),
++                                 max_turns, timeout_secs,
++                                 extra_add_dirs=extra_add_dirs),
+         tier_num=1, phase_name=phase_name,
+         tracker=tracker, tier_timeout=timeout_secs,
+     )
+@@ -1393,7 +1427,8 @@
+     # Tier 2: CC + Anthropic
+     result = _attempt_tier_with_retry(
+         lambda: _run_cc_anthropic(prompt, repo_path, permission_mode,
+-                                  max_turns, timeout_secs),
++                                  max_turns, timeout_secs,
++                                  extra_add_dirs=extra_add_dirs),
+         tier_num=2, phase_name=phase_name,
+         tracker=tracker, tier_timeout=timeout_secs,
+     )
+@@ -1529,6 +1564,9 @@
+         timeout_secs=_PHASE_TIMEOUTS["skeptic"],
+         phase_name="skeptic",
+         tracker=tracker,  # P153/MOL-506
++        # P171/MOL-550 S5: Skeptic reads plan from PLANS_DIR — outside repo_path.
++        # CC subprocess --add-dir <repo> alone sandbox-blocks the Read; extend.
++        extra_add_dirs=[str(PLANS_DIR)],
+     )
+ 
+     output = result.get("output", "")
+@@ -1573,6 +1611,9 @@
+         timeout_secs=_PHASE_TIMEOUTS["builder"],
+         phase_name="builder",
+         tracker=tracker,  # P153/MOL-506
++        # P171/MOL-550 S5: Builder reads plan from PLANS_DIR — outside repo_path.
++        # Same sandbox extension as Skeptic so the builder agent can Read the plan.
++        extra_add_dirs=[str(PLANS_DIR)],
+     )
+ 
+     output = result.get("output", "")
