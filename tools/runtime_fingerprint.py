@@ -268,7 +268,7 @@ def telegram_alert_rate_limited(
         req = urllib.request.Request(
             url, data=data, headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 — fixed https Telegram API URL, not user input
             if 200 <= resp.status < 300:
                 return "sent"
             return f"error:http_{resp.status}"
@@ -530,13 +530,15 @@ def _process_counts() -> dict[str, int]:
             return -1
 
     # Patterns are anchor substrings, NOT regex anchors — the leading `[c]` /
-    # `[h]` / `[s]` bracket trick excludes the grep process itself. Trailing
-    # space rejected because hermes-agent processes show up as e.g.
-    # `python ~/.hermes/hermes-agent/run_agent.py` with no literal "hermes "
-    # token in `ps auxww`. Use the directory-marker substring instead.
+    # `[g]` / `[s]` bracket trick excludes the grep process itself.
+    # hermes_count scopes to the canonical gateway command `gateway run --replace`
+    # (matches both main + per-profile gateways; excludes node daemons under
+    # ~/.hermes/hermes-agent/node_modules/, stale symphony helpers, and other
+    # path-substring noise that the older `[h]ermes-agent` pattern swept in
+    # — false-positive H4 alert RCA, MOL-557).
     return {
         "claude_count": _count("[c]laude "),
-        "hermes_count": _count("[h]ermes-agent"),
+        "hermes_count": _count("[g]ateway run --replace"),
         "symphony_subprocess_count": _count("[s]ymphony_bridge"),
     }
 
