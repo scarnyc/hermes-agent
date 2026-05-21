@@ -2,13 +2,8 @@ name: patch-verifier
 on:
   pull_request:
     branches: [main]
-    paths:
-      - 'scripts/hermes-patches/**'
-      - '.github/workflows/patch-verifier.yml'
   push:
     branches: [main]
-    paths:
-      - 'scripts/hermes-patches/**'
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -27,3 +22,6 @@ jobs:
 
       - name: Assert PATCHES.md present
         run: test -f scripts/hermes-patches/PATCHES.md
+
+      - name: Run verifier in repo-only mode
+        run: bash scripts/hermes-patches/verify_patches.sh --quiet --repo-only

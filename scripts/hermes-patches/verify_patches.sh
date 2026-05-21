@@ -16,13 +16,50 @@
 
 set -uo pipefail
 
-HERMES_AGENT="${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
-HERMES_SCRIPTS="${HERMES_HOME:-$HOME/.hermes}/scripts"
-HERMES_SKILLS="${HERMES_HOME:-$HOME/.hermes}/skills"
-
+# MOL-1984 Phase 4 step 2 — --repo-only mode for CI gate
+#
+# Flag parsing supports any ordering of:
+#   --quiet       suppress all per-check output; only the exit code matters
+#   --repo-only   rebind HERMES_HOME / HERMES_AGENT / HERMES_SCRIPTS / HERMES_SKILLS
+#                 to the current working directory (the hermes-agent repo root).
+#                 Treats a MISSING target file as a SKIP (not a FAIL) — patches
+#                 that target runtime-only paths (e.g. ~/.hermes/scripts/<file>
+#                 that the install script produces, not the repo) are
+#                 automatically excluded from the verdict. Patches whose target
+#                 file IS in the repo are checked normally. Exit 0 iff
+#                 failed == 0; skipped count is informational.
+#
+# MOL-537a known-skip: P122 + P123 are absent from this verifier by design.
+# The original DeepSeek V4 sequence was stalled pre-deployment; their
+# provenance is too thin to fabricate verifier assertions. Re-add only
+# if their feature-branch commits are recovered with content.
 QUIET=0
-if [[ "${1:-}" == "--quiet" ]]; then
-    QUIET=1
+REPO_ONLY=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --quiet) QUIET=1 ;;
+        --repo-only) REPO_ONLY=1 ;;
+    esac
+done
+
+if [[ $REPO_ONLY -eq 1 ]]; then
+    # Pin HERMES_HOME so `${HERMES_HOME:-$HOME/.hermes}/scripts/X` paths in
+    # later check_fixed calls resolve to $PWD/scripts/X instead of the
+    # runtime tree. HERMES_AGENT is the repo root itself (run_agent.py +
+    # agent/ + hermes_cli/ live at top level).
+    HERMES_HOME="$PWD"
+    HERMES_AGENT="$PWD"
+    HERMES_SCRIPTS="$PWD/scripts"
+    HERMES_SKILLS="$PWD/skills"
+    # HERMES_POC_REPO points to the hermes-poc patch-maintenance repo
+    # (a sibling repo, not this one). In CI we're not checking out
+    # hermes-poc — point it at a sentinel non-path so every `$HERMES_POC_REPO/...`
+    # lookup hits the missing-file → SKIP branch under repo-only mode.
+    HERMES_POC_REPO="${HERMES_POC_REPO:-/nonexistent/hermes-poc}"
+else
+    HERMES_AGENT="${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
+    HERMES_SCRIPTS="${HERMES_HOME:-$HOME/.hermes}/scripts"
+    HERMES_SKILLS="${HERMES_HOME:-$HOME/.hermes}/skills"
 fi
 
 # P235/MOL-665: --terse mode. Self-delegates to the default (verbose) run and
@@ -73,7 +110,18 @@ fi
 
 passed=0
 failed=0
+skipped=0
 total=0
+
+# MOL-1984 Phase 4 — REPO_ONLY mode tracks helper outcomes separately from
+# inline-grep block outcomes. Helpers (check/check_marker_count/check_fixed)
+# properly honor REPO_ONLY skip semantics; inline-grep blocks scattered through
+# the script were written for runtime-only files and may "false fail" under
+# REPO_ONLY because their target lives in ~/.hermes/scripts/ not the repo.
+# CI gate (Phase 4) bases exit code on helper_failed when REPO_ONLY=1.
+helper_passed=0
+helper_failed=0
+helper_skipped=0
 
 check() {
     local label="$1"
@@ -82,23 +130,33 @@ check() {
     total=$((total + 1))
 
     if [ ! -f "$file" ]; then
+        if [[ $REPO_ONLY -eq 1 ]]; then
+            [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m %s — skipped (not in repo): %s\n' "$label" "$file"
+            skipped=$((skipped + 1))
+            helper_skipped=$((helper_skipped + 1))
+            return
+        fi
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s — file not found: %s\n' "$label" "$file"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
 
     if [ ! -r "$file" ]; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[?]\033[0m %s — file not readable: %s\n' "$label" "$file"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
 
     if grep -Eq "$pattern" "$file" 2>/dev/null; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m %s\n' "$label"
         passed=$((passed + 1))
+        helper_passed=$((helper_passed + 1))
     else
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s\n' "$label"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
     fi
 }
 
@@ -127,14 +185,22 @@ check_marker_count() {
     total=$((total + 1))
 
     if [ ! -f "$file" ]; then
+        if [[ $REPO_ONLY -eq 1 ]]; then
+            [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m %s — skipped (not in repo): %s\n' "$label" "$file"
+            skipped=$((skipped + 1))
+            helper_skipped=$((helper_skipped + 1))
+            return
+        fi
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s — file not found: %s\n' "$label" "$file"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
 
     if [ ! -r "$file" ]; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[?]\033[0m %s — file not readable: %s\n' "$label" "$file"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
 
@@ -146,9 +212,11 @@ check_marker_count() {
     if [ "$count" -ge "$min_count" ]; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m %s (>=%d, have %d)\n' "$label" "$min_count" "$count"
         passed=$((passed + 1))
+        helper_passed=$((helper_passed + 1))
     else
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s (expected >=%d, have %d)\n' "$label" "$min_count" "$count"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
     fi
 }
 
@@ -164,14 +232,22 @@ check_fixed() {
     total=$((total + 1))
 
     if [ ! -f "$file" ]; then
+        if [[ $REPO_ONLY -eq 1 ]]; then
+            [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m %s — skipped (not in repo): %s\n' "$label" "$file"
+            skipped=$((skipped + 1))
+            helper_skipped=$((helper_skipped + 1))
+            return
+        fi
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s — file not found: %s\n' "$label" "$file"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
 
     if [ ! -r "$file" ]; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[?]\033[0m %s — file not readable: %s\n' "$label" "$file"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
 
@@ -188,12 +264,14 @@ check_fixed() {
     if [ "$grep_exit" -eq 0 ]; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m %s\n' "$label"
         passed=$((passed + 1))
+        helper_passed=$((helper_passed + 1))
     else
         if [ "$grep_exit" -gt 1 ]; then
             [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[?]\033[0m %s — grep error (exit %d) on: %s\n' "$label" "$grep_exit" "$file"
         fi
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s\n' "$label"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
     fi
 }
 
@@ -208,13 +286,27 @@ check_mirror_sha256() {
     total=$((total + 1))
 
     if [ ! -f "$src" ]; then
+        if [[ $REPO_ONLY -eq 1 ]]; then
+            [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m %s — skipped (src not in repo): %s\n' "$label" "$src"
+            skipped=$((skipped + 1))
+            helper_skipped=$((helper_skipped + 1))
+            return
+        fi
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s — source not found: %s\n' "$label" "$src"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
     if [ ! -f "$mirror" ]; then
+        if [[ $REPO_ONLY -eq 1 ]]; then
+            [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m %s — skipped (mirror lives in runtime): %s\n' "$label" "$mirror"
+            skipped=$((skipped + 1))
+            helper_skipped=$((helper_skipped + 1))
+            return
+        fi
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s — mirror not found: %s\n' "$label" "$mirror"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
         return
     fi
 
@@ -225,11 +317,57 @@ check_mirror_sha256() {
     if [ -n "$src_sha" ] && [ "$src_sha" = "$mirror_sha" ]; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m %s\n' "$label"
         passed=$((passed + 1))
+        helper_passed=$((helper_passed + 1))
     else
         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m %s — drift\n      src    %s %s\n      mirror %s %s\n' "$label" "$src_sha" "$src" "$mirror_sha" "$mirror"
         failed=$((failed + 1))
+        helper_failed=$((helper_failed + 1))
     fi
 }
+
+# MOL-1984 Phase 4 — grep() shell function override active under REPO_ONLY=1.
+# Many P-blocks contain inline `grep -c PATTERN "$FILE"` patterns targeting
+# runtime files (e.g. ~/.hermes/scripts/symphony_bridge.py). When run against
+# the hermes-agent repo via --repo-only, those files don't exist. Without
+# this override:
+#   - grep emits "No such file or directory" to stderr (noisy log spam)
+#   - `grep -c` returns empty stdout → next `[ "$VAR" -ge 3 ]` crashes
+#     with "integer expression expected"
+#
+# The override last-arg-checks for absolute paths that don't exist. When
+# triggered, it:
+#   - suppresses stderr (no "No such file" noise)
+#   - emits "0" when -c flag is set (integer comparisons stay clean)
+#   - returns 1 (no-match semantics, matches grep behavior on empty input)
+#
+# Inline-block FAIL counts under REPO_ONLY are tracked but excluded from the
+# CI exit code — the CI gate (Phase 4) bases pass/fail on helper_failed only.
+if [[ $REPO_ONLY -eq 1 ]]; then
+    grep() {
+        local last_arg=""
+        local has_count=0
+        local arg
+        for arg in "$@"; do
+            # Detect any combined or standalone -c flag in option args (e.g. -c, -Fc, -cE).
+            if [[ "$arg" == -* && "$arg" != "--" ]]; then
+                case "$arg" in
+                    *c*) has_count=1 ;;
+                esac
+            fi
+            last_arg="$arg"
+        done
+        if [[ "$last_arg" == /* && ! -e "$last_arg" ]]; then
+            if [[ $has_count -eq 1 ]]; then
+                # Return 0 + emit "0" so callers using `... || echo 0` don't double-emit
+                # (memory grep_c_footgun: `grep -c || echo 0` is the canonical trap).
+                echo "0"
+                return 0
+            fi
+            return 1
+        fi
+        command grep "$@"
+    }
+fi
 
 [[ $QUIET -eq 0 ]] && echo ""
 [[ $QUIET -eq 0 ]] && echo "=== P03: config.py (mcp_servers + envchain guard) ==="
@@ -7682,6 +7820,23 @@ fi
 # Reference diff present
 check_fixed       "P234 reference diff present at scripts/hermes-patches/reference/" \
     "scripts/hermes-patches/reference/P234-MOL-599-jira-transition-target-name.diff" 'MOL-599 P234'
+
+[[ $QUIET -eq 0 ]] && printf '\n=== Summary: %d passed, %d failed, %d skipped, %d total ===\n' "$passed" "$failed" "$skipped" "$total"
+
+# MOL-1984 Phase 4 — under REPO_ONLY, base the CI exit code on helper outcomes.
+# Helpers (check/check_marker_count/check_fixed/check_mirror_sha256) honor
+# REPO_ONLY skip semantics; inline-grep blocks may "false fail" against
+# runtime-only paths and are surfaced separately. CI passes when no helper
+# check failed.
+if [[ $REPO_ONLY -eq 1 ]]; then
+    inline_failed=$((failed - helper_failed))
+    [[ $QUIET -eq 0 ]] && printf '=== Helper checks: %d passed, %d failed, %d skipped | Inline (REPO_ONLY-skipped runtime checks): %d failed ===\n' \
+        "$helper_passed" "$helper_failed" "$helper_skipped" "$inline_failed"
+    if [ "$helper_failed" -gt 0 ]; then
+        exit 1
+    fi
+    exit 0
+fi
 
 if [ "$failed" -gt 0 ]; then
     exit 1
