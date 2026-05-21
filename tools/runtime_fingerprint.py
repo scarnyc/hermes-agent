@@ -610,7 +610,7 @@ def _detect_orphaned_bracket_meta() -> dict | None:
         if not isinstance(pid, int) or pid <= 0:
             return None
         try:
-            os.kill(pid, 0)
+            os.kill(pid, 0)  # windows-footgun: ok (macOS-only runtime)
         except ProcessLookupError:
             return meta
         except (PermissionError, OSError):

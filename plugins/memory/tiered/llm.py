@@ -100,7 +100,7 @@ def _write_tripwire(reason: str, detail: dict) -> None:
     try:
         os.makedirs(_TRIPWIRE_DIR, exist_ok=True)
         path = os.path.join(_TRIPWIRE_DIR, f"composer-{reason}-{int(time.time())}.json")
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump({"ts": time.time(), "reason": reason, **detail}, f)
     except OSError:
         pass

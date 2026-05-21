@@ -136,7 +136,7 @@ def _concurrent_writer(home_str: str, path_str: str, value: str) -> None:
     import tools.runtime_fingerprint as rf  # noqa: E402
 
     p = Path(path_str)
-    p.write_text(value)
+    p.write_text(value, encoding="utf-8")
     rf.record_hermes_write([p], rf.compute_fingerprint([p]))
 
 
