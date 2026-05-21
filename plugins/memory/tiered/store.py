@@ -158,7 +158,7 @@ def _load_taxonomy() -> dict:
         if path.exists():
             try:
                 import yaml
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     return yaml.safe_load(f)
             except Exception as e:
                 logger.warning("Failed to load taxonomy from %s: %s", path, e)
@@ -347,7 +347,7 @@ class TieredMemoryDB:
                 tripwire_dir, f"reembed-failure-{int(time.time())}.json"
             )
             try:
-                with open(tripwire, "w") as f:
+                with open(tripwire, "w", encoding="utf-8") as f:
                     json.dump(
                         {
                             "ts": time.time(),
@@ -427,6 +427,7 @@ class TieredMemoryDB:
             if not escaped:
                 return []
 
+            superseded_clause = "AND me.superseded_by IS NULL" if not include_superseded else ""
             rows = self._conn.execute(f"""
                 SELECT me.id, me.title, me.content, me.category, me.created_at,
                        me.wing, me.room, me.superseded_by,
@@ -435,13 +436,13 @@ class TieredMemoryDB:
                 JOIN memory_entries me ON me.rowid = memory_fts.rowid
                 WHERE memory_fts MATCH ?
                   AND me.archived_at IS NULL
-                  {"AND me.superseded_by IS NULL" if not include_superseded else ""}
+                  {superseded_clause}
                   AND (? IS NULL OR me.category = ?)
                   AND (? IS NULL OR me.wing = ?)
                   AND (? IS NULL OR me.room = ?)
                 ORDER BY bm25(memory_fts, 5.0, 1.0)
                 LIMIT ?
-            """, (escaped, category, category, wing, wing, room, room, limit)).fetchall()
+            """, (escaped, category, category, wing, wing, room, room, limit)).fetchall()  # nosec B608 — superseded_clause is one of two hardcoded literals
 
             return [dict(row) for row in rows]
 
@@ -465,12 +466,13 @@ class TieredMemoryDB:
 
             results = []
             for vr in vec_rows:
+                superseded_clause = "AND superseded_by IS NULL" if not include_superseded else ""
                 me = self._conn.execute(f"""
                     SELECT id, title, content, category, created_at, wing, room, superseded_by
                     FROM memory_entries
                     WHERE rowid = ? AND archived_at IS NULL
-                    {"AND superseded_by IS NULL" if not include_superseded else ""}
-                """, (vr["entry_rowid"],)).fetchone()
+                    {superseded_clause}
+                """, (vr["entry_rowid"],)).fetchone()  # nosec B608 — superseded_clause is one of two hardcoded literals
                 if me:
                     if wing and me["wing"] != wing:
                         continue
@@ -637,7 +639,7 @@ class TieredMemoryDB:
                     OR title LIKE 'Fallback diary:%'
                     OR (category = 'chat' AND LOWER(TRIM(title)) IN ({title_placeholders}))
                     OR (category = 'chat' AND LENGTH(content) < 30)
-            """
+            """  # nosec B608 — title_placeholders is structural "?,?,..."
             noise_rowids = self._conn.execute(select_sql, noise_titles).fetchall()
 
             if dry_run:
@@ -655,7 +657,7 @@ class TieredMemoryDB:
                     OR title LIKE 'Fallback diary:%'
                     OR (category = 'chat' AND LOWER(TRIM(title)) IN ({title_placeholders}))
                     OR (category = 'chat' AND LENGTH(content) < 30)
-            """
+            """  # nosec B608 — title_placeholders is structural "?,?,..."
             cursor = self._conn.execute(delete_sql, noise_titles)
             count = cursor.rowcount
             if count > 0:
@@ -810,14 +812,14 @@ class TieredMemoryDB:
                             WHERE rowid IN ({placeholders})
                             ORDER BY LENGTH(content) DESC
                             LIMIT 1
-                        """, group_rowids).fetchone()
+                        """, group_rowids).fetchone()  # nosec B608 — placeholders is structural "?,?,..."
                     else:
                         keeper = self._conn.execute(f"""
                             SELECT rowid, id FROM memory_entries
                             WHERE rowid IN ({placeholders})
                             ORDER BY created_at DESC
                             LIMIT 1
-                        """, group_rowids).fetchone()
+                        """, group_rowids).fetchone()  # nosec B608 — placeholders is structural "?,?,..."
 
                     keeper_rowid = keeper["rowid"]
                     keeper_id = keeper["id"]
