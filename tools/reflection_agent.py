@@ -324,7 +324,7 @@ def analyze_cron_run(
     and computing manifest + structural-verifier claims.
     """
     try:
-        output_body = output_path.read_text()
+        output_body = output_path.read_text(encoding="utf-8")
     except OSError as e:
         _log_invocation(job_id, [], "", error=f"read failed: {e}")
         return []
