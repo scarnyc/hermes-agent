@@ -1,0 +1,626 @@
+"""Autonomous skill patcher (MOL-376).
+
+After the reflection flywheel exhausts retries with HIGH concerns remaining,
+this module diagnoses which skill instruction caused the failure and surgically
+edits the SKILL.md to fix the root cause. Next cron run, the improved
+instructions produce better output.
+
+Key safety properties:
+  - FAIL-OPEN: any error returns without patching; delivery proceeds normally
+  - DEDUP GUARD: same (job_id, skill_name, concern_category) blocked for 24h
+  - LLM-GATED: Kimi K2.6 diagnoses whether a concern is fixable; returns
+    no_change: true for hallucination/external-factor concerns
+  - FUZZY-MATCH: _patch_skill() fuzzy-match engine rejects ambiguous patches
+  - SECURITY SCAN: skills_guard.py runs on every autonomous edit; rollback on block
+  - DRY_RUN: config flag lets us observe diagnoses without writing files
+  - AUDIT LOG: every diagnosis written to ~/.hermes/logs/skill-patches.log (JSONL)
+
+Entry point: diagnose_and_patch(job, concerns, final_response, auto_patch_cfg)
+Never raises — returns None on any error, logs the exception.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+import hashlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+_MODEL = "moonshotai/kimi-k2.6"
+# P81/MOL-294: HERMES_MOCK_LLM_URL routes to aimock when set (dev-loop cost control).
+_BASE_URL = os.environ.get("HERMES_MOCK_LLM_URL", "").strip() or "https://openrouter.ai/api/v1"
+_API_KEY_ENV = "OPENROUTER_API_KEY"
+_PATCH_LOG_PATH = Path.home() / ".hermes" / "logs" / "skill-patches.log"
+_SKILLS_DIR = Path.home() / ".hermes" / "skills"
+_GENERATE_LOCK_SCRIPT = Path.home() / ".hermes" / "scripts" / "generate-skills-lock.py"
+
+# Kimi K2.6 via OpenRouter — temperature=1.0 retained defensively (provider-imposed).
+_TEMPERATURE = 1.0
+_MAX_TOKENS = 16384
+
+_client = None
+
+# Concern categories that can plausibly be fixed by editing skill instructions.
+# fabrication: LLM hallucinated — changing skill text won't prevent hallucination
+# semantic: internal inconsistency — usually a one-off LLM error, not a skill bug
+_PATCHABLE_CATEGORIES = {"evidence", "transition_missing", "work_not_completed"}
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        from openai import OpenAI
+        api_key = os.environ.get(_API_KEY_ENV, "").strip()
+        if not api_key:
+            raise RuntimeError(f"{_API_KEY_ENV} not set — cannot call diagnosis LLM")
+        _client = OpenAI(base_url=_BASE_URL, api_key=api_key)
+    return _client
+
+
+def _call_kimi(prompt: str) -> str:
+    """Single-turn Kimi K2.6 call. Returns response content string."""
+    client = _get_client()
+    response = client.chat.completions.create(
+        model=_MODEL,
+        max_tokens=_MAX_TOKENS,
+        temperature=_TEMPERATURE,
+        messages=[{"role": "user", "content": prompt}],
+        extra_body={"thinking": {"type": "enabled"}},
+    )
+    msg = response.choices[0].message
+    content = msg.content or ""
+    if not content.strip():
+        reasoning = getattr(msg, "reasoning", None) or ""
+        if reasoning.strip():
+            logger.warning(
+                "Kimi returned empty content (finish_reason=%s); using reasoning trace as fallback",
+                response.choices[0].finish_reason,
+            )
+            return reasoning
+    return content
+
+
+# ── Prompt template ───────────────────────────────────────────────────────
+# The prompt IS the feature. Kimi diagnoses whether a reflection concern traces
+# to a fixable skill-instruction flaw, and if so, returns the exact old_string /
+# new_string for surgical replacement via _patch_skill().
+#
+# DESIGN RATIONALE:
+# - no_change: true is the default — we only patch when the LLM is confident the
+#   concern traces to a specific instruction flaw. Hallucination, one-off model
+#   errors, and external factors are NOT patchable.
+# - old_string must be a verbatim substring of SKILL.md. The fuzzy-match engine
+#   in _patch_skill() handles whitespace/indentation normalization, but the LLM
+#   should still try to match verbatim text.
+# - new_string is the replacement text. Keep it surgical — change the minimum
+#   needed to fix the instruction, don't rewrite the whole skill.
+# - Only HIGH-severity concerns from patchable categories are presented. Medium/
+#   low concerns and fabrication/semantic concerns are excluded upfront.
+
+_DIAGNOSIS_PROMPT = """You are a careful technical editor. A cron job running the skill below produced output with HIGH-severity concerns caught by a semantic reviewer. Your job is to determine WHETHER these concerns trace to a flaw in the skill's instructions — and if so, what exact edit would fix the root cause.
+
+For each concern, decide:
+
+  **PATCHABLE** — the concern traces to a specific instruction in the skill that is:
+    - MISSING: the skill doesn't tell the agent to do something it should (e.g., close the ticket after completing work)
+    - WRONG: the skill tells the agent to do something incorrectly (e.g., use a field/flag that doesn't exist)
+    - AMBIGUOUS: the skill's wording is vague enough that different readings produce different (wrong) behavior
+
+  **NOT PATCHABLE** — the concern is about:
+    - HALLUCINATION: the agent fabricated API fields, function names, or data that don't exist
+    - ONE-OFF ERROR: the agent made a mistake it wouldn't make on a second try with the same instructions
+    - EXTERNAL FACTOR: a rate limit, API error, network issue, or other runtime condition
+    - CORRECT BEHAVIOR: the concern is a false positive — the agent actually did the right thing
+
+Return ONLY a JSON object — no prose, no code fences. Shape:
+
+    {{
+      "diagnoses": [
+        {{
+          "concern_index": 0,
+          "patchable": true,
+          "skill_file": "SKILL.md",
+          "old_string": "verbatim text to find in the skill file",
+          "new_string": "replacement text that fixes the instruction",
+          "rationale": "One sentence explaining what was wrong and how this fixes it."
+        }},
+        {{
+          "concern_index": 1,
+          "patchable": false,
+          "rationale": "One sentence explaining why this concern can't be fixed by editing the skill."
+        }}
+      ]
+    }}
+
+If no concerns are patchable, return {{"diagnoses": []}}. Do not invent patches. Do not edit the skill for style or improvement — only fix instructions that caused the specific concerns listed.
+
+IMPORTANT RULES:
+- old_string MUST be a verbatim substring of the SKILL.md content below. Copy it character-for-character including indentation, blank lines, and punctuation.
+- new_string should be the MINIMAL change — replace only the broken part, leave everything else identical.
+- If the fix is ADDING a missing instruction, set old_string to the exact line or heading AFTER which the new text should be inserted, and new_string to that line PLUS the new instruction. The patcher will replace old_string with new_string.
+- If the fix is DELETING a wrong instruction, set new_string to an empty string.
+- rationale is mandatory for both patchable and non-patchable diagnoses.
+
+---
+SKILL: {skill_name}
+SKILL FILE: {skill_file}
+
+{skill_content}
+
+---
+CONCERNS (HIGH severity only, from the semantic reviewer):
+
+{concerns_text}
+
+---
+CRON OUTPUT (the agent's final response that triggered these concerns):
+
+{final_response}
+
+---
+Return JSON now."""
+
+
+def _extract_skill_name(job: dict) -> Optional[str]:
+    """Extract the skill name from a cron job dict. Returns None if not found."""
+    skill = job.get("skill") or ""
+    if skill:
+        return str(skill).strip()
+    skills = job.get("skills") or []
+    if skills and isinstance(skills, list):
+        return str(skills[0]).strip()
+    return None
+
+
+def _read_skill_content(skill_name: str) -> Optional[tuple[Path, str]]:
+    """Read the SKILL.md for a named skill. Returns (path, content) or None."""
+    skill_dir = _SKILLS_DIR / skill_name
+    if not skill_dir.is_dir():
+        # Try recursive search
+        for candidate in _SKILLS_DIR.rglob(skill_name):
+            if candidate.is_dir():
+                skill_dir = candidate
+                break
+        else:
+            return None
+
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        return None
+
+    try:
+        return (skill_md, skill_md.read_text(encoding="utf-8"))
+    except OSError as e:
+        logger.warning("Failed to read skill %s: %s", skill_name, e)
+        return None
+
+
+def _build_diagnosis_prompt(
+    skill_name: str,
+    skill_content: str,
+    skill_file: str,
+    concerns: list,
+    final_response: str,
+) -> str:
+    """Build the diagnosis prompt for Kimi K2.6."""
+    concern_lines = []
+    for i, c in enumerate(concerns):
+        sev = getattr(c, "severity", "")
+        cat = getattr(c, "category", "")
+        desc = getattr(c, "description", "")
+        ev = getattr(c, "evidence", "")
+        concern_lines.append(
+            f"[{i}] {sev.upper()} / {cat}\n    Description: {desc}\n    Evidence: {ev}"
+        )
+    concerns_text = "\n\n".join(concern_lines)
+
+    # Cap final_response to leave headroom for skill_content + reasoning
+    if len(final_response) > 20_000:
+        final_response = final_response[:20_000] + "\n\n[...truncated for prompt-size cap...]"
+
+    return _DIAGNOSIS_PROMPT.format(
+        skill_name=skill_name,
+        skill_file=skill_file,
+        skill_content=skill_content,
+        concerns_text=concerns_text,
+        final_response=final_response,
+    )
+
+
+def _parse_diagnosis(response_text: str) -> list[dict]:
+    """Parse Kimi's JSON diagnosis response. Returns list of diagnosis dicts."""
+    import re
+
+    if not response_text or not response_text.strip():
+        return []
+
+    _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+    _BARE_JSON_RE = re.compile(r"(\{.*\})", re.DOTALL)
+
+    for pat in (_JSON_FENCE_RE, _BARE_JSON_RE):
+        m = pat.search(response_text)
+        if not m:
+            continue
+        try:
+            data = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        diagnoses = data.get("diagnoses", []) if isinstance(data, dict) else []
+        out = []
+        for d in diagnoses:
+            if not isinstance(d, dict):
+                continue
+            patchable = bool(d.get("patchable", False))
+            entry = {
+                "concern_index": int(d.get("concern_index", 0)),
+                "patchable": patchable,
+                "rationale": str(d.get("rationale", ""))[:500],
+            }
+            if patchable:
+                entry["skill_file"] = str(d.get("skill_file", "SKILL.md"))
+                entry["old_string"] = str(d.get("old_string", ""))
+                entry["new_string"] = str(d.get("new_string", ""))
+            out.append(entry)
+        return out
+
+    return []
+
+
+def _hash_concern(concern) -> str:
+    """SHA256 hash of a concern's description text for dedup cross-referencing.
+    Prevents LLM category reclassification from bypassing the dedup guard —
+    even if the same concern is reclassified from 'evidence' to 'transition_missing',
+    the content hash still matches."""
+    desc = getattr(concern, "description", "") or ""
+    return hashlib.sha256(desc.encode("utf-8")).hexdigest()[:16]
+
+
+def _is_duplicate_patch(
+    skill_name: str,
+    concerns: list,
+    identity: Optional[str] = None,
+) -> bool:
+    """Check whether any patchable concern was already patched in the last 24h.
+
+    When identity is set (cron path), dedup key is (identity, skill_name) ×
+    (category ∩, hash ∩) — both category OR concern-text-hash match block
+    re-patching. Prevents infinite-patch-loop + category-reclassification bypass.
+
+    When identity is None (gateway path), dedup key is (skill_name) ×
+    (category ∩, hash ∩) — ephemeral session UUIDs are meaningless for
+    cross-session dedup, so we skip the identity check."""
+    if not _PATCH_LOG_PATH.exists():
+        return False
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    target_categories = {
+        getattr(c, "category", "") for c in concerns
+        if getattr(c, "category", "") in _PATCHABLE_CATEGORIES
+    }
+    target_hashes = {_hash_concern(c) for c in concerns}
+    if not target_categories:
+        return True  # nothing to patch = skip
+
+    try:
+        with _PATCH_LOG_PATH.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if identity is not None and entry.get("job_id") != identity:
+                    continue
+                if entry.get("skill_name") != skill_name:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(entry.get("ts", ""))
+                except (ValueError, TypeError):
+                    continue
+                if ts < cutoff:
+                    continue
+                if entry.get("status") != "patched":
+                    continue
+                patched_cats = set(entry.get("categories", []))
+                patched_hashes = set(entry.get("concern_hashes", []))
+                # Block if either the same categories OR the same concern
+                # content hashes were already patched. The hash check catches
+                # LLM category reclassification (evidence → transition_missing).
+                if (patched_cats & target_categories) or (
+                    patched_hashes & target_hashes
+                ):
+                    logger.info(
+                        "Duplicate patch suppressed: identity=%s skill=%s categories=%s "
+                        "hashes=%s (previously patched at %s)",
+                        identity, skill_name,
+                        patched_cats & target_categories,
+                        patched_hashes & target_hashes,
+                        entry.get("ts"),
+                    )
+                    return True
+    except OSError as e:
+        logger.warning(
+            "Dedup check read failed — blocking patch (fail-closed): %s", e
+        )
+        return True  # assume duplicate on unreadable log
+
+    return False
+
+
+def _apply_autonomous_patch(
+    skill_name: str,
+    skill_path: Path,
+    old_string: str,
+    new_string: str,
+    dry_run: bool,
+) -> dict:
+    """Apply a patch via _patch_skill(). Returns result dict with success key."""
+    if dry_run:
+        logger.info(
+            "DRY_RUN: would patch skill=%s old=%r new=%r",
+            skill_name, old_string[:100], new_string[:100],
+        )
+        return {"success": True, "dry_run": True, "message": "Dry run — no files changed."}
+
+    from tools.skill_manager_tool import _patch_skill
+
+    if not old_string or not old_string.strip():
+        return {"success": False, "error": "LLM returned empty old_string — rejecting patch"}
+
+    result = _patch_skill(
+        name=skill_name,
+        old_string=old_string,
+        new_string=new_string,
+    )
+    return result
+
+
+def _regenerate_skills_lock(dry_run: bool) -> Optional[str]:
+    """Regenerate skills.lock so MOL-172 integrity check passes on next restart.
+    Returns error string on failure, None on success."""
+    if dry_run:
+        logger.info("DRY_RUN: would regenerate skills.lock")
+        return None
+
+    if not _GENERATE_LOCK_SCRIPT.exists():
+        return f"generate-skills-lock.py not found at {_GENERATE_LOCK_SCRIPT}"
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_GENERATE_LOCK_SCRIPT)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return f"generate-skills-lock.py exit {result.returncode}: {result.stderr[:200]}"
+    except subprocess.TimeoutExpired:
+        return "generate-skills-lock.py timed out after 30s"
+    except OSError as e:
+        return f"generate-skills-lock.py spawn failed: {e}"
+
+    return None
+
+
+def _write_audit_entry(
+    job_id: str,
+    skill_name: str,
+    concerns: list,
+    diagnoses: list[dict],
+    patch_results: list[dict],
+    raw_response: str,
+    dry_run: bool,
+    error: Optional[str] = None,
+) -> None:
+    """Append one JSONL line to the skill-patches audit log."""
+    try:
+        _PATCH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "job_id": job_id,
+            "skill_name": skill_name,
+            "dry_run": dry_run,
+            "concern_count": len(concerns),
+            "categories": [getattr(c, "category", "") for c in concerns],
+            "concern_hashes": [_hash_concern(c) for c in concerns],
+            "diagnoses": diagnoses,
+            "patch_results": patch_results,
+            "raw_response_preview": raw_response[:2000] if raw_response else "",
+            "status": "patched" if any(r.get("success") for r in patch_results) else "no_change",
+            "error": error,
+        }
+        with _PATCH_LOG_PATH.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        logger.warning("skill-patches log write failed: %s", e)
+
+
+def _diagnose_and_patch_core(
+    *,
+    skill_name: str,
+    concerns: list,
+    final_response: str,
+    auto_patch_cfg: Optional[dict] = None,
+    identity: Optional[str] = None,
+) -> None:
+    """Core patching pipeline — caller-agnostic (cron + gateway share this).
+
+    All 9 guard layers run identically regardless of caller. The only difference
+    is the optional identity parameter for dedup: cron passes job_id, gateway
+    passes None (ephemeral session UUIDs are meaningless for cross-session dedup).
+
+    Never raises — all errors are caught and logged.
+    """
+    cfg = auto_patch_cfg or {}
+    if not cfg.get("enabled", False):
+        return
+
+    dry_run = bool(cfg.get("dry_run", False))
+
+    # Filter to HIGH-severity concerns in patchable categories only.
+    # Medium/low concerns and fabrication/semantic concerns are NOT patchable
+    # by editing skill text — fabrication is hallucination, semantic is
+    # internal inconsistency (one-off LLM error).
+    high_concerns = [
+        c for c in concerns
+        if getattr(c, "severity", "") == "high"
+        and getattr(c, "category", "") in _PATCHABLE_CATEGORIES
+    ]
+    if not high_concerns:
+        return
+
+    # Dedup guard — don't patch the same skill+category combo twice in 24h.
+    # When identity is None (gateway), dedup is on (skill_name, category_hash)
+    # only — ephemeral session UUIDs are meaningless for cross-session dedup.
+    if _is_duplicate_patch(skill_name, high_concerns, identity=identity):
+        return
+
+    skill_data = _read_skill_content(skill_name)
+    if not skill_data:
+        logger.warning("Auto-patch skipped: skill %s not found", skill_name)
+        return
+
+    skill_path, skill_content = skill_data
+
+    # Build prompt and diagnose
+    try:
+        prompt = _build_diagnosis_prompt(
+            skill_name=skill_name,
+            skill_content=skill_content,
+            skill_file=str(skill_path),
+            concerns=high_concerns,
+            final_response=final_response,
+        )
+    except Exception as e:
+        logger.warning("Auto-patch prompt build failed: %s", e)
+        _write_audit_entry(
+            identity or "?", skill_name, high_concerns, [], [],
+            "", dry_run, error=f"prompt build: {e}",
+        )
+        return
+
+    try:
+        raw = _call_kimi(prompt)
+    except Exception as e:
+        logger.warning("Auto-patch LLM call failed: %s", e)
+        _write_audit_entry(
+            identity or "?", skill_name, high_concerns, [], [],
+            "", dry_run, error=f"LLM call: {e}",
+        )
+        return
+
+    diagnoses = _parse_diagnosis(raw)
+    if not diagnoses:
+        logger.info("Auto-patch: no diagnoses returned for identity=%s skill=%s", identity, skill_name)
+        _write_audit_entry(
+            identity or "?", skill_name, high_concerns, [], [],
+            raw, dry_run,
+        )
+        return
+
+    # Apply patchable diagnoses
+    patch_results: list[dict] = []
+    any_patched = False
+    for d in diagnoses:
+        if not d.get("patchable"):
+            continue
+        result = _apply_autonomous_patch(
+            skill_name=skill_name,
+            skill_path=skill_path,
+            old_string=d.get("old_string", ""),
+            new_string=d.get("new_string", ""),
+            dry_run=dry_run,
+        )
+        patch_results.append(result)
+        if result.get("success"):
+            any_patched = True
+            logger.info(
+                "Auto-patch applied: identity=%s skill=%s concern_index=%d rationale=%s",
+                identity, skill_name, d.get("concern_index", -1),
+                d.get("rationale", "")[:120],
+            )
+        else:
+            logger.warning(
+                "Auto-patch rejected: identity=%s skill=%s concern_index=%d error=%s",
+                identity, skill_name, d.get("concern_index", -1),
+                result.get("error", "unknown"),
+            )
+
+    # Regenerate skills.lock if any patches landed (non-dry-run)
+    lock_error = None
+    if any_patched and not dry_run:
+        lock_error = _regenerate_skills_lock(dry_run=False)
+        if lock_error:
+            logger.warning("Auto-patch: skills.lock regeneration failed: %s", lock_error)
+
+    _write_audit_entry(
+        identity or "?", skill_name, high_concerns, diagnoses, patch_results,
+        raw, dry_run, error=lock_error,
+    )
+
+
+def diagnose_and_patch(
+    job: dict,
+    concerns: list,
+    final_response: str,
+    auto_patch_cfg: Optional[dict] = None,
+) -> None:
+    """Diagnose HIGH reflection concerns and apply surgical skill edits (cron path).
+
+    Thin wrapper over _diagnose_and_patch_core() that extracts skill_name and
+    job_id from the job dict. Cron-specific pre-flights (enabled check,
+    skill extraction) live here; all guard layers live in the core function.
+    """
+    cfg = auto_patch_cfg or {}
+    if not cfg.get("enabled", False):
+        return
+
+    job_id = str(job.get("id", "?"))
+    skill_name = _extract_skill_name(job)
+    if not skill_name:
+        logger.info("Auto-patch skipped: no skill name in job %s", job_id)
+        return
+
+    _diagnose_and_patch_core(
+        skill_name=skill_name,
+        concerns=concerns,
+        final_response=final_response,
+        auto_patch_cfg=cfg,
+        identity=job_id,
+    )
+
+
+def diagnose_and_patch_for_session(
+    session_id: str,
+    skill_name: str,
+    concerns: list,
+    final_response: str,
+    auto_improve_cfg: Optional[dict] = None,
+) -> None:
+    """Gateway-wide entry point. Same pipeline, scoped to interactive sessions.
+
+    Uses identity=None for dedup — dedup key is (skill_name, category_hash)
+    only, since session UUIDs are ephemeral and meaningless across sessions.
+    """
+    cfg = auto_improve_cfg or {}
+    if not cfg.get("enabled", False):
+        return
+    if not skill_name:
+        return
+    _diagnose_and_patch_core(
+        skill_name=skill_name,
+        concerns=concerns,
+        final_response=final_response,
+        auto_patch_cfg=cfg,
+        identity=None,
+    )

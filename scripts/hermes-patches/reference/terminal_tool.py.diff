@@ -1,0 +1,31 @@
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index be565f19..2dfda2fc 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -613,6 +613,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
+     volumes = cc.get("docker_volumes", [])
+     docker_forward_env = cc.get("docker_forward_env", [])
+     docker_env = cc.get("docker_env", {})
++    expiry_seconds = cc.get("container_expiry_seconds", 7200)
++    max_concurrent = cc.get("max_concurrent_containers", 2)
+ 
+     if env_type == "local":
+         lc = local_config or {}
+@@ -629,6 +631,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
+             auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
+             forward_env=docker_forward_env,
+             env=docker_env,
++            expiry_seconds=expiry_seconds,
++            max_concurrent_containers=max_concurrent,
+         )
+     
+     elif env_type == "singularity":
+@@ -1124,6 +1128,8 @@ def terminal_tool(
+                                 "modal_mode": config.get("modal_mode", "auto"),
+                                 "docker_volumes": config.get("docker_volumes", []),
+                                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
++                                "container_expiry_seconds": config.get("container_expiry_seconds", 7200),
++                                "max_concurrent_containers": config.get("max_concurrent_containers", 2),
+                             }
+ 
+                         local_config = None

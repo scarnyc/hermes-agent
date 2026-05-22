@@ -1,0 +1,26 @@
+diff --git a/run_agent.py b/run_agent.py
+index 129eb167..dc8efb49 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -7623,6 +7623,7 @@ class AIAgent:
+ 
+             finish_reason = "stop"
+             response = None  # Guard against UnboundLocalError if all retries fail
++            api_kwargs = None  # Guard against UnboundLocalError if _build_api_kwargs fails
+ 
+             while retry_count < max_retries:
+                 try:
+@@ -8744,9 +8745,10 @@ class AIAgent:
+                             self.log_prefix, max_retries, _final_summary,
+                             _provider, _model, len(api_messages), f"{approx_tokens:,}",
+                         )
+-                        self._dump_api_request_debug(
+-                            api_kwargs, reason="max_retries_exhausted", error=api_error,
+-                        )
++                        if api_kwargs is not None:
++                            self._dump_api_request_debug(
++                                api_kwargs, reason="max_retries_exhausted", error=api_error,
++                            )
+                         self._persist_session(messages, conversation_history)
+                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
+                         if _is_stream_drop:

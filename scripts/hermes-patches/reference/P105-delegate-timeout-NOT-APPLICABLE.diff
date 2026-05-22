@@ -1,0 +1,56 @@
+commit 50d97edbe15e3a4fd72ddbe00a3afb85e9bbafc9
+Author: Teknium <127238744+teknium1@users.noreply.github.com>
+Date:   Thu Apr 23 16:14:55 2026 -0700
+
+    feat(delegation): bump default child_timeout_seconds to 600s (#14809)
+    
+    The 300s default was too tight for high-reasoning models on non-trivial
+    delegated tasks — e.g. gpt-5.5 xhigh reviewing 12 files would burn >5min
+    on reasoning tokens before issuing its first tool call, tripping the
+    hard wall-clock timeout with 0 api_calls logged.
+    
+    - tools/delegate_tool.py: DEFAULT_CHILD_TIMEOUT 300 -> 600
+    - hermes_cli/config.py: surface delegation.child_timeout_seconds in
+      DEFAULT_CONFIG so it's discoverable (previously the key was read by
+      _get_child_timeout() but absent from the default config schema)
+    
+    Users can still override via config.yaml delegation.child_timeout_seconds
+    or DELEGATION_CHILD_TIMEOUT_SECONDS env var (floor 30s, no ceiling).
+
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index cfcc7ff28..c578ded96 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -739,6 +739,10 @@ DEFAULT_CONFIG = {
+         "inherit_mcp_toolsets": True,
+         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
+                                # independent of the parent's max_iterations)
++        "child_timeout_seconds": 600,  # wall-clock timeout for each child agent (floor 30s,
++                                       # no ceiling). High-reasoning models on large tasks
++                                       # (e.g. gpt-5.5 xhigh, opus-4.6) need generous budgets;
++                                       # raise if children time out before producing output.
+         "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
+                                  # "low", "minimal", "none" (empty = inherit parent's level)
+         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 2c35c7c7e..e779e6f60 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -298,7 +298,7 @@ def _get_child_timeout() -> float:
+     """Read delegation.child_timeout_seconds from config.
+ 
+     Returns the number of seconds a single child agent is allowed to run
+-    before being considered stuck.  Default: 300 s (5 minutes).
++    before being considered stuck.  Default: 600 s (10 minutes).
+     """
+     cfg = _load_config()
+     val = cfg.get("child_timeout_seconds")
+@@ -409,7 +409,7 @@ def _preserve_parent_mcp_toolsets(
+ 
+ 
+ DEFAULT_MAX_ITERATIONS = 50
+-DEFAULT_CHILD_TIMEOUT = 300  # seconds before a child agent is considered stuck
++DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
+ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
+ _HEARTBEAT_STALE_CYCLES = (
+     5  # mark child stale after this many heartbeats with no iteration progress

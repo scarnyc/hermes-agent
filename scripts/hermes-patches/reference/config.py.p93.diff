@@ -1,0 +1,17 @@
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -96,6 +96,13 @@ def is_managed() -> bool:
+
+ def get_managed_update_command() -> Optional[str]:
+     """Return the preferred upgrade command for a managed install."""
++    # P93/MOL-283: Block updates on patched trees.
++    # When the sentinel marker exists, return a no-op echo so that
++    # `recommended_update_command()` and any caller that reads the
++    # managed command won't silently fall through to `hermes update`.
++    _patched_marker = Path.home() / ".hermes" / ".patched-tree"
++    if _patched_marker.exists():
++        return "echo '✗ This Hermes installation has local patches — see MOL-283 for migration workflow'"
+     managed_system = get_managed_system()
+     if managed_system == "Homebrew":
+         return "brew upgrade hermes-agent"

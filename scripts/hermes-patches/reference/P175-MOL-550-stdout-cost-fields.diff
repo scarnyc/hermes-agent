@@ -1,0 +1,129 @@
+--- a/scripts/symphony_bridge.py
++++ b/scripts/symphony_bridge.py
+@@ -1013,6 +1013,37 @@
+                    http_code=None, elapsed_ms=elapsed_ms,
+                    error=str(exc), key_available=bool(ds_key),
+                    probe_note="parent-process probe failed; tick proceeds")
++
++
++# ── CC result-envelope parser (F10) ────────────────────────────────────────
++
++def _extract_cc_result_meta(stdout: str) -> dict:
++    """P175/MOL-550 F10: parse total_cost_usd / num_turns / subtype / is_error
++    from a `claude -p --output-format json` result envelope. Returns empty
++    dict on parse-fail so the caller can splice unconditionally — observability
++    fields land when stdout is a clean JSON envelope, silently no-op otherwise.
++
++    Iter 5 S6 dispatch (2026-05-12) couldn't recover the Tier 1 cost
++    post-hoc because the bridge logged `stdout_head=stdout[:500]` and the
++    `total_cost_usd` field lives past the 500-char boundary. F10 parses
++    the FULL stdout and surfaces the cost / turn-count / outcome subtype
++    as top-level fields on the tier_attempt event, with stdout_head
++    truncation retained for human spot-check.
++    """
++    if not stdout:
++        return {}
++    try:
++        env = json.loads(stdout.strip())
++    except (json.JSONDecodeError, ValueError):
++        return {}
++    if not isinstance(env, dict) or env.get("type") != "result":
++        return {}
++    return {
++        "cc_total_cost_usd": env.get("total_cost_usd"),
++        "cc_num_turns": env.get("num_turns"),
++        "cc_subtype": env.get("subtype"),
++        "cc_is_error": env.get("is_error"),
++    }
+ 
+ 
+ # ── Tier 1: Claude Code + DeepSeek direct ──────────────────────────────────
+@@ -1122,6 +1153,7 @@
+                    timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                    exit_code=exit_code, signal=signal_name,
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                    env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": 1,
+                 "error": f"{_TIMEOUT_ERROR_PREFIX} {timeout_secs}s",
+@@ -1144,6 +1176,7 @@
+                    timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                    exit_code=exit_code, signal=None,
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                    env_vars=env_snap, rate_limited=rate_limited,
+                    outcome="rate_limited" if rate_limited else "nonzero_exit")
+         return {"success": False, "output": stdout, "tier": 1,
+@@ -1154,6 +1187,7 @@
+     _log_event("tier_attempt", tier=1, engine="cc+ds", endpoint=DEEPSEEK_ENDPOINT,
+                timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                exit_code=0, signal=None, stdout_head=stdout[:500],
++               **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                stderr_tail=_stderr_tail(stderr), env_vars=env_snap,
+                outcome="success")
+ 
+@@ -1240,6 +1274,7 @@
+                    timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                    exit_code=exit_code, signal=signal_name,
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                    env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": 2,
+                 "error": f"{_TIMEOUT_ERROR_PREFIX} {timeout_secs}s",
+@@ -1264,6 +1299,7 @@
+                    timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                    exit_code=exit_code, signal=None,
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                    env_vars=env_snap, rate_limited=rate_limited,
+                    outcome="rate_limited" if rate_limited else "nonzero_exit")
+         return {"success": False, "output": stdout, "tier": 2,
+@@ -1275,6 +1311,7 @@
+                endpoint="https://api.anthropic.com",
+                timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                exit_code=0, signal=None, stdout_head=stdout[:500],
++               **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                stderr_tail=_stderr_tail(stderr), env_vars=env_snap,
+                outcome="success")
+ 
+@@ -1363,6 +1400,7 @@
+                    timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                    exit_code=exit_code, signal=signal_name,
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                    env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": tier,
+                 "error": f"{_TIMEOUT_ERROR_PREFIX} {timeout_secs}s",
+@@ -1385,6 +1423,7 @@
+                    timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                    exit_code=exit_code, signal=None,
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
++                   **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                    env_vars=env_snap, rate_limited=rate_limited,
+                    outcome="rate_limited" if rate_limited else "nonzero_exit")
+         return {"success": False, "output": stdout, "tier": tier,
+@@ -1395,6 +1434,7 @@
+     _log_event("tier_attempt", tier=tier, engine=engine, provider=provider,
+                timeout_secs=timeout_secs, elapsed_ms=elapsed_ms,
+                exit_code=0, signal=None, stdout_head=stdout[:500],
++               **_extract_cc_result_meta(stdout),  # P175/MOL-550 F10
+                stderr_tail=_stderr_tail(stderr), env_vars=env_snap,
+                outcome="success")
+ 
+@@ -1624,8 +1664,14 @@
+     )
+ 
+     output = result.get("output", "")
+-    verdict_match = re.search(r"VERDICT:\s*(SHIP IT|REVISE|RETHINK)", output)
+-    verdict = verdict_match.group(1) if verdict_match else None
++    # P176/MOL-550 F11: anchor regex to start-of-line + take LAST match.
++    # Old `re.search` returned first occurrence anywhere — could extract a
++    # quoted prior verdict from skeptic narrative prose ("previous verdict
++    # was X, this one is Y"). Iter 5 yesterday had a skeptic narrate
++    # "I can't read the plan, RETHINK" mid-paragraph and the regex
++    # extracted RETHINK as the verdict. Anchor to ^VERDICT: + take last.
++    _p176_verdicts = re.findall(r"^\s*VERDICT:\s*(SHIP IT|REVISE|RETHINK)\b", output, re.MULTILINE)
++    verdict = _p176_verdicts[-1] if _p176_verdicts else None
+ 
+     # P164/MOL-549 S5: exit=0 + empty output is the signature of the model-slug
+     # silent-fail bug (and of any future "agent ran but emitted nothing" class).

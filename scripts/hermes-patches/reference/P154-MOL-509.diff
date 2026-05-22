@@ -1,0 +1,680 @@
+--- a/.hermes/scripts/symphony_bridge.py
++++ b/.hermes/scripts/symphony_bridge.py
+@@ -26,10 +26,11 @@
+ import subprocess
+ import sys
+ import time
++from dataclasses import dataclass
+ from datetime import datetime, timezone, timedelta
+ from pathlib import Path
+ from types import MappingProxyType
+-from typing import Literal
++from typing import Literal, get_args
+ 
+ # P152/MOL-503: Phase 2 v2 — 4-cell parallel infra-health gate. Import at
+ # module-top (not lazy) so a malformed/missing preflight_health.py surfaces
+@@ -188,6 +189,84 @@
+ # classifier outputs that aren't catalogued here will fall back instead of
+ # raising KeyError.
+ _DEFAULT_RETRY_POLICY = (1, 0)
++
++# ── RunResult (P154/MOL-509) ───────────────────────────────────────────────
++
++# P154/MOL-509 review (#176 fix-pass-1): closed `final_status` vocabulary
++# promoted to a `Literal` so mypy catches typos at construction sites and
++# future callers (daemon P156 / cron-fallback P158) get IDE completions.
++# Mirrors the P153 `PhaseName` precedent in the same file.
++FinalStatus = Literal[
++    "succeeded",                       # phases 1-4 passed + PR merged
++    "incomplete",                      # phase abort / budget exhausted / REVISE-RETHINK
++    "failed",                          # Phase 1 (planner) failed
++    "skipped_recently_running",        # state shows running < 60min ago
++    "skipped_max_attempts",            # attempt_count >= 3
++    "skipped_succeeded_in_progress",   # loud-skip: succeeded but Jira still In Progress
++    "skipped_progressed",              # silent-skip: succeeded + progressed past In Progress
++    "dry_run",                         # DRY_RUN short-circuit
++]
++
++
++@dataclass(frozen=True)
++class RunResult:
++    """Outcome of a single symphony-bridge ticket execution.
++
++    P154/MOL-509 — returned by `run_one(key)`. Both the cron driver
++    (`main` loop) and the future daemon (P156) consume this to update
++    their respective queues.
++
++    `dispatched=False` means the ticket was skipped (max attempts,
++    recently-running, succeeded-and-progressed, etc.) — the caller
++    should not increment a "dispatched this tick" counter.
++
++    Closed `final_status` vocabulary lives in the `FinalStatus` Literal
++    just above; the docstring there enumerates each value's meaning.
++
++    `pr_num` is `str | None` (not `int | None`): `phase_builder` yields
++    the PR number from `re.search(r"PR_NUM=(\\d+)", output).group(1)`,
++    so the upstream type is `str`. `phase_reviewer(..., pr_num: str)`
++    confirms.
++
++    `__post_init__` enforces three load-bearing invariants at runtime
++    (Literal validation isn't enforced by Python itself; mypy catches it
++    statically, this guards the daemon/cron callers in production too):
++
++    1. ``final_status`` is a member of the closed ``FinalStatus`` vocab.
++    2. ``dispatched=False`` implies a ``skipped_*`` final_status.
++    3. ``final_status='succeeded'`` implies ``pr_state='merged'`` and
++       ``pr_num is not None`` (a succeeded dispatch always merged a PR).
++    """
++    dispatched: bool
++    final_status: FinalStatus
++    pr_num: str | None = None
++    pr_state: str | None = None
++    error: str | None = None
++    detail_line: str | None = None
++
++    def __post_init__(self):
++        valid = get_args(FinalStatus)
++        if self.final_status not in valid:
++            raise ValueError(
++                f"final_status={self.final_status!r} not in FinalStatus "
++                f"vocabulary {valid}"
++            )
++        if not self.dispatched and not self.final_status.startswith("skipped_"):
++            raise ValueError(
++                f"dispatched=False requires a skipped_* final_status; "
++                f"got {self.final_status!r}"
++            )
++        if self.final_status == "succeeded":
++            if self.pr_state != "merged":
++                raise ValueError(
++                    f"final_status='succeeded' requires pr_state='merged', "
++                    f"got {self.pr_state!r}"
++                )
++            if self.pr_num is None:
++                raise ValueError(
++                    "final_status='succeeded' requires pr_num to be set"
++                )
++
+ 
+ # ── BudgetTracker (P153/MOL-506) ───────────────────────────────────────────
+ 
+@@ -1458,6 +1537,276 @@
+     print(banner)
+ 
+ 
++def run_one(key: str, *, dry_run: bool = False) -> RunResult:
++    """Execute the symphony pipeline for a single ticket.
++
++    P154/MOL-509 — extracted from `main()` to give the future daemon
++    (P156) and the cron-fallback path (P158) a shared primitive.
++
++    Reads state from disk (initializes if missing), applies skip-logic,
++    then runs the 4-phase dispatch + gh pr merge. Returns a RunResult
++    describing the outcome. Caller (cron `main()` or daemon loop) is
++    responsible for the per-tick cap and the summary line.
++
++    Pre-flight (PAUSED, DRY_RUN detection, SIGKILL sweep, preflight
++    probe + health gate, Jira JQL query) stays in the caller — it's a
++    pre-tick concern, not a per-ticket concern.
++    """
++    # ── Skip-logic ──────────────────────────────────────────────────
++    state = read_state(key)
++    if state:
++        last_status = state.get("last_status", "")
++        attempt_count = state.get("attempt_count", 0)
++        last_attempt_ts = state.get("last_attempt_ts")
++
++        if last_status == "running" and last_attempt_ts:
++            try:
++                last_dt = datetime.fromisoformat(last_attempt_ts)
++                age = (datetime.now(timezone.utc) - last_dt).total_seconds()
++                if age < 3600:
++                    _log(f"{key}: recently running ({age:.0f}s ago), skipping")
++                    return RunResult(dispatched=False,
++                                     final_status="skipped_recently_running")
++            except (ValueError, TypeError):
++                pass
++
++        if attempt_count >= 3:
++            _log(f"{key}: max attempts ({attempt_count}), skipping")
++            print(f"⚠️ {key}: symphony-bridge max attempts exceeded "
++                  f"— manual intervention needed")
++            return RunResult(dispatched=False,
++                             final_status="skipped_max_attempts")
++
++        if last_status == "succeeded":
++            ok, body, _ = _run_jira(["jira", "issue", "view", key, "--plain"])
++            if ok and "In Progress" in body:
++                _log(f"{key}: loud-skip — succeeded but still In Progress")
++                print(f"⚠️ {key}: marked succeeded but still In Progress "
++                      f"in Jira — verify PR landed + transition manually")
++                return RunResult(dispatched=False,
++                                 final_status="skipped_succeeded_in_progress")
++            elif ok:
++                _log(f"{key}: silent-skip — progressed past In Progress")
++                return RunResult(dispatched=False,
++                                 final_status="skipped_progressed")
++
++    # First time seeing this key — initialize state
++    if not state:
++        state = {
++            "key": key,
++            "first_seen": _now_et_iso(),
++            "last_attempt_ts": None,
++            "attempt_count": 0,
++            "last_status": "unstarted",
++        }
++
++    # DRY_RUN short-circuit — no state mutation, no dispatch
++    if dry_run:
++        _log(f"{key}: would dispatch (DRY RUN)")
++        return RunResult(dispatched=True, final_status="dry_run",
++                         detail_line=f"- Would-dispatch: {key} (DRY RUN)")
++
++    # ── LIVE dispatch ───────────────────────────────────────────────
++    state["last_status"] = "running"
++    state["last_attempt_ts"] = _now_et_iso()
++    # P148/MOL-498: stamp dispatch_start checkpoint BEFORE first phase so SIGKILL
++    # recovery on next tick can name the phase that died.
++    _set_checkpoint(state, "dispatch_start")
++    _safe_write_state(key, state, where="dispatch_start")
++
++    # P153/MOL-506: start the global wall-clock budget at dispatch_start.
++    # All six phase boundaries below (planner / skeptic / planner_revise /
++    # skeptic_revise / builder / reviewer) gate on tracker.can_start_phase(...)
++    # and each retry inside run_phase_with_fallback consults tracker.remaining().
++    tracker = BudgetTracker.start_now()
++    _log_event("budget_tracker_started", key=key,
++               budget_summary=tracker.to_summary())
++
++    _log(f"Dispatching {key} (attempt {state['attempt_count'] + 1})")
++    _log_event("dispatch_start", key=key,
++               attempt_count=state["attempt_count"] + 1)
++
++    # Extract repo + ticket info
++    ticket_body = get_ticket_body(key)
++    repo_path = extract_repo(ticket_body)
++    summary = get_ticket_summary(key, ticket_body)
++    _log(f"  Repo: {repo_path}")
++    _log(f"  Summary: {summary[:100]}")
++
++    # ── Phase 1: Planner ───────────────────────────────────────────
++    if not tracker.can_start_phase("planner"):  # P153/MOL-506
++        _abort_budget_exhausted(key, state, "planner", tracker)
++        return RunResult(dispatched=True, final_status="incomplete")
++    _log("── Phase 1 (Planner) ──")
++    p1 = phase_planner(key, summary, ticket_body, repo_path, tracker=tracker)
++    if not p1["ok"]:
++        state["last_status"] = "failed"
++        state["attempt_count"] += 1
++        _safe_write_state(key, state, where="planner_failed")
++        _log(f"DISPATCH FAILED: {key} Phase 1 failed: {p1.get('error')}")
++        _log_event("phase_failed", key=key, phase="planner",
++                   error=str(p1.get("error", ""))[:300], tier=p1.get("tier"))
++        return RunResult(dispatched=True, final_status="failed",
++                         error=str(p1.get("error", ""))[:300])
++
++    plan_content = p1["plan_content"]
++    _set_checkpoint(state, "planner_done")
++    _safe_write_state(key, state, where="planner_done")
++    _log_event("phase_complete", key=key, phase="planner", tier=p1.get("tier"))
++
++    # ── Phase 2: Skeptic ───────────────────────────────────────────
++    if not tracker.can_start_phase("skeptic"):  # P153/MOL-506
++        _abort_budget_exhausted(key, state, "skeptic", tracker)
++        return RunResult(dispatched=True, final_status="incomplete")
++    _log("── Phase 2 (Skeptic) ──")
++    p2 = phase_skeptic(key, repo_path, tracker=tracker)
++
++    if p2["verdict"] == "RETHINK":
++        state["last_status"] = "incomplete"
++        state["attempt_count"] += 1
++        _safe_write_state(key, state, where="skeptic_rethink")
++        _log(f"DISPATCH INCOMPLETE: {key} Phase 2 RETHINK")
++        print(f"⚠️ {key}: plan-skeptic RETHINK — plan architecturally flawed")
++        return RunResult(dispatched=True, final_status="incomplete")
++
++    if p2["verdict"] == "REVISE":
++        # P153/MOL-506: both legs of the REVISE loop are full phases —
++        # gate each independently. A REVISE-retry that can't fit Phase 1
++        # is just budget exhaustion, not a retry failure.
++        if not tracker.can_start_phase("planner_revise"):
++            _abort_budget_exhausted(key, state, "planner_revise", tracker)
++            return RunResult(dispatched=True, final_status="incomplete")
++        _log("Phase 2 REVISE — re-running Phase 1 with findings")
++        revised_body = ticket_body + f"\n\nSkeptic findings:\n{p2['output'][:2000]}"
++        p1 = phase_planner(key, summary, revised_body, repo_path, tracker=tracker)
++        if not p1["ok"]:
++            state["last_status"] = "failed"
++            state["attempt_count"] += 1
++            _safe_write_state(key, state, where="planner_revise_failed")
++            _log(f"DISPATCH FAILED: {key} Phase 1 retry failed")
++            return RunResult(dispatched=True, final_status="failed")
++
++        plan_content = p1["plan_content"]  # needed for phase_builder below
++        if not tracker.can_start_phase("skeptic_revise"):  # P153/MOL-506
++            _abort_budget_exhausted(key, state, "skeptic_revise", tracker)
++            return RunResult(dispatched=True, final_status="incomplete")
++        p2 = phase_skeptic(key, repo_path, tracker=tracker)
++        if p2["verdict"] in ("REVISE", "RETHINK", None):
++            state["last_status"] = "incomplete"
++            state["attempt_count"] += 1
++            _safe_write_state(key, state, where="skeptic_revise_failed")
++            _log(f"DISPATCH INCOMPLETE: {key} Phase 2 retry: {p2['verdict']}")
++            _log_event("phase_failed", key=key, phase="skeptic_retry",
++                       verdict=p2.get("verdict"), tier=p2.get("tier"))
++            print(f"⚠️ {key}: plan-skeptic {p2['verdict']} "
++                  f"after retry — plan needs manual revision")
++            return RunResult(dispatched=True, final_status="incomplete")
++
++    _set_checkpoint(state, "skeptic_done")
++    _safe_write_state(key, state, where="skeptic_done")
++    _log_event("phase_complete", key=key, phase="skeptic",
++               verdict=p2.get("verdict"), tier=p2.get("tier"))
++
++    # ── Phase 3: Builder ───────────────────────────────────────────
++    if not tracker.can_start_phase("builder"):  # P153/MOL-506
++        _abort_budget_exhausted(key, state, "builder", tracker)
++        return RunResult(dispatched=True, final_status="incomplete")
++    _log("── Phase 3 (Builder) ──")
++    p3 = phase_builder(key, plan_content, repo_path, tracker=tracker)
++    pr_num = p3.get("pr_num")
++
++    if not p3["ok"] or not pr_num:
++        state["last_status"] = "incomplete"
++        state["attempt_count"] += 1
++        _safe_write_state(key, state, where="builder_failed")
++        _log(f"DISPATCH INCOMPLETE: {key} Phase 3 failed or no PR")
++        _log_event("phase_failed", key=key, phase="builder",
++                   error=str(p3.get("error", ""))[:300], tier=p3.get("tier"))
++        return RunResult(dispatched=True, final_status="incomplete",
++                         error=str(p3.get("error", ""))[:300])
++
++    _set_checkpoint(state, "builder_done")
++    _safe_write_state(key, state, where="builder_done")
++    _log_event("phase_complete", key=key, phase="builder",
++               pr_num=pr_num, tier=p3.get("tier"))
++
++    # ── Phase 4: Reviewer ──────────────────────────────────────────
++    if not tracker.can_start_phase("reviewer"):  # P153/MOL-506
++        # P153/MOL-506: builder already opened a PR; record it on
++        # state so the next tick (or a manual sweep) can find + triage
++        # the un-reviewed PR instead of leaving it orphaned.
++        state["orphan_pr_num"] = pr_num
++        _abort_budget_exhausted(key, state, "reviewer", tracker)
++        return RunResult(dispatched=True, final_status="incomplete",
++                         pr_num=pr_num)
++    _log("── Phase 4 (Reviewer) ──")
++    p4 = phase_reviewer(key, pr_num, repo_path, tracker=tracker)
++
++    # ── Bash gate ──────────────────────────────────────────────────
++    if p4["gate"] == 0:
++        _log(f"Merging PR #{pr_num}")
++        try:
++            r = subprocess.run(
++                ["gh", "pr", "merge", str(pr_num), "--squash", "--delete-branch"],
++                capture_output=True, text=True, timeout=30,
++                cwd=repo_path,
++            )
++            # gh pr merge returns non-zero for branch protection,
++            # mergeability conflicts, auth failure, network 5xx,
++            # rate-limit. Capturing the exit code prevents falsely
++            # marking the state as merged when the PR is still open
++            # (which would then trip the silent-skip path next tick).
++            if r.returncode == 0:
++                pr_state = "merged"
++            else:
++                pr_state = "open"
++                _log_event("pr_merge_failed",
++                           key=key, pr_num=pr_num,
++                           exit_code=r.returncode,
++                           stderr_tail=_stderr_tail(r.stderr or ""))
++                sys.stderr.write(
++                    f"⚠️ {key}: gh pr merge #{pr_num} "
++                    f"exit {r.returncode}: {(r.stderr or '')[:200]}\n")
++                sys.stderr.flush()
++        except (OSError, subprocess.TimeoutExpired) as exc:
++            pr_state = "open"
++            _log_event("pr_merge_exception",
++                       key=key, pr_num=pr_num,
++                       exc_type=type(exc).__name__,
++                       exc=str(exc)[:200])
++            sys.stderr.write(
++                f"⚠️ {key}: gh pr merge exception: "
++                f"{type(exc).__name__}: {str(exc)[:200]}\n")
++            sys.stderr.flush()
++    else:
++        pr_state = "open"
++
++    _set_checkpoint(state, "reviewer_done")
++    _log_event("phase_complete", key=key, phase="reviewer",
++               passed=p4.get("passed"), gate=p4.get("gate"),
++               pr_state=pr_state, tier=p4.get("tier"))
++
++    # ── Update final state ─────────────────────────────────────────
++    if p4["passed"] and pr_state == "merged":
++        state["last_status"] = "succeeded"
++        # attempt_count unchanged (success)
++    else:
++        state["last_status"] = "incomplete"
++        state["attempt_count"] += 1
++
++    _safe_write_state(key, state, where="dispatch_complete")
++
++    _log(f"DISPATCH COMPLETE: {key} status={state['last_status']} "
++         f"pr_state={pr_state}")
++    _log_event("dispatch_complete", key=key,
++               final_status=state["last_status"],
++               pr_state=pr_state, pr_num=pr_num,
++               attempt_count=state["attempt_count"])
++
++    return RunResult(dispatched=True, final_status=state["last_status"],
++                     pr_num=pr_num, pr_state=pr_state)
++
++
+ def main() -> None:
+     start_time = time.monotonic()
+ 
+@@ -1514,6 +1863,10 @@
+     _log(f"Found {len(keys)} eligible tickets: top={keys[0]}")
+ 
+     # ── Step 2: Iterate keys ────────────────────────────────────────────
++    # P154/MOL-509: per-ticket execution delegated to run_one(). Cron loop
++    # owns only iteration, 1-per-tick cap, and the wall-clock budget for
++    # the loop itself. Daemon (P156) will share run_one() but skip this
++    # loop in favor of pulling from queue.db.
+     dispatched = 0
+     skipped = 0
+     dispatched_status = None
+@@ -1524,278 +1877,20 @@
+             _log("Total timeout reached, stopping iteration")
+             break
+ 
+-        # Check state
+-        state = read_state(key)
+-        if state:
+-            last_status = state.get("last_status", "")
+-            attempt_count = state.get("attempt_count", 0)
+-            last_attempt_ts = state.get("last_attempt_ts")
+-
+-            if last_status == "running" and last_attempt_ts:
+-                try:
+-                    last_dt = datetime.fromisoformat(last_attempt_ts)
+-                    age = (datetime.now(timezone.utc) - last_dt).total_seconds()
+-                    if age < 3600:
+-                        _log(f"{key}: recently running ({age:.0f}s ago), skipping")
+-                        skipped += 1
+-                        continue
+-                except (ValueError, TypeError):
+-                    pass
+-
+-            if attempt_count >= 3:
+-                _log(f"{key}: max attempts ({attempt_count}), skipping")
+-                print(f"⚠️ {key}: symphony-bridge max attempts exceeded "
+-                      f"— manual intervention needed")
+-                skipped += 1
+-                continue
+-
+-            if last_status == "succeeded":
+-                ok, body, _ = _run_jira(["jira", "issue", "view", key, "--plain"])
+-                if ok and "In Progress" in body:
+-                    _log(f"{key}: loud-skip — succeeded but still In Progress")
+-                    print(f"⚠️ {key}: marked succeeded but still In Progress "
+-                          f"in Jira — verify PR landed + transition manually")
+-                    skipped += 1
+-                    continue
+-                elif ok:
+-                    _log(f"{key}: silent-skip — progressed past In Progress")
+-                    skipped += 1
+-                    continue
+-
+-        # First time seeing this key — initialize state
+-        if not state:
+-            state = {
+-                "key": key,
+-                "first_seen": _now_et_iso(),
+-                "last_attempt_ts": None,
+-                "attempt_count": 0,
+-                "last_status": "unstarted",
+-            }
+-
+-        # Check: DRY_RUN
+-        if dry_run:
+-            _log(f"{key}: would dispatch (DRY RUN)")
+-            dispatch_details.append(f"- Would-dispatch: {key} (DRY RUN)")
+-            dispatched += 1
+-            break  # 1-per-tick cap
+-
+-        # LIVE dispatch
+-        state["last_status"] = "running"
+-        state["last_attempt_ts"] = _now_et_iso()
+-        # P148/MOL-498: stamp dispatch_start checkpoint BEFORE first phase so SIGKILL
+-        # recovery on next tick can name the phase that died.
+-        _set_checkpoint(state, "dispatch_start")
+-        _safe_write_state(key, state, where="dispatch_start")
+-
+-        # P153/MOL-506: start the global wall-clock budget at dispatch_start.
+-        # All six phase boundaries below (planner / skeptic / planner_revise /
+-        # skeptic_revise / builder / reviewer) gate on tracker.can_start_phase(...)
+-        # and each retry inside run_phase_with_fallback consults tracker.remaining().
+-        tracker = BudgetTracker.start_now()
+-        _log_event("budget_tracker_started", key=key,
+-                   budget_summary=tracker.to_summary())
+-
+-        _log(f"Dispatching {key} (attempt {state['attempt_count'] + 1})")
+-        _log_event("dispatch_start", key=key,
+-                   attempt_count=state["attempt_count"] + 1)
+-
+-        # Step 1.5: Extract repo + ticket info
+-        ticket_body = get_ticket_body(key)
+-        repo_path = extract_repo(ticket_body)
+-        summary = get_ticket_summary(key, ticket_body)
+-        _log(f"  Repo: {repo_path}")
+-        _log(f"  Summary: {summary[:100]}")
+-
+-        # ── Phase 1: Planner ───────────────────────────────────────────
+-        if not tracker.can_start_phase("planner"):  # P153/MOL-506
+-            _abort_budget_exhausted(key, state, "planner", tracker)
+-            dispatched_status = "incomplete"
+-            dispatched += 1
+-            break
+-        _log("── Phase 1 (Planner) ──")
+-        p1 = phase_planner(key, summary, ticket_body, repo_path, tracker=tracker)
+-        if not p1["ok"]:
+-            state["last_status"] = "failed"
+-            state["attempt_count"] += 1
+-            _safe_write_state(key, state, where="planner_failed")
+-            _log(f"DISPATCH FAILED: {key} Phase 1 failed: {p1.get('error')}")
+-            _log_event("phase_failed", key=key, phase="planner",
+-                       error=str(p1.get("error", ""))[:300], tier=p1.get("tier"))
+-            dispatched_status = "failed"
+-            dispatched += 1
+-            break
+-
+-        plan_content = p1["plan_content"]
+-        _set_checkpoint(state, "planner_done")
+-        _safe_write_state(key, state, where="planner_done")
+-        _log_event("phase_complete", key=key, phase="planner", tier=p1.get("tier"))
+-
+-        # ── Phase 2: Skeptic ───────────────────────────────────────────
+-        if not tracker.can_start_phase("skeptic"):  # P153/MOL-506
+-            _abort_budget_exhausted(key, state, "skeptic", tracker)
+-            dispatched_status = "incomplete"
+-            dispatched += 1
+-            break
+-        _log("── Phase 2 (Skeptic) ──")
+-        p2 = phase_skeptic(key, repo_path, tracker=tracker)
+-
+-        if p2["verdict"] == "RETHINK":
+-            state["last_status"] = "incomplete"
+-            state["attempt_count"] += 1
+-            _safe_write_state(key, state, where="skeptic_rethink")
+-            _log(f"DISPATCH INCOMPLETE: {key} Phase 2 RETHINK")
+-            print(f"⚠️ {key}: plan-skeptic RETHINK — plan architecturally flawed")
+-            dispatched_status = "incomplete"
+-            dispatched += 1
+-            break
+-
+-        if p2["verdict"] == "REVISE":
+-            # P153/MOL-506: both legs of the REVISE loop are full phases —
+-            # gate each independently. A REVISE-retry that can't fit Phase 1
+-            # is just budget exhaustion, not a retry failure.
+-            if not tracker.can_start_phase("planner_revise"):
+-                _abort_budget_exhausted(key, state, "planner_revise", tracker)
+-                dispatched_status = "incomplete"
+-                dispatched += 1
+-                break
+-            _log("Phase 2 REVISE — re-running Phase 1 with findings")
+-            revised_body = ticket_body + f"\n\nSkeptic findings:\n{p2['output'][:2000]}"
+-            p1 = phase_planner(key, summary, revised_body, repo_path, tracker=tracker)
+-            if not p1["ok"]:
+-                state["last_status"] = "failed"
+-                state["attempt_count"] += 1
+-                _safe_write_state(key, state, where="planner_revise_failed")
+-                _log(f"DISPATCH FAILED: {key} Phase 1 retry failed")
+-                dispatched_status = "failed"
+-                dispatched += 1
+-                break
+-
+-            plan_content = p1["plan_content"]  # needed for phase_builder below
+-            if not tracker.can_start_phase("skeptic_revise"):  # P153/MOL-506
+-                _abort_budget_exhausted(key, state, "skeptic_revise", tracker)
+-                dispatched_status = "incomplete"
+-                dispatched += 1
+-                break
+-            p2 = phase_skeptic(key, repo_path, tracker=tracker)
+-            if p2["verdict"] in ("REVISE", "RETHINK", None):
+-                state["last_status"] = "incomplete"
+-                state["attempt_count"] += 1
+-                _safe_write_state(key, state, where="skeptic_revise_failed")
+-                _log(f"DISPATCH INCOMPLETE: {key} Phase 2 retry: {p2['verdict']}")
+-                _log_event("phase_failed", key=key, phase="skeptic_retry",
+-                           verdict=p2.get("verdict"), tier=p2.get("tier"))
+-                print(f"⚠️ {key}: plan-skeptic {p2['verdict']} "
+-                      f"after retry — plan needs manual revision")
+-                dispatched_status = "incomplete"
+-                dispatched += 1
+-                break
+-
+-        _set_checkpoint(state, "skeptic_done")
+-        _safe_write_state(key, state, where="skeptic_done")
+-        _log_event("phase_complete", key=key, phase="skeptic",
+-                   verdict=p2.get("verdict"), tier=p2.get("tier"))
+-
+-        # ── Phase 3: Builder ───────────────────────────────────────────
+-        if not tracker.can_start_phase("builder"):  # P153/MOL-506
+-            _abort_budget_exhausted(key, state, "builder", tracker)
+-            dispatched_status = "incomplete"
+-            dispatched += 1
+-            break
+-        _log("── Phase 3 (Builder) ──")
+-        p3 = phase_builder(key, plan_content, repo_path, tracker=tracker)
+-        pr_num = p3.get("pr_num")
+-
+-        if not p3["ok"] or not pr_num:
+-            state["last_status"] = "incomplete"
+-            state["attempt_count"] += 1
+-            _safe_write_state(key, state, where="builder_failed")
+-            _log(f"DISPATCH INCOMPLETE: {key} Phase 3 failed or no PR")
+-            _log_event("phase_failed", key=key, phase="builder",
+-                       error=str(p3.get("error", ""))[:300], tier=p3.get("tier"))
+-            dispatched_status = "incomplete"
+-            dispatched += 1
+-            break
+-
+-        _set_checkpoint(state, "builder_done")
+-        _safe_write_state(key, state, where="builder_done")
+-        _log_event("phase_complete", key=key, phase="builder",
+-                   pr_num=pr_num, tier=p3.get("tier"))
+-
+-        # ── Phase 4: Reviewer ──────────────────────────────────────────
+-        if not tracker.can_start_phase("reviewer"):  # P153/MOL-506
+-            # P153/MOL-506: builder already opened a PR; record it on
+-            # state so the next tick (or a manual sweep) can find + triage
+-            # the un-reviewed PR instead of leaving it orphaned.
+-            state["orphan_pr_num"] = pr_num
+-            _abort_budget_exhausted(key, state, "reviewer", tracker)
+-            dispatched_status = "incomplete"
+-            dispatched += 1
+-            break
+-        _log("── Phase 4 (Reviewer) ──")
+-        p4 = phase_reviewer(key, pr_num, repo_path, tracker=tracker)
+-
+-        # ── Bash gate ──────────────────────────────────────────────────
+-        if p4["gate"] == 0:
+-            _log(f"Merging PR #{pr_num}")
+-            try:
+-                r = subprocess.run(
+-                    ["gh", "pr", "merge", str(pr_num), "--squash", "--delete-branch"],
+-                    capture_output=True, text=True, timeout=30,
+-                    cwd=repo_path,
+-                )
+-                # gh pr merge returns non-zero for branch protection,
+-                # mergeability conflicts, auth failure, network 5xx,
+-                # rate-limit. Capturing the exit code prevents falsely
+-                # marking the state as merged when the PR is still open
+-                # (which would then trip the silent-skip path next tick).
+-                if r.returncode == 0:
+-                    pr_state = "merged"
+-                else:
+-                    pr_state = "open"
+-                    _log_event("pr_merge_failed",
+-                               key=key, pr_num=pr_num,
+-                               exit_code=r.returncode,
+-                               stderr_tail=_stderr_tail(r.stderr or ""))
+-                    sys.stderr.write(
+-                        f"⚠️ {key}: gh pr merge #{pr_num} "
+-                        f"exit {r.returncode}: {(r.stderr or '')[:200]}\n")
+-                    sys.stderr.flush()
+-            except (OSError, subprocess.TimeoutExpired) as exc:
+-                pr_state = "open"
+-                _log_event("pr_merge_exception",
+-                           key=key, pr_num=pr_num,
+-                           exc_type=type(exc).__name__,
+-                           exc=str(exc)[:200])
+-                sys.stderr.write(
+-                    f"⚠️ {key}: gh pr merge exception: "
+-                    f"{type(exc).__name__}: {str(exc)[:200]}\n")
+-                sys.stderr.flush()
+-        else:
+-            pr_state = "open"
+-
+-        _set_checkpoint(state, "reviewer_done")
+-        _log_event("phase_complete", key=key, phase="reviewer",
+-                   passed=p4.get("passed"), gate=p4.get("gate"),
+-                   pr_state=pr_state, tier=p4.get("tier"))
+-
+-        # ── Update state ──────────────────────────────────────────────
+-        if p4["passed"] and pr_state == "merged":
+-            state["last_status"] = "succeeded"
+-            # attempt_count unchanged (success)
+-        else:
+-            state["last_status"] = "incomplete"
+-            state["attempt_count"] += 1
+-
+-        _safe_write_state(key, state, where="dispatch_complete")
+-
+-        _log(f"DISPATCH COMPLETE: {key} status={state['last_status']} "
+-             f"pr_state={pr_state}")
+-        _log_event("dispatch_complete", key=key,
+-                   final_status=state["last_status"],
+-                   pr_state=pr_state, pr_num=pr_num,
+-                   attempt_count=state["attempt_count"])
+-        dispatched_status = state["last_status"]
++        result = run_one(key, dry_run=dry_run)
++
++        if not result.dispatched:
++            skipped += 1
++            continue
++
+         dispatched += 1
++        if result.detail_line:
++            dispatch_details.append(result.detail_line)
++        # Preserve pre-P154 summary semantics: dry_run dispatches do not
++        # set dispatched_status (the summary's "Dispatched: …" tail line
++        # historically suppressed itself in DRY_RUN mode).
++        if result.final_status != "dry_run":
++            dispatched_status = result.final_status
+         break  # 1-per-tick cap
+ 
+     # ── Step 3: Summary ────────────────────────────────────────────────

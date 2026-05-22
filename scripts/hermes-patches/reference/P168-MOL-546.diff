@@ -1,0 +1,501 @@
+diff --git a/plugins/memory/tiered/embeddings.py b/plugins/memory/tiered/embeddings.py
+--- a/plugins/memory/tiered/embeddings.py	2026-05-12 12:29:01
++++ b/plugins/memory/tiered/embeddings.py	2026-05-12 12:29:01
+@@ -0,0 +1,124 @@
++"""In-process embedding client for tiered memory.
++
++P168/MOL-546: swapped from Ollama HTTP (nomic-embed-text, 768-dim, MTEB ~62.4)
++to in-process fastembed (mxbai-embed-large-v1, 1024-dim, MTEB ~64.7). The swap
++buys ~2.3 MTEB-retrieval points AND removes the Ollama HTTP round-trip + cold-load
++penalty (~3-5s first call on prior model). Model loads once at import; subsequent
++embeds run ~15-50ms each.
++
++MAX_CHARS = 2000: mxbai-embed-large's effective context is ~512 tokens (~2000 chars),
++so 6000-char (P160) truncation was wasted bytes beyond model context AND slower
++embed pass. Returns None on failure for FTS-only fallback.
++
++Migration: store.py:_migrate_vec_dims() auto-handles the 768→1024 dim change via
++DROP+CREATE memory_vec + _reembed_all(). ~16ms per entry × ~2400 entries ≈ 40s on
++first gateway start post-upgrade.
++
++P168/MOL-546 review fix-pass-2 (silent-failure-hunter findings):
++- `_get_model()` first-call init is allowed to RAISE — caller (typically
++  `_reembed_all` during migration) sees the actionable error instead of
++  per-call's silent return-None mask.
++- `generate_embedding` per-call catch narrowed from bare `except Exception`
++  to specific classes that fastembed/ONNX/IO can actually emit; KeyboardInterrupt
++  and programming errors (TypeError, AttributeError) propagate.
++- Per-entry truncation logging adds an audit trail when MAX_CHARS truncation
++  fires, so future recall regressions can be attributed to specific entries.
++"""
++
++import logging
++import os
++from typing import Optional
++
++from fastembed import TextEmbedding
++
++logger = logging.getLogger(__name__)
++
++MODEL = "mixedbread-ai/mxbai-embed-large-v1"  # P168/MOL-546 — was "nomic-embed-text"
++DIMS = 1024                                    # P168/MOL-546 — was 768 (nomic); auto-migration via store.py:_migrate_vec_dims
++MAX_CHARS = 2000                               # P168/MOL-546 — was 6000 (P160); matches mxbai's ~512-token effective context
++
++# Exception classes that the embed path can legitimately produce.
++# Bare `except Exception` was rejected per review: it masked programming
++# errors (TypeError, AttributeError) AND environmental crashes worth surfacing
++# (MemoryError under OOM is borderline but listed here because the alternative
++# is the entire embedding pass dying mid-batch from one OOM event).
++# P168/MOL-546.
++_EMBED_ERRORS = (RuntimeError, OSError, ValueError, ImportError, MemoryError)
++
++# Module-level singleton — fastembed lazy-loads ONNX session on first .embed() call.
++# Cache dir keeps model weights in ~/.cache/fastembed/ (writable from Hermes sandbox).
++_CACHE_DIR = os.path.expanduser("~/.cache/fastembed")
++_model: Optional[TextEmbedding] = None
++
++
++def _get_model() -> TextEmbedding:
++    """Lazily instantiate the shared TextEmbedding singleton.
++
++    First call performs HF download (if model uncached) + ONNX session init.
++    Failures here ARE allowed to raise — the caller's per-call exception
++    handler is for inference errors only, not init errors. An init failure
++    surfaces as `fastembed init failed: <reason>` to the operator instead
++    of being silently swallowed for every subsequent embed call.
++    """
++    global _model
++    if _model is None:
++        os.makedirs(_CACHE_DIR, exist_ok=True)
++        try:
++            _model = TextEmbedding(MODEL, cache_dir=_CACHE_DIR)
++        except _EMBED_ERRORS as e:
++            logger.error(
++                "fastembed init failed for %s in %s: %s. "
++                "Check HF egress + cache writability; pre-download with "
++                "`python -m fastembed.cli download %s` if running offline.",
++                MODEL, _CACHE_DIR, e, MODEL,
++            )
++            raise
++    return _model
++
++
++def generate_embedding(text: str) -> Optional[list[float]]:
++    """Generate 1024-dim embedding via fastembed. Returns None on failure (FTS-only fallback).
++
++    First call cost: ONNX session init + optional HF download (allowed to raise).
++    Subsequent calls catch only inference-class errors per `_EMBED_ERRORS`.
++    """
++    raw_len = len(text)
++    text = text[:MAX_CHARS].strip()
++    if not text:
++        return None
++    if raw_len > MAX_CHARS:
++        logger.info("Embedding input truncated: %d → %d chars", raw_len, MAX_CHARS)
++    try:
++        emb = next(iter(_get_model().embed([text])))
++        emb_list = emb.tolist()
++        if len(emb_list) != DIMS:
++            logger.warning("Embedding dimension mismatch: expected %d, got %d", DIMS, len(emb_list))
++            return None
++        return emb_list
++    except _EMBED_ERRORS as e:
++        logger.warning("Embedding generation failed: %s", e)
++        return None
++
++
++def generate_embeddings(texts: list[str]) -> list[Optional[list[float]]]:
++    """Batch embedding generation. fastembed handles batching internally."""
++    if not texts:
++        return []
++    stripped = [t[:MAX_CHARS].strip() for t in texts]
++    non_empty_indices = [i for i, t in enumerate(stripped) if t]
++    if not non_empty_indices:
++        return [None] * len(texts)
++    non_empty_texts = [stripped[i] for i in non_empty_indices]
++    try:
++        raw = list(_get_model().embed(non_empty_texts))
++        validated = [
++            emb.tolist() if hasattr(emb, "tolist") and len(emb) == DIMS else None
++            for emb in raw
++        ]
++        result: list[Optional[list[float]]] = [None] * len(texts)
++        for idx, emb in zip(non_empty_indices, validated):
++            result[idx] = emb
++        return result
++    except _EMBED_ERRORS as e:
++        logger.warning("Batch embedding generation failed: %s", e)
++        return [None] * len(texts)
+diff --git a/plugins/memory/tiered/store.py b/plugins/memory/tiered/store.py
+--- a/plugins/memory/tiered/store.py	2026-05-12 12:29:01
++++ b/plugins/memory/tiered/store.py	2026-05-12 12:29:01
+@@ -86,12 +86,15 @@
+ 
+ CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
+   entry_rowid integer primary key,
+-  embedding float[768] distance_metric=cosine,
++  embedding float[1024] distance_metric=cosine,
+   category text
+ );
+--- P151/MOL-502: dim was 1024 (bge-m3); now 768 (nomic-embed-text).
+--- Existing DBs auto-migrate via _migrate_vec_dims() in __init__.
+--- Existing DBs auto-migrate via _migrate_vec_dims() in __init__.
++-- P151/MOL-502: dim was 1024 (bge-m3); briefly 768 (nomic-embed-text).
++-- P168/MOL-546: back to 1024 (mxbai-embed-large-v1).
++-- Existing DBs auto-migrate via _migrate_vec_dims() in __init__. Fresh DBs
++-- skip the migration (no prior memory_vec data → migration probe returns
++-- empty), so the SCHEMA literal MUST match the current model's DIMS or
++-- fresh installs ship with a broken vec table.
+ 
+ CREATE TABLE IF NOT EXISTS memory_stats (
+   source      TEXT PRIMARY KEY DEFAULT 'hermes',
+@@ -323,7 +326,8 @@
+         ).fetchall()
+         count = 0
+         for r in rows:
+-            emb = generate_embedding(f"{r['title']} {r['content']}")
++            # P168/MOL-546: title appears 2x so it contributes meaningfully even on long content
++            emb = generate_embedding(f"{r['title']}. {r['title']}. {r['content']}")
+             if emb:
+                 self._conn.execute(
+                     "INSERT OR REPLACE INTO memory_vec (entry_rowid, embedding, category) VALUES (?, ?, ?)",
+@@ -398,7 +402,8 @@
+                     "SELECT id FROM memory_entries WHERE rowid = ?", (entry_rowid,)
+                 ).fetchone()["id"]
+ 
+-                embedding = generate_embedding(f"{title} {content}")
++                # P168/MOL-546: title appears 2x so it contributes meaningfully even on long content
++                embedding = generate_embedding(f"{title}. {title}. {content}")
+                 if embedding:
+                     self._conn.execute(
+                         "INSERT INTO memory_vec (entry_rowid, embedding, category) VALUES (?, ?, ?)",
+diff --git a/plugins/memory/tiered/tests/test_embeddings.py b/plugins/memory/tiered/tests/test_embeddings.py
+--- a/plugins/memory/tiered/tests/test_embeddings.py	2026-05-12 12:29:01
++++ b/plugins/memory/tiered/tests/test_embeddings.py	2026-05-12 12:29:01
+@@ -1,24 +1,45 @@
+-"""Tests for embeddings.py — Ollama embedding client."""
++"""Tests for embeddings.py — in-process fastembed client (P168/MOL-546).
+ 
++Pre-MOL-546 this module wrapped an httpx call to Ollama. The contract surface
++is unchanged (`generate_embedding(text)` and `generate_embeddings(texts)` still
++return `Optional[list[float]]` / `list[Optional[list[float]]]`), so these tests
++re-verify the SAME contracts against the new in-process implementation.
++
++Mocking shape: tests patch the module-level `_get_model()` singleton accessor
++to return a MagicMock with an `.embed(iterable)` method, mirroring the
++fastembed.TextEmbedding API surface used by the call sites.
++"""
++
+ import unittest
++from typing import Iterable
+ from unittest.mock import MagicMock, patch
+ 
+-import httpx
+ 
++def _fake_vector(dim: int, fill: float = 0.1):
++    """Build a numpy-array-like that exposes .tolist() and len() — what fastembed yields."""
++    v = MagicMock()
++    v.tolist.return_value = [fill] * dim
++    v.__len__.return_value = dim
++    return v
+ 
++
++def _fake_embed_iter(vectors):
++    """Build a callable returning an iterator over `vectors`, mirroring fastembed's .embed()."""
++    def _embed(texts: Iterable[str]):
++        for v in vectors:
++            yield v
++    return _embed
++
++
+ class TestGenerateEmbedding(unittest.TestCase):
+     """Tests for generate_embedding (single text)."""
+ 
+-    @patch("plugins.memory.tiered.embeddings.httpx.post")
+-    def test_generate_embedding_success(self, mock_post: MagicMock) -> None:
+-        """Successful 1024-dim response returns list of 1024 floats."""
+-        mock_resp = MagicMock()
+-        mock_resp.json.return_value = {
+-            "embeddings": [[0.1] * 1024],
+-            "model": "qllama/bge-small-en-v1.5",
+-        }
+-        mock_resp.raise_for_status = MagicMock()
+-        mock_post.return_value = mock_resp
++    @patch("plugins.memory.tiered.embeddings._get_model")
++    def test_generate_embedding_success(self, mock_get_model: MagicMock) -> None:
++        """Successful 1024-dim fastembed call returns a list of 1024 floats."""
++        model = MagicMock()
++        model.embed = _fake_embed_iter([_fake_vector(1024)])
++        mock_get_model.return_value = model
+ 
+         from plugins.memory.tiered.embeddings import generate_embedding
+ 
+@@ -28,83 +49,65 @@
+         self.assertIsInstance(result[0], float)
+ 
+     def test_generate_embedding_empty_text(self) -> None:
+-        """Empty string returns None without making any HTTP call."""
++        """Empty string returns None without invoking the model."""
+         from plugins.memory.tiered.embeddings import generate_embedding
+ 
+         result = generate_embedding("")
+         self.assertIsNone(result)
+ 
+-    @patch("plugins.memory.tiered.embeddings.httpx.post")
+-    def test_generate_embedding_connection_error(self, mock_post: MagicMock) -> None:
+-        """Connection error returns None (FTS-only fallback)."""
+-        mock_post.side_effect = httpx.ConnectError("Connection refused")
++    @patch("plugins.memory.tiered.embeddings._get_model")
++    def test_generate_embedding_model_raises(self, mock_get_model: MagicMock) -> None:
++        """Any exception from the model layer (HF download, ONNX session, etc) returns None."""
++        model = MagicMock()
++        model.embed = MagicMock(side_effect=RuntimeError("simulated model failure"))
++        mock_get_model.return_value = model
+ 
+         from plugins.memory.tiered.embeddings import generate_embedding
+ 
+         result = generate_embedding("hello world")
+         self.assertIsNone(result)
+ 
+-    @patch("plugins.memory.tiered.embeddings.httpx.post")
+-    def test_generate_embedding_timeout(self, mock_post: MagicMock) -> None:
+-        """Timeout returns None (FTS-only fallback)."""
+-        mock_post.side_effect = httpx.TimeoutException("Request timed out")
++    @patch("plugins.memory.tiered.embeddings._get_model")
++    def test_generate_embedding_wrong_dims(self, mock_get_model: MagicMock) -> None:
++        """Vector with wrong dimensions returns None (defensive check, shouldn't trigger in prod)."""
++        model = MagicMock()
++        model.embed = _fake_embed_iter([_fake_vector(128)])  # wrong dim
++        mock_get_model.return_value = model
+ 
+         from plugins.memory.tiered.embeddings import generate_embedding
+ 
+         result = generate_embedding("hello world")
+         self.assertIsNone(result)
+ 
+-    @patch("plugins.memory.tiered.embeddings.httpx.post")
+-    def test_generate_embedding_wrong_dims(self, mock_post: MagicMock) -> None:
+-        """Response with wrong dimensions (128 instead of 1024) returns None."""
+-        mock_resp = MagicMock()
+-        mock_resp.json.return_value = {
+-            "embeddings": [[0.1] * 128],
+-            "model": "qllama/bge-small-en-v1.5",
+-        }
+-        mock_resp.raise_for_status = MagicMock()
+-        mock_post.return_value = mock_resp
++    @patch("plugins.memory.tiered.embeddings._get_model")
++    def test_generate_embedding_truncation(self, mock_get_model: MagicMock) -> None:
++        """Text longer than MAX_CHARS gets truncated before the embed call."""
++        captured = {}
+ 
+-        from plugins.memory.tiered.embeddings import generate_embedding
++        def _capturing_embed(texts: Iterable[str]):
++            captured["texts"] = list(texts)
++            yield _fake_vector(1024)
+ 
+-        result = generate_embedding("hello world")
+-        self.assertIsNone(result)
++        model = MagicMock()
++        model.embed = _capturing_embed
++        mock_get_model.return_value = model
+ 
+-    @patch("plugins.memory.tiered.embeddings.httpx.post")
+-    def test_generate_embedding_truncation(self, mock_post: MagicMock) -> None:
+-        """Text > 8000 chars gets truncated before sending to API."""
+-        mock_resp = MagicMock()
+-        mock_resp.json.return_value = {
+-            "embeddings": [[0.1] * 1024],
+-            "model": "qllama/bge-small-en-v1.5",
+-        }
+-        mock_resp.raise_for_status = MagicMock()
+-        mock_post.return_value = mock_resp
++        from plugins.memory.tiered.embeddings import MAX_CHARS, generate_embedding
+ 
+-        from plugins.memory.tiered.embeddings import generate_embedding
+-
+-        long_text = "x" * 10000
++        long_text = "x" * (MAX_CHARS + 5000)
+         generate_embedding(long_text)
++        self.assertEqual(len(captured["texts"][0]), MAX_CHARS)
+ 
+-        # Verify the POST call received truncated text (8000 chars)
+-        call_args = mock_post.call_args
+-        sent_text = call_args.kwargs.get("json", call_args[1].get("json", {}))["input"]
+-        self.assertEqual(len(sent_text), 8000)
+ 
+-
+ class TestGenerateEmbeddings(unittest.TestCase):
+     """Tests for generate_embeddings (batch)."""
+ 
+-    @patch("plugins.memory.tiered.embeddings.httpx.post")
+-    def test_generate_embeddings_batch(self, mock_post: MagicMock) -> None:
+-        """Batch request with 2 texts returns 2 embeddings."""
+-        mock_resp = MagicMock()
+-        mock_resp.json.return_value = {
+-            "embeddings": [[0.1] * 1024, [0.2] * 1024],
+-            "model": "qllama/bge-small-en-v1.5",
+-        }
+-        mock_resp.raise_for_status = MagicMock()
+-        mock_post.return_value = mock_resp
++    @patch("plugins.memory.tiered.embeddings._get_model")
++    def test_generate_embeddings_batch(self, mock_get_model: MagicMock) -> None:
++        """Batch of 2 texts returns 2 embeddings of correct dim."""
++        model = MagicMock()
++        model.embed = _fake_embed_iter([_fake_vector(1024, 0.1), _fake_vector(1024, 0.2)])
++        mock_get_model.return_value = model
+ 
+         from plugins.memory.tiered.embeddings import generate_embeddings
+ 
+@@ -114,11 +117,27 @@
+         self.assertEqual(len(result[1]), 1024)
+ 
+     def test_generate_embeddings_empty_list(self) -> None:
+-        """Empty list returns empty list without making any HTTP call."""
++        """Empty input returns empty list without invoking the model."""
+         from plugins.memory.tiered.embeddings import generate_embeddings
+ 
+         result = generate_embeddings([])
+         self.assertEqual(result, [])
++
++    @patch("plugins.memory.tiered.embeddings._get_model")
++    def test_generate_embeddings_mixed_empty(self, mock_get_model: MagicMock) -> None:
++        """Empty strings in batch get a None slot — model is only called for non-empty inputs."""
++        model = MagicMock()
++        # Two non-empty texts in the input → two vectors back
++        model.embed = _fake_embed_iter([_fake_vector(1024), _fake_vector(1024)])
++        mock_get_model.return_value = model
++
++        from plugins.memory.tiered.embeddings import generate_embeddings
++
++        result = generate_embeddings(["hello", "", "world"])
++        self.assertEqual(len(result), 3)
++        self.assertEqual(len(result[0]), 1024)
++        self.assertIsNone(result[1])
++        self.assertEqual(len(result[2]), 1024)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/plugins/memory/tiered/tests/test_store.py b/plugins/memory/tiered/tests/test_store.py
+--- a/plugins/memory/tiered/tests/test_store.py	2026-05-12 12:29:01
++++ b/plugins/memory/tiered/tests/test_store.py	2026-05-12 12:29:01
+@@ -677,3 +677,107 @@
+         assert _escape_fts_query("single") == '"single"'
+         # Double quotes in tokens get escaped
+         assert _escape_fts_query('say "hi"') == '"say" """hi"""'
++
++
++class TestMigrationAndReembed:
++    """P168/MOL-546 behavioral coverage for the 768→1024 auto-migration AND
++    the title-2x embedding text. The pr-test-analyzer flagged these as
++    load-bearing claims with zero automated coverage — these tests cover
++    the migration path + the source-vs-behavior gap on title-2x."""
++
++    def test_migrate_dims_768_to_1024(self):
++        """Seed a 768-dim vec table, run _migrate_vec_dims, assert new dim
++        + non-empty reembed. The fresh-DB schema is 1024-dim post-MOL-546,
++        so this test manually DROPs and re-CREATEs memory_vec at 768-dim
++        with one seed row before triggering the migration.
++        """
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = Path(tmpdir) / "migrate.db"
++            with patch("plugins.memory.tiered.store.scrub_content", side_effect=lambda t, **kw: t):
++                # Mock generate_embedding so insert_entry's 1024-dim write succeeds
++                # while we're still on the 1024-dim schema.
++                with patch("plugins.memory.tiered.store.generate_embedding") as mock_emb:
++                    mock_emb.return_value = [0.1] * 1024
++                    from plugins.memory.tiered.store import TieredMemoryDB
++                    store = TieredMemoryDB(db_path)
++                    store.insert_entry("Pre-migration title", "old content body", category="project")
++                    store.insert_entry("Second pre-migration", "more old content", category="project")
++
++                    # Manually downgrade memory_vec to 768-dim to simulate a pre-MOL-546 DB.
++                    store._conn.execute("DROP TABLE memory_vec")
++                    store._conn.execute("""
++                        CREATE VIRTUAL TABLE memory_vec USING vec0(
++                            entry_rowid integer primary key,
++                            embedding float[768] distance_metric=cosine,
++                            category text
++                        )
++                    """)
++                    # Seed one row at 768-dim so the migration probe finds non-empty data.
++                    store._conn.execute(
++                        "INSERT INTO memory_vec (entry_rowid, embedding, category) VALUES (?, ?, ?)",
++                        (1, serialize_float32([0.1] * 768), "project"),
++                    )
++                    store._conn.commit()
++                    store.close()
++
++                    # Reopen — _migrate_vec_dims fires in __init__, sees 768 vs DIMS=1024 mismatch.
++                    store = TieredMemoryDB(db_path)
++                    row = store._conn.execute(
++                        "SELECT length(embedding) FROM memory_vec LIMIT 1"
++                    ).fetchone()
++                    assert row is not None, "memory_vec is empty after migration"
++                    new_dims = row[0] // 4
++                    assert new_dims == 1024, f"expected 1024-dim post-migration, got {new_dims}"
++                    re_count = store._conn.execute(
++                        "SELECT COUNT(*) FROM memory_vec"
++                    ).fetchone()[0]
++                    assert re_count == 2, f"expected 2 reembedded entries, got {re_count}"
++                    store.close()
++
++    def test_embedding_text_contains_title_twice(self):
++        """Behavioral assertion that the title appears 2x in the string passed
++        to generate_embedding, at BOTH call sites (insert + reembed). Source-level
++        verifier doesn't catch a future refactor that routes through a helper;
++        this captures the actual string at runtime.
++        """
++        captured = []
++
++        def capture_emb(text):
++            captured.append(text)
++            return [0.1] * 1024
++
++        with tempfile.TemporaryDirectory() as tmpdir:
++            db_path = Path(tmpdir) / "title.db"
++            with patch("plugins.memory.tiered.store.scrub_content", side_effect=lambda t, **kw: t):
++                with patch("plugins.memory.tiered.store.generate_embedding", side_effect=capture_emb):
++                    from plugins.memory.tiered.store import TieredMemoryDB
++                    store = TieredMemoryDB(db_path)
++                    store.insert_entry("Unique Title XYZ", "the body content goes here", category="project")
++                    assert captured, "generate_embedding was never called by insert_entry"
++                    insert_call = captured[-1]
++                    assert insert_call.count("Unique Title XYZ") == 2, (
++                        f"insert path: title appeared {insert_call.count('Unique Title XYZ')}x, "
++                        f"expected 2x. Got: {insert_call!r}"
++                    )
++
++                    # Drop + re-create memory_vec so _reembed_all can write fresh without
++                    # hitting the UNIQUE constraint on entry_rowid (production path always
++                    # drops first via _migrate_vec_dims).
++                    store._conn.execute("DROP TABLE memory_vec")
++                    store._conn.execute("""
++                        CREATE VIRTUAL TABLE memory_vec USING vec0(
++                            entry_rowid integer primary key,
++                            embedding float[1024] distance_metric=cosine,
++                            category text
++                        )
++                    """)
++                    store._conn.commit()
++                    captured.clear()
++                    store._reembed_all()
++                    assert captured, "generate_embedding was never called by _reembed_all"
++                    reembed_call = captured[-1]
++                    assert reembed_call.count("Unique Title XYZ") == 2, (
++                        f"reembed path: title appeared {reembed_call.count('Unique Title XYZ')}x, "
++                        f"expected 2x. Got: {reembed_call!r}"
++                    )
++                    store.close()
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml	2026-05-12 12:29:01
++++ b/pyproject.toml	2026-05-12 12:29:01
+@@ -48,6 +48,9 @@
+   # (which is a silent killer on Windows — see CONTRIBUTING.md) and
+   # `os.killpg` (which doesn't exist on Windows).
+   "psutil>=5.9.0,<8",
++  # Tiered memory embedder (P168/MOL-546 — in-process via fastembed; was Ollama HTTP)
++  "fastembed>=0.4,<1",
++  "onnxruntime>=1.17,<2",  # transitive of fastembed; pin explicitly so a fastembed bump can't silently drop it
+ ]
+ 
+ [project.optional-dependencies]

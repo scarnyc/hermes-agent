@@ -1,0 +1,25 @@
+--- a/.hermes/scripts/symphony_bridge.py	(pre-P184)
++++ b/.hermes/scripts/symphony_bridge.py	(P184/MOL-550 Iter 7 F15)
+@@ _PHASE_TIMEOUTS @@
+ _PHASE_TIMEOUTS: "MappingProxyType[PhaseName, int]" = MappingProxyType({
+     "planner": 1800,   # 30 min — P166/MOL-550 S4: Tier 3 real planner work on MOL-481-class tickets exceeded 600s
+-    "skeptic": 300,    #  5 min
++    "skeptic": 1200,   # 20 min — P184/MOL-550 (Iter 7 F15): raised from 300 after MOL-498 logs showed 3 SIGKILL timeouts at 300s + cc+ds successes at 271s/1002s/1335s (600s would have killed two of three observed convergences). F13 smoke cell 2 (DS realistic) at ~530s sets a floor; 1200s gives ~50% margin over the 1002s success and accepts the 1335s outlier might still SIGKILL → P183/F14 cascade catches. Trade: longer wait on slow cases vs. earlier cascade-to-Tier-2; favoring Tier 1 convergence headroom since cc+ds is cheapest per second.
+     "builder": 1800,   # 30 min
+     "reviewer": 900,   # 15 min
+     # REVISE-loop gates: floor matches the underlying base phase via
+     # BudgetTracker._effective_min_phase, not the bare 300s.
+     "planner_revise": 600,
+-    "skeptic_revise": 300,
++    "skeptic_revise": 1200,  # P184/MOL-550 (Iter 7 F15): keep parity with skeptic base above.
+ })
+
+# Investigation summary (full version in PATCHES.md):
+# MOL-498 log review (~/.hermes/logs/symphony_bridge.log) showed:
+#   - 3 SIGKILL timeouts on DS Tier 1 at 300s/600s (no stderr — hard-kill flushes nothing)
+#   - 6 nonzero-exit fast failures (model-slug [1m] routing — already fixed in P165)
+#   - 1 error_max_turns at 1384s/61 turns (turn-budget hit, not wall-clock)
+#   - 3 successes at 271s/1002s/1335s/23-94 turns — DS CAN complete, needs wall-time
+# DS Tier 1 isn't broken; the Skeptic phase shared Planner's pre-tuning ceiling.
+# Sized at 1200s (not 600s) to clear the 1002s observed-success floor; the
+# 1335s outlier remains a SIGKILL risk → P183/F14 cascade safety net.

@@ -1,0 +1,13 @@
+diff --git a/scripts/hermes-patches/reference/claude-agents/planner.md b/scripts/hermes-patches/reference/claude-agents/planner.md
+index 2473ada..dfd3632 100644
+--- a/scripts/hermes-patches/reference/claude-agents/planner.md
++++ b/scripts/hermes-patches/reference/claude-agents/planner.md
+@@ -33,7 +33,7 @@ Invoke these via the `Skill` tool when the plan involves the listed concern:
+ - Operate in plan mode; do not write files outside `{plan_file}`.
+ - No code edits — Builder's job.
+ - Call `ExitPlanMode` once the plan is written.
+-- **P172/MOL-550 (Iter 5 F7) — atomic plan-write → exit handoff.** After you have written the plan file at the target path, your VERY NEXT tool call MUST be `ExitPlanMode` with the plan content. Do NOT re-grep, re-read, re-dispatch Task agents, or call any other tool. The plan-write → ExitPlanMode handoff is atomic. Continuing to explore after the plan is written burns turn budget without improving the plan and risks `error_max_turns` (S6 dispatch 2026-05-12 burned $3.25 hitting this case).
++- **P173/MOL-550 (Iter 6 F8) — ExitPlanMode is the plan-write primitive.** The plan-mode harness uses ExitPlanMode as the file-write mechanism, not the `Write` tool. `--permission-mode plan` disables `Write`; do not attempt to use it. Once you have composed the plan in your own reasoning, your VERY NEXT tool call MUST be `ExitPlanMode` with the FULL plan content as its argument. The Claude harness writes the plan to disk from outside the subprocess sandbox; you do NOT need to (and cannot) write the file yourself. After ExitPlanMode, do not call any further tools (no `Grep`, `Read`, `Task`, `Bash`, etc.) — your job is done; the subprocess exits. Continuing to explore after the plan is composed burns turn budget and risks `error_max_turns`. Failure mode (2026-05-12 S6 dispatch): a planner spent 94 turns failing to use `Write` against a sandboxed path, then called ExitPlanMode with a malformed argument — the harness wrote nothing. Don't be that planner.
+ 
+ ---
+ 

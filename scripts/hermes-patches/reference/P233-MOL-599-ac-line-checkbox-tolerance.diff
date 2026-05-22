@@ -1,0 +1,68 @@
+--- a/scripts/distill_goal.py
++++ b/scripts/distill_goal.py
+@@ -58,7 +58,18 @@
+ _OUT_OF_SCOPE_RE = re.compile(r"^\s*##\s+Out\s+of\s+scope\s*$", re.IGNORECASE | re.MULTILINE)
+ _NEXT_H2_RE = re.compile(r"^\s*##\s+\S", re.MULTILINE)
+-_AC_LINE_RE = re.compile(r"^(?:\s*[-*]\s+|\s*\d+\.\s+)\S", re.MULTILINE)
++# MOL-599 P233: AC item form tolerance — GitHub-style bare `[ ]` / `[x]`
++# checkboxes are a common Jira AC convention. The prior pattern only matched
++# `-`/`*`/digit bullets, so jira-cli `--plain` output with bare-checkbox AC
++# items would return ac_count=0 and abort `distill()` at exit 3
++# (`empty_ac_section`) AFTER P232's heading-anchor fix landed. Atomic with
++# P232: same module, same fault class (parser tolerance against real-world
++# ticket prose), exposed by the same MOL-599 live smoke.
++_AC_LINE_RE = re.compile(
++    r"^(?:\s*[-*]\s+|\s*\d+\.\s+|\s*\[[ xX]\]\s+)\S",
++    re.MULTILINE,
++)
++
+--- a/tests/test_distill_goal_indent.py
++++ b/tests/test_distill_goal_indent.py
+@@ -170,3 +170,77 @@
+     assert sha != body_only_sha, (
+         "sha256 must differ from body-alone hash — proves the AC slice "
+         "actually got included in the payload."
+     )
++
++
++def test_ac_line_re_counts_bare_checkbox_items(distill_goal_module):
++    """MOL-599 P233: _AC_LINE_RE must recognize GitHub-style bare checkboxes.
++
++    MOL-599's RAW_INTENT.md uses the `[ ] item` form for AC items — no leading
++    dash, no asterisk, no number. The current regex only matches `-`/`*`/digit
++    list bullets, so _count_ac_items() returns 0 and distill_goal.distill()
++    exits 3 at line 137 with reason=`empty_ac_section` — even AFTER P232's
++    indent-tolerance fix resolves the heading-detection layer.
++
++    This is the second exit-3 defect uncovered by the MOL-599 live smoke.
++    P232 fixed the AC heading; P233 fixes the AC item form.
++    """
++    ac_section = (
++        "  [ ] Tool override flag: plugin can replace a built-in tool\n"
++        "  [ ] MCP parallel tool calls execute concurrently\n"
++        "  [x] Already-checked items count too\n"
++        "  [X] Capital-X variant\n"
++    )
++    matches = list(distill_goal_module._AC_LINE_RE.finditer(ac_section))
++    assert len(matches) == 4
++
++
++def test_distill_against_mol599_fixture_produces_goal_md(
++    distill_goal_module, raw_intent_module, tmp_path, monkeypatch
++):
++    """MOL-599 P233 + P232 end-to-end: distill() against the real MOL-599
++    RAW_INTENT.md must produce a non-empty GOAL.md with all 4 AC items.
++    """
++    if not MOL599_FIXTURE.exists():
++        pytest.skip(f"MOL-599 fixture not present at {MOL599_FIXTURE}")
++
++    goal_dir = tmp_path / "MOL-599"
++    goal_dir.mkdir()
++    (goal_dir / "RAW_INTENT.md").write_text(
++        MOL599_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
++    )
++    goal_path, activation_path, ac_count = distill_goal_module.distill("MOL-599", goal_dir)
++    assert ac_count == 4
++    goal_md = goal_path.read_text(encoding="utf-8")
++    assert "Tool override flag" in goal_md
++    assert "Register cherry-picks" in goal_md

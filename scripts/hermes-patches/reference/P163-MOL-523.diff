@@ -1,0 +1,160 @@
+--- a/.hermes/scripts/symphony_bridge.py
++++ b/.hermes/scripts/symphony_bridge.py
+@@ -19,6 +19,7 @@
+ """
+ 
+ import json
++import math
+ import os
+ import re
+ import shlex
+@@ -81,6 +82,39 @@
+ # phases (builder=1800, reviewer=900) need their full timeout, not 300.
+ _MIN_PHASE_BUDGET = 300
+ 
++# P163/MOL-523: env-flag for the E2E shakeout. When HERMES_BUDGET_DISABLED is
++# truthy, BudgetTracker.can_start_phase() always returns True and remaining()
++# returns math.inf — eliminates the abort-mid-dispatch confound when measuring
++# natural wall-clock for a full ticket. Operator-supervised only; SIGKILL is
++# the manual safety net. The launchd plist sets the env via EnvironmentVariables
++# for the shakeout window, then unsets + kickstart before leaving the session.
++_BUDGET_DISABLED_ENV = "HERMES_BUDGET_DISABLED"
++
++
++_BUDGET_DISABLED_FALSY = frozenset({"", "0", "false", "no", "off"})
++_BUDGET_DISABLED_TRUTHY = frozenset({"1", "true", "yes", "on"})
++
++
++def _budget_disabled() -> bool:
++    """Single source of truth for the HERMES_BUDGET_DISABLED gate.
++
++    P163/MOL-523: tri-state, fail-closed semantics. The disable flag turns off
++    a safety layer; unrecognized inputs must NOT silently enable bypass.
++
++    - Recognized falsy ({"", "0", "false", "no", "off"}, case-insensitive)
++      returns False (gate active, production behavior).
++    - Recognized truthy ({"1", "true", "yes", "on"}, case-insensitive) returns
++      True (gate disabled).
++    - Any other value (typos like "disable" / "disabled" / "enable" / garbage)
++      returns False (fail-closed, gate stays active).
++
++    Operators wanting to disable the gate must type a recognized truthy value.
++    """
++    val = os.environ.get(_BUDGET_DISABLED_ENV, "").strip().lower()
++    if val in _BUDGET_DISABLED_TRUTHY:
++        return True
++    return False
++
+ # P148/MOL-498: stderr tail cap to bound log file size (Tier-1 silence is most likely in the tail).
+ _STDERR_TAIL_MAX = 50_000
+ 
+@@ -308,6 +342,15 @@
+         return time.monotonic() - self._start_monotonic
+ 
+     def remaining(self) -> float:
++        # P163/MOL-523: when HERMES_BUDGET_DISABLED is set, remaining() yields
++        # math.inf so the inner-loop retry-budget guard in
++        # _attempt_tier_with_retry (which subtracts retry_wait + tier_timeout
++        # from remaining() and aborts if negative) treats every retry as
++        # affordable. Without this, can_start_phase() short-circuiting alone
++        # would let phases START while individual retries inside them still
++        # got budget-aborted — defeating the experimental mode.
++        if _budget_disabled():
++            return math.inf
+         return max(0.0, self._budget - self.elapsed())
+ 
+     def _effective_min_phase(self, phase: PhaseName) -> int:
+@@ -320,19 +363,40 @@
+         return max(self._min_phase, _PHASE_TIMEOUTS.get(phase, 0))
+ 
+     def can_start_phase(self, phase: PhaseName) -> bool:
+-        """True iff remaining() >= phase-aware floor."""
++        """True iff remaining() >= phase-aware floor.
++
++        P163/MOL-523: HERMES_BUDGET_DISABLED short-circuits to True
++        unconditionally. The explicit check is in remaining() (returns
++        math.inf), but the short-circuit here also documents the bypass
++        at the policy boundary for grep-discoverability.
++        """
++        if _budget_disabled():
++            return True
+         return self.remaining() >= self._effective_min_phase(phase)
+ 
+     def to_summary(self) -> dict:
+         """Two-decimal rounding is contract — JSONL log consumers
+         (`budget_summary` field in `budget_exhausted_abort`, banner
+         formatting) depend on the stable shape.
++
++        P163/MOL-523: when disabled, `remaining_secs` is emitted as `None`
++        (valid JSON `null`) rather than `math.inf` (which `json.dumps` emits as
++        non-standard `Infinity` — rejected by strict parsers and silently
++        precision-clipped by lenient ones). The `disabled=True` companion key
++        carries the signal. `remaining()` itself still yields `math.inf` so
++        in-process numeric consumers (retry-budget guard, banner formatting)
++        keep working — the translation lives at the JSON boundary only.
+         """
+-        return {
++        disabled = _budget_disabled()
++        rem = self.remaining()
++        summary = {
+             "budget_secs": self._budget,
+             "elapsed_secs": round(self.elapsed(), 2),
+-            "remaining_secs": round(self.remaining(), 2),
++            "remaining_secs": None if disabled else round(rem, 2),
+         }
++        if disabled:
++            summary["disabled"] = True
++        return summary
+ 
+     def __repr__(self) -> str:
+         return f"BudgetTracker({self.to_summary()})"
+@@ -1632,8 +1696,18 @@
+     # skeptic_revise / builder / reviewer) gate on tracker.can_start_phase(...)
+     # and each retry inside run_phase_with_fallback consults tracker.remaining().
+     tracker = BudgetTracker.start_now()
+-    _log_event("budget_tracker_started", key=key,
+-               budget_summary=tracker.to_summary())
++    # P163/MOL-523: emit a distinct event when the experimental disable flag
++    # is set so log filters / dashboards can flag this dispatch as un-budgeted
++    # without ambiguity. budget_summary still includes the construction-time
++    # budget for context; disabled=true in the summary is the active signal.
++    if _budget_disabled():
++        _log_event("budget_tracker_disabled", key=key,
++                   budget_summary=tracker.to_summary(),
++                   note=(f"{_BUDGET_DISABLED_ENV} env var is truthy; "
++                         "can_start_phase always True, remaining() is inf"))
++    else:
++        _log_event("budget_tracker_started", key=key,
++                   budget_summary=tracker.to_summary())
+ 
+     _log(f"Dispatching {key} (attempt {state['attempt_count'] + 1})")
+     _log_event("dispatch_start", key=key,
+--- a/.hermes/scripts/symphony_daemon.py
++++ b/.hermes/scripts/symphony_daemon.py
+@@ -43,6 +43,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import signal
+ import sqlite3
+ import sys
+@@ -381,6 +382,18 @@
+     _LOG_DIR.mkdir(parents=True, exist_ok=True)
+     _log("symphony daemon starting")
+ 
++    # P163/MOL-523: emit immediate JSONL signal on daemon start so an operator
++    # who unset HERMES_BUDGET_DISABLED + kickstart-ed can confirm cleanup
++    # without waiting for the next dispatch. Logged at startup regardless of
++    # value so the cleanup-verification grep target is unconditional.
++    _budget_env_raw = os.environ.get(symphony_bridge._BUDGET_DISABLED_ENV)
++    symphony_bridge._log_event(
++        "budget_disabled_at_daemon_start",
++        env_var=symphony_bridge._BUDGET_DISABLED_ENV,
++        env_value=("<unset>" if _budget_env_raw is None else _budget_env_raw),
++        disabled=symphony_bridge._budget_disabled(),
++    )
++
+     # init_queue raises RuntimeError if WAL journal mode could not be
+     # enabled (per its docstring). Catch + log a distinguishing FATAL
+     # line so a launchd KeepAlive crash-loop on a WAL-incompatible FS is

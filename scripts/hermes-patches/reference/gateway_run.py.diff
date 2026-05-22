@@ -1,0 +1,22 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 659ba801..40755933 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -793,7 +793,7 @@ class GatewayRunner:
+ 
+         service_tier = getattr(self, "_service_tier", None)
+         if not service_tier:
+-            route["request_overrides"] = None
++            route["request_overrides"] = {}
+             return route
+ 
+         try:
+@@ -6971,7 +6971,7 @@ class GatewayRunner:
+             agent.status_callback = _status_callback_sync
+             agent.reasoning_config = reasoning_config
+             agent.service_tier = self._service_tier
+-            agent.request_overrides = turn_route.get("request_overrides")
++            agent.request_overrides = turn_route.get("request_overrides") or {}
+ 
+             # Background review delivery — send "💾 Memory updated" etc. to user
+             def _bg_review_send(message: str) -> None:

@@ -1,0 +1,412 @@
+--- /tmp/sb.pre-p149.py	2026-05-11 08:50:40
++++ /tmp/sb.p149-fixed.py	2026-05-11 10:36:45
+@@ -73,6 +73,69 @@
+     "capacity", "overloaded", "quota",
+ ]
+ 
++# P149/MOL-499: timeout error message contract shared between tier dispatch
++# functions (_run_cc_deepseek, _run_cc_anthropic, _run_hermes_swarm) and the
++# classifier. Tier functions format their timeout error_text as
++# f"{_TIMEOUT_ERROR_PREFIX} {N}s"; the classifier uses startswith to detect.
++# Sharing the constant locks the contract across the call sites.
++_TIMEOUT_ERROR_PREFIX = "timeout after"
++
++# P149/MOL-499: per-tier retry classification.
++# Match against (error_text + " " + stderr_tail).lower() — substring search.
++# Transient: 5xx blips, connection drops, DNS hiccups. Retry once with no wait.
++# Patterns are HTTP-anchored or contextualized to avoid false positives from
++# port numbers (e.g., :5030), variable names (e.g., eof_handler), or path
++# components (e.g., /etc/dns/). When a stderr substring matches BOTH a
++# transient and a deterministic pattern (rare but possible), deterministic
++# wins — see _classify_tier_failure docstring for the tie-breaking rule.
++_TRANSIENT_PATTERNS = [  # P149/MOL-499
++    "connection reset", "connectionreseterror", "broken pipe",
++    "temporary failure", "unexpected eof", "eof received",
++    "http 503", "http 502", "http 504", "503 service",
++    "500 internal server", "gateway timeout",
++    "name resolution failed", "dns resolution failed",
++]
++
++# P149/MOL-499: authoritative (no retry) failure markers — auth, config, missing tools.
++# Retrying these wastes budget; surface the failure to the next tier instead.
++# Checked BEFORE _TRANSIENT_PATTERNS — when both bucket matches (e.g., DNS
++# permission-denied), deterministic wins (no retry) over transient (retry).
++_DETERMINISTIC_FAILURE_PATTERNS = [  # P149/MOL-499
++    "401 unauthorized", "403 forbidden",
++    "invalid api key", "invalid argument", "invalid_request",
++    "authentication failed", "authorization failed",
++    "permission denied",
++    "no such file", "command not found",
++    "missing required", "schema validation",
++    "key not available",  # P149 PR #170 review: api-key-missing path → deterministic, not unknown
++]
++
++# P149/MOL-499: retry policy per classification.
++# Tuple shape: (allow_retry, wait_before_retry_seconds).
++# `allow_retry` is binary in practice — the loop in _attempt_tier_with_retry
++# is hard-bounded to 2 iterations ("for attempt in (1, 2)"). A value of 1 means
++# "no retry" (the loop breaks after the first attempt's policy check); a value
++# of 2 means "retry once" (one extra call after the first failure). Larger
++# values have NO additional effect — the loop bound caps them. Field is named
++# "max_attempts" historically; semantically a 2-state flag.
++# Note: "timeout" → no retry because the timeout already burned the full
++# tier_timeout budget — retrying would burn another full window.
++# Note: "unknown" → no retry (conservative); unclassified failures may be
++# deterministic config issues we haven't catalogued yet.
++_RETRY_POLICY = {
++    "rate_limit":    (2, 60),
++    "transient":     (2,  0),
++    "deterministic": (1,  0),
++    "timeout":       (1,  0),
++    "unknown":       (1,  0),
++}
++
++# P149/MOL-499 PR #170 review: classification fallback when classifier returns
++# a value not in _RETRY_POLICY. Defensively conservative — no retry. Future
++# classifier outputs that aren't catalogued here will fall back instead of
++# raising KeyError.
++_DEFAULT_RETRY_POLICY = (1, 0)
++
+ # ── Helpers ────────────────────────────────────────────────────────────────
+ 
+ def _now_iso() -> str:
+@@ -151,8 +214,150 @@
+ def _is_rate_limited(text: str) -> bool:
+     low = text.lower()
+     return any(p in low for p in _RATE_LIMIT_PATTERNS)
++
++
++def _classify_tier_failure(error_text: str, stderr_tail: str) -> str:
++    """P149/MOL-499: classify a tier failure for retry decisions.
++
++    Returns one of: 'rate_limit', 'timeout', 'deterministic', 'transient', 'unknown'.
++
++    Order matters (tie-breaking rules — when a stderr substring matches
++    multiple buckets, the earlier check wins):
++      1. timeout — already burned full tier_timeout, retry doubles the burn.
++         Checked via `error_text.startswith(_TIMEOUT_ERROR_PREFIX)` ONLY —
++         stderr_tail is not searched for timeout because partial output from
++         a timed-out subprocess may incidentally contain "timeout after" text
++         that isn't a structured timeout signal. Contract: tier dispatch
++         functions MUST format their timeout error_text as
++         f"{_TIMEOUT_ERROR_PREFIX} {N}s".
++      2. rate_limit — wait-then-retry policy. Wins over transient because
++         some rate-limit payloads include downstream 503s.
++      3. deterministic — auth/config (no retry, fall through). Wins over
++         transient when both match (e.g., "permission denied" on a DNS
++         config path matches both `permission denied` deterministic AND
++         could match a future broader DNS-related transient pattern).
++      4. transient — connection/5xx blips (immediate retry).
++      5. unknown — conservative (no retry).
++    """
++    err_low = (error_text or "").lower()
++    if err_low.startswith(_TIMEOUT_ERROR_PREFIX):
++        return "timeout"
++    combined = f"{err_low} {(stderr_tail or '').lower()}"
++    if not combined.strip():
++        return "unknown"
++    if any(p in combined for p in _RATE_LIMIT_PATTERNS):
++        return "rate_limit"
++    if any(p in combined for p in _DETERMINISTIC_FAILURE_PATTERNS):
++        return "deterministic"
++    if any(p in combined for p in _TRANSIENT_PATTERNS):
++        return "transient"
++    return "unknown"
++
++
++def _attempt_tier_with_retry(
++    tier_call,
++    tier_num: int,
++    phase_name: str,
++    phase_start: float,
++    phase_budget: int,
++    tier_timeout: int,
++) -> dict:
++    """P149/MOL-499: dispatch a tier with ≤2 attempts based on failure classification.
++
++    `tier_call` is a zero-arg callable that runs the tier and returns the
++    standard {success, output, tier, error, stderr_tail, rate_limited?} dict.
++
++    Phase-budget guard: skip retry if remaining < (retry_wait + tier_timeout).
++    DRY_RUN: log decision, skip `time.sleep(retry_wait)`. The tier call ITSELF
++    is still executed in DRY_RUN — only the inter-attempt sleep is suppressed.
++    Do not use DRY_RUN with live tier callables if retry attempts must be
++    suppressed.
++
++    Loop is hard-bounded at 2 attempts (`for attempt in (1, 2)`); `_RETRY_POLICY`
++    tuple values > 2 have no additional effect.
++
++    Logs every retry decision as JSONL `tier_retry_decision` for forensics.
++    On attempt-2 exhaustion (both attempts used) logs `exhausted_attempts`.
++    On uncaught exception from `tier_call()` logs `tier_attempt_exception`
++    + re-raises so state-recovery in main() still fires.
++    """
++    dry_run = DRY_RUN_FILE.exists()
++    last_result = None
++    for attempt in (1, 2):
++        # P149 PR #170 review: wrap tier_call to preserve JSONL forensics on
++        # unexpected exceptions. Re-raise so main()'s state-recovery fires.
++        try:
++            result = tier_call()
++        except Exception as exc:
++            _log_event("tier_attempt_exception",
++                       tier=tier_num, phase=phase_name, attempt=attempt,
++                       exc_type=type(exc).__name__,
++                       exc=str(exc)[:300])
++            raise
++        last_result = result
++        if result["success"]:
++            if attempt > 1:
++                _log_event("tier_retry_succeeded",
++                           tier=tier_num, phase=phase_name, attempt=attempt)
++            return result
++
++        if attempt >= 2:
++            # P149 PR #170 review: classify + log attempt-2 failures so the
++            # forensic record distinguishes "retry attempted, also failed"
++            # from "no retry attempted" via the `decision` field.
++            klass2 = _classify_tier_failure(
++                result.get("error", ""),
++                result.get("stderr_tail", ""),
++            )
++            _log_event("tier_retry_decision",
++                       tier=tier_num, phase=phase_name, attempt=attempt,
++                       classification=klass2, decision="exhausted_attempts")
++            break
+ 
++        klass = _classify_tier_failure(
++            result.get("error", ""),
++            result.get("stderr_tail", ""),
++        )
++        # P149 PR #170 review: defensive lookup. _RETRY_POLICY[klass] would
++        # KeyError + propagate to main()'s broad catch (losing forensics) if a
++        # future classifier output is added without updating the policy dict.
++        policy_entry = _RETRY_POLICY.get(klass, _DEFAULT_RETRY_POLICY)
++        if policy_entry is _DEFAULT_RETRY_POLICY and klass not in _RETRY_POLICY:
++            _log_event("tier_retry_decision",
++                       tier=tier_num, phase=phase_name, attempt=attempt,
++                       classification=klass,
++                       decision="unknown_class_fallback_no_retry")
++            break
++        max_attempts, retry_wait = policy_entry
++        if max_attempts <= 1:
++            _log_event("tier_retry_decision",
++                       tier=tier_num, phase=phase_name, attempt=attempt,
++                       classification=klass, decision="no_retry_by_policy")
++            break
+ 
++        phase_elapsed = time.monotonic() - phase_start
++        needed = retry_wait + tier_timeout
++        remaining = phase_budget - phase_elapsed
++        if needed > remaining:
++            _log_event("tier_retry_decision",
++                       tier=tier_num, phase=phase_name, attempt=attempt,
++                       classification=klass, decision="skipped_phase_budget",
++                       phase_elapsed_secs=round(phase_elapsed, 2),
++                       phase_budget=phase_budget,
++                       needed_secs=needed,
++                       remaining_secs=round(remaining, 2))
++            break
++
++        _log_event("tier_retry_decision",
++                   tier=tier_num, phase=phase_name, attempt=attempt,
++                   classification=klass, decision="retry",
++                   wait_seconds=retry_wait, dry_run=dry_run)
++        if retry_wait > 0 and not dry_run:
++            time.sleep(retry_wait)
++
++    return last_result
++
++
+ def _get_api_key(key_name: str) -> str:
+     """Fetch an API key from envchain."""
+     try:
+@@ -430,8 +635,17 @@
+     """Tier 1: claude -p pointed at api.deepseek.com."""
+     ds_key = _get_api_key("DEEPSEEK_API_KEY")
+     if not ds_key:
++        # P149 PR #170 review: emit tier_attempt for missing-key early-exit so
++        # JSONL forensics distinguish "no key in envchain" from "tier timed out".
++        # error_text contains "key not available" → classifies as deterministic.
++        _log_event("tier_attempt", tier=1, engine="cc+ds",
++                   endpoint=DEEPSEEK_ENDPOINT, timeout_secs=timeout_secs,
++                   elapsed_ms=0, exit_code=None, signal=None,
++                   stdout_head="", stderr_tail="",
++                   outcome="key_unavailable", key_name="DEEPSEEK_API_KEY")
+         return {"success": False, "output": "", "tier": 1,
+-                "error": "DEEPSEEK_API_KEY not available"}
++                "error": "DEEPSEEK_API_KEY key not available",
++                "stderr_tail": "", "rate_limited": False}
+ 
+     argv = [
+         CLAUDE_BIN, "-p",
+@@ -482,7 +696,7 @@
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
+                    env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": 1,
+-                "error": f"timeout after {timeout_secs}s",
++                "error": f"{_TIMEOUT_ERROR_PREFIX} {timeout_secs}s",
+                 "stderr_tail": _stderr_tail(stderr), "rate_limited": False}
+     except OSError as exc:
+         elapsed_ms = int((time.monotonic() - start_ts) * 1000)
+@@ -579,7 +793,7 @@
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
+                    env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": 2,
+-                "error": f"timeout after {timeout_secs}s",
++                "error": f"{_TIMEOUT_ERROR_PREFIX} {timeout_secs}s",
+                 "stderr_tail": _stderr_tail(stderr), "rate_limited": False}
+     except OSError as exc:
+         elapsed_ms = int((time.monotonic() - start_ts) * 1000)
+@@ -640,8 +854,18 @@
+ 
+     api_key = _get_api_key(key_name)
+     if not api_key:
++        # P149 PR #170 review: emit tier_attempt for missing-key early-exit
++        # (see _run_cc_deepseek for rationale).
++        engine = "hermes-swarm"
++        _log_event("tier_attempt", tier=tier, engine=engine,
++                   provider=provider, model=model,
++                   timeout_secs=timeout_secs, elapsed_ms=0,
++                   exit_code=None, signal=None,
++                   stdout_head="", stderr_tail="",
++                   outcome="key_unavailable", key_name=key_name)
+         return {"success": False, "output": "", "tier": tier,
+-                "error": f"{key_name} not available"}
++                "error": f"{key_name} key not available",
++                "stderr_tail": "", "rate_limited": False}
+ 
+     argv = [
+         sys.executable, "-m", "hermes_cli.main",
+@@ -691,7 +915,7 @@
+                    stdout_head=stdout[:500], stderr_tail=_stderr_tail(stderr),
+                    env_vars=env_snap, outcome="timeout")
+         return {"success": False, "output": "", "tier": tier,
+-                "error": f"timeout after {timeout_secs}s",
++                "error": f"{_TIMEOUT_ERROR_PREFIX} {timeout_secs}s",
+                 "stderr_tail": _stderr_tail(stderr), "rate_limited": False}
+     except OSError as exc:
+         elapsed_ms = int((time.monotonic() - start_ts) * 1000)
+@@ -730,38 +954,74 @@
+ # ── Fallback orchestrator ──────────────────────────────────────────────────
+ 
+ def run_phase_with_fallback(prompt: str, repo_path: str, permission_mode: str,
+-                            max_turns: int, timeout_secs: int) -> dict:
+-    """Try Tier 1 → Tier 2 → Tier 3 → Tier 4. Return first successful result."""
++                            max_turns: int, timeout_secs: int,
++                            phase_name: str = "unknown",
++                            phase_budget: int | None = None) -> dict:
++    """Try Tier 1 → Tier 2 → Tier 3 → Tier 4. Return first successful result.
++
++    P149/MOL-499: each tier gets ≤2 attempts based on _classify_tier_failure
++    of attempt 1's error_text + stderr_tail. Phase-budget guard prevents retry
++    when remaining time wouldn't cover the retry's full tier_timeout.
++
++    P149 PR #170 review: phase_budget default is 2× _PHASE_TIMEOUTS[phase_name]
++    so that a per-tier retry (cost up to retry_wait + tier_timeout) actually
++    fits within the remaining budget after a fast first-attempt failure. The
++    previous default of `_PHASE_TIMEOUTS[phase_name]` made the budget exactly
++    equal to one tier_timeout, which trips the guard for any nonzero
++    phase_elapsed — making the entire retry mechanism inert in production.
++    For unknown phase_name, falls back to `timeout_secs * 2` (same shape).
++    The 2× multiplier is a P149-scope minimum to make retries reachable; the
++    proper per-phase budget allocation belongs to Phase 3 / P152 (global
++    wall-clock budget manager).
++    """
++    phase_start = time.monotonic()
++    if phase_budget is None:
++        phase_budget = _PHASE_TIMEOUTS.get(phase_name, timeout_secs) * 2
++
+     # Tier 1: CC + DeepSeek
+-    result = _run_cc_deepseek(prompt, repo_path, permission_mode,
+-                              max_turns, timeout_secs)
++    result = _attempt_tier_with_retry(
++        lambda: _run_cc_deepseek(prompt, repo_path, permission_mode,
++                                 max_turns, timeout_secs),
++        tier_num=1, phase_name=phase_name,
++        phase_start=phase_start, phase_budget=phase_budget,
++        tier_timeout=timeout_secs,
++    )
+     if result["success"]:
+         return result
+     _log(f"Tier 1 failed: {result.get('error', 'unknown')[:150]}")
+ 
+-    if not result.get("rate_limited"):
+-        _log("Tier 1 non-rate-limit error — still trying Tier 2")
+-
+     # Tier 2: CC + Anthropic
+-    result = _run_cc_anthropic(prompt, repo_path, permission_mode,
+-                               max_turns, timeout_secs)
++    result = _attempt_tier_with_retry(
++        lambda: _run_cc_anthropic(prompt, repo_path, permission_mode,
++                                  max_turns, timeout_secs),
++        tier_num=2, phase_name=phase_name,
++        phase_start=phase_start, phase_budget=phase_budget,
++        tier_timeout=timeout_secs,
++    )
+     if result["success"]:
+         return result
+     _log(f"Tier 2 failed: {result.get('error', 'unknown')[:150]}")
+ 
+-    if not result.get("rate_limited"):
+-        _log("Tier 2 non-rate-limit error — still trying Tier 3")
+-
+     # Tier 3: Hermes Swarm + DeepSeek
+-    result = _run_hermes_swarm(prompt, "deepseek", "deepseek-v4-pro[1m]",
+-                               repo_path, timeout_secs, tier=3)
++    result = _attempt_tier_with_retry(
++        lambda: _run_hermes_swarm(prompt, "deepseek", "deepseek-v4-pro[1m]",
++                                  repo_path, timeout_secs, tier=3),
++        tier_num=3, phase_name=phase_name,
++        phase_start=phase_start, phase_budget=phase_budget,
++        tier_timeout=timeout_secs,
++    )
+     if result["success"]:
+         return result
+     _log(f"Tier 3 failed: {result.get('error', 'unknown')[:150]}")
+ 
+     # Tier 4: Hermes Swarm + Kimi
+-    result = _run_hermes_swarm(prompt, "kimi-coding", "kimi-k2.6",
+-                               repo_path, timeout_secs, tier=4)
++    result = _attempt_tier_with_retry(
++        lambda: _run_hermes_swarm(prompt, "kimi-coding", "kimi-k2.6",
++                                  repo_path, timeout_secs, tier=4),
++        tier_num=4, phase_name=phase_name,
++        phase_start=phase_start, phase_budget=phase_budget,
++        tier_timeout=timeout_secs,
++    )
+     if result["success"]:
+         return result
+     _log(f"Tier 4 failed: {result.get('error', 'unknown')[:150]}")
+@@ -795,6 +1055,7 @@
+         prompt, repo_path, permission_mode="plan",
+         max_turns=_CC_MAX_TURNS["planner"],
+         timeout_secs=_PHASE_TIMEOUTS["planner"],
++        phase_name="planner",
+     )
+ 
+     if result["success"]:
+@@ -829,6 +1090,7 @@
+         prompt, repo_path, permission_mode="plan",
+         max_turns=_CC_MAX_TURNS["skeptic"],
+         timeout_secs=_PHASE_TIMEOUTS["skeptic"],
++        phase_name="skeptic",
+     )
+ 
+     output = result.get("output", "")
+@@ -870,6 +1132,7 @@
+         prompt, repo_path, permission_mode="auto",
+         max_turns=_CC_MAX_TURNS["builder"],
+         timeout_secs=_PHASE_TIMEOUTS["builder"],
++        phase_name="builder",
+     )
+ 
+     output = result.get("output", "")
+@@ -908,6 +1171,7 @@
+         prompt, repo_path, permission_mode="auto",
+         max_turns=_CC_MAX_TURNS["reviewer"],
+         timeout_secs=_PHASE_TIMEOUTS["reviewer"],
++        phase_name="reviewer",
+     )
+ 
+     output = result.get("output", "")

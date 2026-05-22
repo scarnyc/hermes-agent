@@ -1,0 +1,54 @@
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index c99761d5..51a1d423 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -986,22 +986,40 @@ def generate_launchd_plist() -> str:
+         dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
+     )
+ 
++    # If envchain-wrapper.sh exists at HERMES_HOME/scripts/, route the gateway
++    # through it so the launchd-managed process inherits Keychain-stored secrets
++    # (TAVILY_API_KEY, GRANOLA_*, etc.). Without this, cron jobs can't access
++    # envchain namespaces because launchd only injects PATH/VIRTUAL_ENV/HERMES_HOME.
++    envchain_wrapper = Path(hermes_home) / "scripts" / "envchain-wrapper.sh"
++    if envchain_wrapper.is_file() and os.access(str(envchain_wrapper), os.X_OK):
++        program_args = f"""    <array>
++        <string>{envchain_wrapper}</string>
++        <string>{python_path}</string>
++        <string>-m</string>
++        <string>hermes_cli.main</string>
++        <string>gateway</string>
++        <string>run</string>
++        <string>--replace</string>
++    </array>"""
++    else:
++        program_args = f"""    <array>
++        <string>{python_path}</string>
++        <string>-m</string>
++        <string>hermes_cli.main</string>
++        <string>gateway</string>
++        <string>run</string>
++        <string>--replace</string>
++    </array>"""
++
+     return f"""<?xml version="1.0" encoding="UTF-8"?>
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+ <plist version="1.0">
+ <dict>
+     <key>Label</key>
+     <string>{label}</string>
+-    
++
+     <key>ProgramArguments</key>
+-    <array>
+-        <string>{python_path}</string>
+-        <string>-m</string>
+-        <string>hermes_cli.main</string>
+-        <string>gateway</string>
+-        <string>run</string>
+-        <string>--replace</string>
+-    </array>
++{program_args}
+     
+     <key>WorkingDirectory</key>
+     <string>{working_dir}</string>

@@ -46,7 +46,7 @@ Before gathering data, verify the environment is healthy. Check and report:
 
 4. Task list tripwire check (daily-task-list skill):
    - `ls ~/.hermes/cron/output/daily-task-list/ABORTED-*.marker 2>/dev/null` — check for any abort tripwires from the 06:30 run.
-   - If a tripwire exists for today or yesterday, read its contents (`cat` the file) and emit a HIGH-VISIBILITY first line of the briefing (BEFORE INFRA): `>>> TASK LIST STALE -- daily-task-list ABORTED <date> — vault task-list target missing or unwritable. Re-run cron manually and inspect ABORTED-*.marker. <<<`
+   - If a tripwire exists for today or yesterday, read its contents (`cat` the file) and emit a HIGH-VISIBILITY first line of the briefing (BEFORE INFRA): `>>> TASK LIST STALE -- daily-task-list ABORTED <date> — symlink bridge broken. Re-run migration per ABORTED-*.marker. <<<`
    - Do NOT suppress this. It escalates above every other briefing content.
    - **If NO tripwire marker exists, emit NOTHING for this check. Absence = healthy. Do NOT surface `NO_TRIPWIRE` in the INFRA line — it is not a DEGRADED signal.**
 
@@ -74,7 +74,7 @@ from zoneinfo import ZoneInfo
 import os
 tz = ZoneInfo("America/New_York")
 today = datetime.now(tz).date()
-base = os.path.expanduser("~/Will's Vault/Task List")
+base = os.path.expanduser("~/.hermes/notes/obsidian/task-list")
 for delta, label in [(0, "TODAY"), (1, "YESTERDAY"), (2, "DAYBEFORE")]:
     d = today - timedelta(days=delta)
     p = f"{base}/{d.strftime('%b %-d %Y')}.md"
@@ -217,8 +217,6 @@ Render under a **TOP HEADLINES** subsection of the NEWS block in the output temp
 
 WSJ subscriber note: WSJ RSS feeds at `feeds.a.dj.com` are frozen as of Jan 2025 (see `references/wsj-feeds-status.md`). Web-search results land on wsj.com URLs; subscriber cookies handle paywall click-through. Headlines + URLs only — don't try to extract paywalled body content.
 
-Pitfall: `site:wsj.com` and `site:nytimes.com` web_search queries often return category/index pages (e.g., "Latest Headlines - WSJ", "Today's Headlines Newsletter - NYT") rather than specific articles with headlines. When this happens, lean on the RSS feed from 6a (NYT Top Stories → blogwatcher) for NYT content, and favor the broader queries 3 (`"world news today"`) and 4 (`"business markets today"`) for actual story-level results. The site-scoped queries are a supplement — never the sole source for the TOP HEADLINES subsection.
-
 ### Step 7: Drive Activity
 
 Use the `terminal` tool to check recently modified files:
@@ -246,7 +244,7 @@ Synthesize all collected data. Perform cross-source analysis:
 - Highlight items that need the user's attention today
 - Note discrepancies (e.g., JIRA ticket marked done but meeting notes show open action items)
 
-**Surface task-list items — this is required, not optional.** The file resolved in Step 1 (`~/Will's Vault/Task List/<MMM D YYYY>.md`) is the canonical to-do list. Render the TASKS section in the output template with the structure below, even on light days:
+**Surface task-list items — this is required, not optional.** The file resolved in Step 1 (`~/.hermes/notes/obsidian/task-list/<MMM D YYYY>.md`) is the canonical to-do list. Render the TASKS section in the output template with the structure below, even on light days:
 - **NOW:** every unchecked (`[ ]`) item under the `### NOW` heading. Preserve the existing parent → child indentation so context isn't lost.
 - **This Week:** top 3-5 unchecked items from the `## This Week` heading, prioritized by overlap with today's calendar / active JIRA / overdue email.
 - **Cross-references:** if a NOW or This Week item shares vocabulary with a meeting / email / JIRA ticket already surfaced above, append `(see CALENDAR / EMAIL / JIRA above)`.

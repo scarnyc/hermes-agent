@@ -1,0 +1,40 @@
+--- a/scripts/symphony_bridge.py
++++ b/scripts/symphony_bridge.py
+@@ -69,6 +69,12 @@
+ CLAUDE_BIN = os.path.expanduser("~/.local/bin/claude")
+ 
+ DEEPSEEK_ENDPOINT = "https://api.deepseek.com/anthropic/v1/messages"
++# P167/MOL-550: base URL form (no /v1/messages suffix) for ANTHROPIC_BASE_URL.
++# Claude appends /v1/messages to the base internally; passing the full
++# endpoint URL caused doubled paths → 404 (which CC mis-labeled as "model
++# not found"). The /v1/messages-suffixed form remains correct for HTTP
++# preflight probes that hit the API directly.
++DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+ 
+ _TOTAL_TIMEOUT_SECONDS = 4800  # 80 minutes — P166/MOL-550 S4: extended for symphony's 4-phase happy path (planner 30 + skeptic 5 + builder 30 + reviewer 15 = 80m)
+ 
+@@ -1041,11 +1047,20 @@
+     ]
+ 
+     env = os.environ.copy()
+-    env["ANTHROPIC_BASE_URL"] = DEEPSEEK_ENDPOINT
+-    env["ANTHROPIC_AUTH_TOKEN"] = ds_key
+-    # P166/MOL-550 S3a: route model selection via env var (clean slug, no
+-    # [1m] suffix). Bypasses CC's local catalog check that rejected --model.
++    # P167/MOL-550: ANTHROPIC_BASE_URL must be the BASE form (no /v1/messages
++    # suffix) — claude appends the path internally. Pre-P167 the full
++    # endpoint URL was passed, causing doubled paths and 404s.
++    env["ANTHROPIC_BASE_URL"] = DEEPSEEK_BASE_URL
++    env["ANTHROPIC_AUTH_TOKEN"] = ds_key
++    # P166/MOL-550 S3a + P167/MOL-550 S3a-hotfix: route ALL THREE model tiers
++    # (Opus/Sonnet/Haiku) via env var to DeepSeek slugs. P166 only set OPUS,
++    # which left CC's `--permission-mode plan` sub-call resolving Sonnet/Haiku
++    # to default Anthropic slugs (e.g. `claude-sonnet-4-6[1m]`) that the
++    # DS /anthropic endpoint rejects with 404. Mirrors the env-var triplet
++    # in ~/.claude/scripts/claude-deepseek-direct.sh (proven path).
+     env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "deepseek-v4-pro"
++    env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "deepseek-v4-pro"
++    env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "deepseek-v4-flash"
+ 
+     _log(f"Tier 1 (CC+DS): spawning claude -p --permission-mode {permission_mode} "
+          f"max_turns={max_turns} timeout={timeout_secs}s")

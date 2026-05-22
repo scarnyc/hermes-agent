@@ -1,0 +1,55 @@
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 63018d6f..5d3fb9b5 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -489,6 +489,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
+     logger.info("Prompt: %s", prompt[:100])
+ 
++    agent = None  # Ensure defined for finally block (memory provider cleanup)
++
+     try:
+         # Inject origin context so the agent's send_message tool knows the chat.
+         # Must be INSIDE the try block so the finally cleanup always runs.
+@@ -499,11 +501,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+                 os.environ["HERMES_SESSION_CHAT_NAME"] = origin["chat_name"]
+         # Re-read .env and config.yaml fresh every run so provider/key
+         # changes take effect without a gateway restart.
++        # override=False: only fill MISSING env vars from .env. This prevents
++        # stale .env values from clobbering envchain-injected secrets (same
++        # pattern as env_loader.py patch). Envchain values take precedence.
+         from dotenv import load_dotenv
+         try:
+-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="utf-8")
++            load_dotenv(str(_hermes_home / ".env"), override=False, encoding="utf-8")
+         except UnicodeDecodeError:
+-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
++            load_dotenv(str(_hermes_home / ".env"), override=False, encoding="latin-1")
+ 
+         delivery_target = _resolve_delivery_target(job)
+         if delivery_target:
+@@ -608,9 +613,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+             providers_ignored=pr.get("ignore"),
+             providers_order=pr.get("order"),
+             provider_sort=pr.get("sort"),
+-            disabled_toolsets=["cronjob", "messaging", "clarify"],
++            disabled_toolsets=["cronjob", "messaging", "clarify", "memory"],
+             quiet_mode=True,
+-            skip_memory=True,  # Cron system prompts would corrupt user representations
++            skip_memory=job.get("skip_memory", True),  # Per-job override; builtin memory blocked via disabled_toolsets
+             platform="cron",
+             session_id=_cron_session_id,
+             session_db=_session_db,
+@@ -735,6 +740,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+         return False, output, "", error_msg
+ 
+     finally:
++        # Shut down memory provider to close SQLite connections (MOL-141)
++        if agent is not None:
++            try:
++                agent.shutdown_memory_provider()
++            except Exception:
++                pass
+         # Clean up injected env vars so they don't leak to other jobs
+         for key in (
+             "HERMES_SESSION_PLATFORM",

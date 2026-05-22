@@ -1,0 +1,53 @@
+--- /tmp/pre-P189/prompt_builder.py	2026-05-19 08:49:48
++++ /Users/wills_mac_mini/.hermes/hermes-agent/agent/prompt_builder.py	2026-05-19 08:44:48
+@@ -1445,3 +1445,50 @@
+     return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
+ 
+ 
++# P189/MOL-330: session-maintenance marker consumer.
++# Producer side (on_session_finalize in plugins/session-maintenance + the daily
++# sweep cron) writes JSON markers to ~/.hermes/state/maintenance-pending-*.json
++# when a session crosses the heuristic threshold. Until P189 there was NO
++# consumer in the runtime — markers piled up indefinitely. This function is
++# the consumer: on every session start, glob pending markers and prepend a
++# system message instructing the agent to run the diary → revise-context →
++# remember chain for each marker. The remember skill deletes the marker and
++# inserts the maintenance_runs tombstone as its last step.
++def build_maintenance_marker_prompt(marker_dir: Optional[str] = None) -> str:
++    """Return a system-prepend listing pending maintenance markers, or ""."""
++    try:
++        if marker_dir is None:
++            marker_dir = str(Path(get_hermes_home()) / "state")
++        marker_path = Path(marker_dir)
++        if not marker_path.is_dir():
++            return ""
++        markers = sorted(marker_path.glob("maintenance-pending-*.json"))
++        if not markers:
++            return ""
++        entries: list[str] = []
++        for mp in markers[:5]:
++            try:
++                payload = json.loads(mp.read_text())
++            except (OSError, json.JSONDecodeError):
++                continue
++            sid = payload.get("session_id", "<unknown>")
++            hit = payload.get("heuristic_hit", "unknown")
++            turns = payload.get("message_count", 0)
++            entries.append(f"  - session_id={sid} heuristic_hit={hit} turns={turns}")
++        if not entries:
++            return ""
++        overflow = ""
++        if len(markers) > 5:
++            overflow = f"\n  - ... and {len(markers) - 5} more pending marker(s)"
++        return (
++            "# Pending session-maintenance work\n\n"
++            f"{len(markers)} prior session(s) ended without completing the "
++            "maintenance chain. For each marker below, run the "
++            "diary → revise-context → remember skill chain. Pass the "
++            "session_id and heuristic_hit values to the remember skill so it "
++            "tombstones the run and deletes the marker.\n\n"
++            f"{chr(10).join(entries)}{overflow}\n"
++        )
++    except Exception as exc:
++        logger.warning("[P189/MOL-330] build_maintenance_marker_prompt failed: %s", exc)
++        return ""

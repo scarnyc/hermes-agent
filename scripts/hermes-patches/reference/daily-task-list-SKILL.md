@@ -23,7 +23,7 @@ Read your persona:
 - `~/.hermes/SOUL.md` — identity and behavioral guidelines
 - `~/.hermes/memories/USER.md` — who you're helping
 
-Do NOT read `~/.hermes/memories/TASKS.md` — it is archive-frozen and no longer the canonical task source. The canonical source is today's file under `~/Will's Vault/Task List/`.
+Do NOT read `~/.hermes/memories/TASKS.md` — it is archive-frozen and no longer the canonical task source. The canonical source is today's file under `~/.hermes/notes/obsidian/task-list/`.
 
 Adopt the persona from SOUL.md. Address the user as specified in USER.md.
 
@@ -36,7 +36,7 @@ The historical Steps 0, 1, 3, 5 from v2.1.0 are now handled by `~/.hermes/script
 Compute yesterday's paths from the current date (America/New_York), then diff the snapshot against the user's edited version:
 
 ```bash
-YESTERDAY=~/Will's\ Vault/Task\ List/"$(TZ=America/New_York date -v-1d +'%b %-d %Y').md"
+YESTERDAY=~/.hermes/notes/obsidian/task-list/"$(TZ=America/New_York date -v-1d +'%b %-d %Y').md"
 YESTERDAY_SNAP=~/.hermes/cron/output/daily-task-list/"$(TZ=America/New_York date -v-1d +'%b %-d %Y')-original.md"
 if [ -f "$YESTERDAY_SNAP" ] && [ -f "$YESTERDAY" ]; then
   diff -u "$YESTERDAY_SNAP" "$YESTERDAY" > /tmp/daily-task-diff.txt || true

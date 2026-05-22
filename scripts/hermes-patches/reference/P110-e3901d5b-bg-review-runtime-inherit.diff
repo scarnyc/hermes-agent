@@ -1,0 +1,54 @@
+commit e3901d5b257d5ac3f58420c3fb55aaa536fc56ac
+Author: Teknium <127238744+teknium1@users.noreply.github.com>
+Date:   Sun Apr 26 08:29:40 2026 -0700
+
+    fix(run_agent): background review fork inherits parent's live runtime (#16099)
+    
+    The background memory/skill review (_spawn_background_review) has always
+    forked a new AIAgent passing only model and provider, then relied on
+    AIAgent.__init__ to re-resolve credentials from env vars. This works for
+    users with keys in ~/.hermes/.env but silently falls back to env-var
+    auto-resolution in all cases, which fails for OAuth-only providers,
+    session-scoped creds, and credential-pool setups where auth can't be
+    reconstructed from env.
+    
+    This used to be invisible -- failures were swallowed via logger.debug().
+    PR 8a2506af4 (Apr 24) surfaced auxiliary failures to the user, which
+    made the stale bug visible as:
+        "Auxiliary background review failed: No LLM provider configured"
+    
+    Fix: pass api_key, base_url, api_mode, and credential_pool from the
+    parent's live runtime into the fork -- matching how every other
+    auxiliary path (compression, memory flush, vision, session search)
+    already inherits the parent's credentials via _current_main_runtime().
+
+diff --git a/run_agent.py b/run_agent.py
+index b567b9654..984c8e71d 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -3245,12 +3245,25 @@ class AIAgent:
+                 with open(os.devnull, "w") as _devnull, \
+                      contextlib.redirect_stdout(_devnull), \
+                      contextlib.redirect_stderr(_devnull):
++                    # Inherit the parent agent's live runtime (provider, model,
++                    # base_url, api_key, api_mode) so the fork uses the exact
++                    # same credentials the main turn is using.  Without this,
++                    # AIAgent.__init__ re-runs auto-resolution from env vars,
++                    # which fails for OAuth-only providers, session-scoped
++                    # creds, or credential-pool setups where the resolver can't
++                    # reconstruct auth from scratch -- producing the spurious
++                    # "No LLM provider configured" warning at end of turn.
++                    _parent_runtime = self._current_main_runtime()
+                     review_agent = AIAgent(
+                         model=self.model,
+                         max_iterations=8,
+                         quiet_mode=True,
+                         platform=self.platform,
+                         provider=self.provider,
++                        api_mode=_parent_runtime.get("api_mode") or None,
++                        base_url=_parent_runtime.get("base_url") or None,
++                        api_key=_parent_runtime.get("api_key") or None,
++                        credential_pool=getattr(self, "_credential_pool", None),
+                         parent_session_id=self.session_id,
+                     )
+                     review_agent._memory_write_origin = "background_review"

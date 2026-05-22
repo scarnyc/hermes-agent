@@ -1,0 +1,27 @@
+name: patch-verifier
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check on verifier
+        run: bash -n scripts/hermes-patches/verify_patches.sh
+
+      - name: Assert reference directory present
+        run: |
+          test -d scripts/hermes-patches/reference
+          file_count=$(find scripts/hermes-patches/reference -type f | wc -l | tr -d ' ')
+          echo "reference_file_count=$file_count"
+          test "$file_count" -gt 0
+
+      - name: Assert PATCHES.md present
+        run: test -f scripts/hermes-patches/PATCHES.md
+
+      - name: Run verifier in repo-only mode
+        run: bash scripts/hermes-patches/verify_patches.sh --quiet --repo-only

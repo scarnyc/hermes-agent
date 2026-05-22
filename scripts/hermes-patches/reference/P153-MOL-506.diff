@@ -1,0 +1,687 @@
+# P153/MOL-506 — symphony-bridge global wall-clock budget manager (Phase 3)
+#
+# Re-apply against ~/.hermes/scripts/symphony_bridge.py via:
+#   patch -p0 -i scripts/hermes-patches/reference/P153-MOL-506.diff \
+#         ~/.hermes/scripts/symphony_bridge.py
+#
+# Architecture + verifier inventory: PATCHES.md §P153.
+# Test surface: tests/test_budget_tracker.py.
+#
+--- /tmp/sb.pre-p153.py
++++ /tmp/sb.p153.py
+@@ -28,6 +28,8 @@
+ import time
+ from datetime import datetime, timezone, timedelta
+ from pathlib import Path
++from types import MappingProxyType
++from typing import Literal
+ 
+ # P152/MOL-503: Phase 2 v2 — 4-cell parallel infra-health gate. Import at
+ # module-top (not lazy) so a malformed/missing preflight_health.py surfaces
+@@ -68,6 +70,16 @@
+ 
+ _TOTAL_TIMEOUT_SECONDS = 3300  # 55 minutes — stay within 60-min cron window
+ 
++# P153/MOL-506: global wall-clock budget for a single ticket dispatch.
++# Aliased to _TOTAL_TIMEOUT_SECONDS until Phase 1 log data justifies sizing
++# from typical-ticket-completion instead of cron ceiling.
++_GLOBAL_BUDGET_SECONDS = _TOTAL_TIMEOUT_SECONDS
++
++# P153/MOL-506: absolute minimum remaining wall-clock before any phase can
++# launch. Combined with _PHASE_TIMEOUTS via _effective_min_phase so longer
++# phases (builder=1800, reviewer=900) need their full timeout, not 300.
++_MIN_PHASE_BUDGET = 300
++
+ # P148/MOL-498: stderr tail cap to bound log file size (Tier-1 silence is most likely in the tail).
+ _STDERR_TAIL_MAX = 50_000
+ 
+@@ -77,20 +89,37 @@
+     "DEEPSEEK_API_KEY", "KIMI_API_KEY", "OPENROUTER_API_KEY",
+ ]
+ 
+-# Per-phase timeouts in seconds
+-_PHASE_TIMEOUTS = {
++# P153/MOL-506: phase names are a closed set. Lifts the "phase must be in
++# _PHASE_TIMEOUTS" invariant from test-discipline to mypy-time — a typo
++# like "buidler" fails type-check instead of silently degrading to the
++# bare 300s floor in _effective_min_phase.
++PhaseName = Literal[
++    "planner", "skeptic", "builder", "reviewer",
++    "planner_revise", "skeptic_revise",
++]
++
++# Per-phase timeouts in seconds. Wrapped in MappingProxyType so a stray
++# `_PHASE_TIMEOUTS["builder"] = 60` from a test fixture or future helper
++# raises TypeError instead of silently mutating the runtime contract.
++_PHASE_TIMEOUTS: "MappingProxyType[PhaseName, int]" = MappingProxyType({
+     "planner": 600,    # 10 min
+     "skeptic": 300,    #  5 min
+     "builder": 1800,   # 30 min
+     "reviewer": 900,   # 15 min
+-}
+-
+-_CC_MAX_TURNS = {
++    # REVISE-loop gates: floor matches the underlying base phase via
++    # BudgetTracker._effective_min_phase, not the bare 300s.
++    "planner_revise": 600,
++    "skeptic_revise": 300,
++})
++
++_CC_MAX_TURNS: "MappingProxyType[PhaseName, int]" = MappingProxyType({
+     "planner": 60,
+     "skeptic": 40,
+     "builder": 150,
+     "reviewer": 80,
+-}
++    "planner_revise": 60,
++    "skeptic_revise": 40,
++})
+ 
+ _RATE_LIMIT_PATTERNS = [
+     "rate_limit", "rate limited", "429", "too many requests",
+@@ -160,6 +189,76 @@
+ # raising KeyError.
+ _DEFAULT_RETRY_POLICY = (1, 0)
+ 
++# ── BudgetTracker (P153/MOL-506) ───────────────────────────────────────────
++
++
++class BudgetTracker:
++    """Global wall-clock budget for a single ticket dispatch.
++
++    Construct via `BudgetTracker.start_now()` (or via `__init__` with an
++    explicit start_monotonic for state-file rehydration). The start time
++    is non-optional — the unarmed state is unrepresentable. Consulted
++    before each phase boundary in main() via can_start_phase, and at each
++    retry decision inside _attempt_tier_with_retry via remaining.
++    """
++
++    def __init__(self, budget_seconds: int, min_phase_budget: int,
++                 start_monotonic: float):
++        # Construction-time validation locks the invariants the type
++        # signature can't express. A negative budget would yield
++        # remaining()==0 forever; min_phase > budget would refuse every
++        # phase. Loud failure beats silent wedge.
++        if budget_seconds <= 0:
++            raise ValueError(
++                f"budget_seconds must be positive, got {budget_seconds}")
++        if not (0 <= min_phase_budget <= budget_seconds):
++            raise ValueError(
++                f"min_phase_budget={min_phase_budget} must be in "
++                f"[0, {budget_seconds}]")
++        self._budget = budget_seconds
++        self._min_phase = min_phase_budget
++        self._start_monotonic = start_monotonic
++
++    @classmethod
++    def start_now(cls, budget_seconds: int = _GLOBAL_BUDGET_SECONDS,
++                  min_phase_budget: int = _MIN_PHASE_BUDGET) -> "BudgetTracker":
++        """Primary production entry point: construct + arm in one step."""
++        return cls(budget_seconds, min_phase_budget, time.monotonic())
++
++    def elapsed(self) -> float:
++        return time.monotonic() - self._start_monotonic
++
++    def remaining(self) -> float:
++        return max(0.0, self._budget - self.elapsed())
++
++    def _effective_min_phase(self, phase: PhaseName) -> int:
++        """Phase-aware floor: a phase with a longer `_PHASE_TIMEOUTS`
++        entry (builder=1800, reviewer=900) needs that much remaining to
++        be worth starting. Otherwise builder kicks off with 400s left,
++        fails on the retry-budget guard, and gets attributed as "all
++        tiers failed" instead of the truer "budget exhausted".
++        """
++        return max(self._min_phase, _PHASE_TIMEOUTS.get(phase, 0))
++
++    def can_start_phase(self, phase: PhaseName) -> bool:
++        """True iff remaining() >= phase-aware floor."""
++        return self.remaining() >= self._effective_min_phase(phase)
++
++    def to_summary(self) -> dict:
++        """Two-decimal rounding is contract — JSONL log consumers
++        (`budget_summary` field in `budget_exhausted_abort`, banner
++        formatting) depend on the stable shape.
++        """
++        return {
++            "budget_secs": self._budget,
++            "elapsed_secs": round(self.elapsed(), 2),
++            "remaining_secs": round(self.remaining(), 2),
++        }
++
++    def __repr__(self) -> str:
++        return f"BudgetTracker({self.to_summary()})"
++
++
+ # ── Helpers ────────────────────────────────────────────────────────────────
+ 
+ def _now_iso() -> str:
+@@ -179,11 +278,21 @@
+     _log_event("legacy_log", msg=msg)
+ 
+ 
++_LOG_EVENT_FAIL_WARNED = False
++
++
+ def _log_event(event: str, **fields) -> None:
+     """P148/MOL-498: append a structured JSONL record to ~/.hermes/logs/symphony_bridge.log.
+ 
+     Fail-open: never raise. ISO 8601 UTC timestamp with Z suffix.
++
++    P153/MOL-506: on the FIRST OSError/serialization failure of a process
++    lifetime, emit a one-shot stderr banner. Without this, sandbox-deny
++    on LOG_DIR silently nukes the entire forensic record — observable
++    only by noticing the log file doesn't grow. Subsequent failures
++    stay silent so the latch doesn't itself become log spam.
+     """
++    global _LOG_EVENT_FAIL_WARNED
+     record = {"ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+               "event": event, **fields}
+     try:
+@@ -192,8 +301,17 @@
+             fh.write(json.dumps(record, default=str) + "\n")
+             fh.flush()
+             os.fsync(fh.fileno())
+-    except OSError:
+-        pass
++    except (OSError, ValueError, TypeError) as exc:
++        if not _LOG_EVENT_FAIL_WARNED:
++            _LOG_EVENT_FAIL_WARNED = True
++            try:
++                sys.stderr.write(
++                    f"⚠️ symphony_bridge: JSONL log write failed "
++                    f"({type(exc).__name__}: {str(exc)[:200]}); "
++                    f"subsequent emits will be silent\n")
++                sys.stderr.flush()
++            except OSError:
++                pass
+ 
+ 
+ def _stderr_tail(s: str) -> str:
+@@ -281,9 +399,8 @@
+ def _attempt_tier_with_retry(
+     tier_call,
+     tier_num: int,
+-    phase_name: str,
+-    phase_start: float,
+-    phase_budget: int,
++    phase_name: PhaseName,
++    tracker: "BudgetTracker",
+     tier_timeout: int,
+ ) -> dict:
+     """P149/MOL-499: dispatch a tier with ≤2 attempts based on failure classification.
+@@ -553,6 +670,36 @@
+     tmp = state_file.with_suffix(".tmp")
+     tmp.write_text(json.dumps(data, indent=2) + "\n")
+     os.replace(tmp, state_file)
++
++
++def _safe_write_state(key: str, data: dict, where: str) -> bool:
++    """P153/MOL-506: write_state with failure observability.
++
++    write_state can raise OSError (disk full, sandbox-deny on STATE_DIR,
++    ENOSPC), ValueError, or TypeError (json.dumps on non-serializable
++    field). Bare write_state callsites in main() previously let those
++    propagate to __main__'s broad catch, losing per-call attribution.
++
++    On failure: emit `state_write_failed` event tagged with `where`,
++    write stderr banner, return False. Caller decides whether to
++    continue (most paths continue — the dispatch_complete logging at
++    end of tick records the discrepancy via state-on-disk vs in-memory
++    state divergence).
++
++    Returns True on success.
++    """
++    try:
++        write_state(key, data)
++        return True
++    except (OSError, ValueError, TypeError) as exc:
++        _log_event("state_write_failed",
++                   key=key, where=where, exc_type=type(exc).__name__,
++                   exc=str(exc)[:200])
++        sys.stderr.write(
++            f"⚠️ {key}: state write failed at {where}: "
++            f"{type(exc).__name__}: {str(exc)[:200]}\n")
++        sys.stderr.flush()
++        return False
+ 
+ 
+ def _set_checkpoint(state: dict, phase: str) -> None:
+@@ -1036,21 +1183,24 @@
+ 
+ def run_phase_with_fallback(prompt: str, repo_path: str, permission_mode: str,
+                             max_turns: int, timeout_secs: int,
+-                            phase_name: str = "unknown") -> dict:
++                            phase_name: PhaseName,
++                            tracker: "BudgetTracker") -> dict:
+     """Try Tier 1 → Tier 2 → Tier 3 → Tier 4. Return first successful result.
+ 
+     P149/MOL-499: each tier gets ≤2 attempts based on _classify_tier_failure
+     of attempt 1's error_text + stderr_tail.
++
++    P153/MOL-506: retry-budget guard consults `tracker.remaining()` — the
++    global wall-clock budget is the single source of truth for "do we have
++    time for this retry?". The tracker is non-optional; callers thread the
++    dispatch-start tracker in.
+     """
+-    phase_start = time.monotonic()
+-    phase_budget = _PHASE_TIMEOUTS.get(phase_name, 600)
+     # Tier 1: CC + DeepSeek
+     result = _attempt_tier_with_retry(
+         lambda: _run_cc_deepseek(prompt, repo_path, permission_mode,
+                                  max_turns, timeout_secs),
+         tier_num=1, phase_name=phase_name,
+-        phase_start=phase_start, phase_budget=phase_budget,
+-        tier_timeout=timeout_secs,
++        tracker=tracker, tier_timeout=timeout_secs,
+     )
+     if result["success"]:
+         return result
+@@ -1061,8 +1211,7 @@
+         lambda: _run_cc_anthropic(prompt, repo_path, permission_mode,
+                                   max_turns, timeout_secs),
+         tier_num=2, phase_name=phase_name,
+-        phase_start=phase_start, phase_budget=phase_budget,
+-        tier_timeout=timeout_secs,
++        tracker=tracker, tier_timeout=timeout_secs,
+     )
+     if result["success"]:
+         return result
+@@ -1073,8 +1222,7 @@
+         lambda: _run_hermes_swarm(prompt, "deepseek", "deepseek-v4-pro[1m]",
+                                   repo_path, timeout_secs, tier=3),
+         tier_num=3, phase_name=phase_name,
+-        phase_start=phase_start, phase_budget=phase_budget,
+-        tier_timeout=timeout_secs,
++        tracker=tracker, tier_timeout=timeout_secs,
+     )
+     if result["success"]:
+         return result
+@@ -1085,8 +1233,7 @@
+         lambda: _run_hermes_swarm(prompt, "kimi-coding", "kimi-k2.6",
+                                   repo_path, timeout_secs, tier=4),
+         tier_num=4, phase_name=phase_name,
+-        phase_start=phase_start, phase_budget=phase_budget,
+-        tier_timeout=timeout_secs,
++        tracker=tracker, tier_timeout=timeout_secs,
+     )
+     if result["success"]:
+         return result
+@@ -1098,7 +1245,8 @@
+ # ── Phase-specific logic ───────────────────────────────────────────────────
+ 
+ def phase_planner(key: str, summary: str, ticket_body: str,
+-                  repo_path: str) -> dict:
++                  repo_path: str,
++                  tracker: "BudgetTracker") -> dict:
+     """Phase 1: Write implementation plan."""
+     plan_file = PLANS_DIR / f"{key}.md"
+     PLANS_DIR.mkdir(parents=True, exist_ok=True)
+@@ -1120,6 +1268,7 @@
+         max_turns=_CC_MAX_TURNS["planner"],
+         timeout_secs=_PHASE_TIMEOUTS["planner"],
+         phase_name="planner",
++        tracker=tracker,  # P153/MOL-506
+     )
+ 
+     if result["success"]:
+@@ -1136,7 +1285,8 @@
+             "tier": result["tier"]}
+ 
+ 
+-def phase_skeptic(key: str, repo_path: str) -> dict:
++def phase_skeptic(key: str, repo_path: str,
++                  tracker: "BudgetTracker") -> dict:
+     """Phase 2: Adversarial plan review.
+ 
+     Reads the plan from disk at PLANS_DIR/{key}.md — does NOT take an
+@@ -1159,6 +1309,7 @@
+         max_turns=_CC_MAX_TURNS["skeptic"],
+         timeout_secs=_PHASE_TIMEOUTS["skeptic"],
+         phase_name="skeptic",
++        tracker=tracker,  # P153/MOL-506
+     )
+ 
+     output = result.get("output", "")
+@@ -1170,7 +1321,8 @@
+             "tier": result["tier"]}
+ 
+ 
+-def phase_builder(key: str, plan_content: str, repo_path: str) -> dict:
++def phase_builder(key: str, plan_content: str, repo_path: str,
++                  tracker: "BudgetTracker") -> dict:
+     """Phase 3: Implement code, commit, push, open PR."""
+     plan_file = PLANS_DIR / f"{key}.md"
+     slug = key.lower().replace("_", "-")
+@@ -1192,6 +1344,7 @@
+         max_turns=_CC_MAX_TURNS["builder"],
+         timeout_secs=_PHASE_TIMEOUTS["builder"],
+         phase_name="builder",
++        tracker=tracker,  # P153/MOL-506
+     )
+ 
+     output = result.get("output", "")
+@@ -1211,7 +1364,8 @@
+             "tier": result["tier"]}
+ 
+ 
+-def phase_reviewer(key: str, pr_num: str, repo_path: str) -> dict:
++def phase_reviewer(key: str, pr_num: str, repo_path: str,
++                   tracker: "BudgetTracker") -> dict:
+     """Phase 4: Review PR, write gate decision."""
+     gate_file = f"/tmp/symphony-step65-{pr_num}.gate-decision"
+ 
+@@ -1229,12 +1383,15 @@
+         max_turns=_CC_MAX_TURNS["reviewer"],
+         timeout_secs=_PHASE_TIMEOUTS["reviewer"],
+         phase_name="reviewer",
++        tracker=tracker,  # P153/MOL-506
+     )
+ 
+     output = result.get("output", "")
+     passed = "REVIEW: PASS" in output
+ 
+-    # Read gate decision
++    # Read gate decision. FileNotFoundError is a subclass of OSError so a
++    # bare `except OSError` covers both; we keep the explicit class names
++    # in the event field for forensic grep clarity.
+     gate_value = None
+     try:
+         gate_text = Path(gate_file).read_text().strip()
+@@ -1242,8 +1399,17 @@
+             gate_value = 0
+         elif "merge:1" in gate_text:
+             gate_value = 1
+-    except (OSError, FileNotFoundError):
+-        pass
++        else:
++            _log_event("reviewer_gate_unrecognized",
++                       key=key, pr_num=pr_num, path=gate_file,
++                       content_head=gate_text[:200])
++    except FileNotFoundError:
++        _log_event("reviewer_gate_missing",
++                   key=key, pr_num=pr_num, path=gate_file)
++    except OSError as exc:
++        _log_event("reviewer_gate_unreadable",
++                   key=key, pr_num=pr_num, path=gate_file,
++                   exc_type=type(exc).__name__, exc=str(exc)[:200])
+ 
+     _log(f"Phase 4: passed={passed}, gate={gate_value}")
+     return {"ok": True, "passed": passed, "gate": gate_value,
+@@ -1251,6 +1417,45 @@
+ 
+ 
+ # ── Main ───────────────────────────────────────────────────────────────────
++
++
++def _abort_budget_exhausted(key: str, state: dict, phase_name: PhaseName,
++                            tracker: "BudgetTracker") -> None:
++    """P153/MOL-506: clean-abort path when global wall-clock budget can't
++    cover the next phase. Writes state + log + stdout banner; caller breaks
++    the dispatch loop after this returns.
++
++    State shape: last_status="incomplete", abort_reason="global_budget_exhausted",
++    attempt_count += 1. The "incomplete" status + attempt_count semantics
++    match the existing phase-failure paths — SIGKILL recovery sweep and
++    max-attempts gate already handle "incomplete" correctly.
++
++    Ordering invariant: stderr banner fires FIRST so the abort stays
++    visible when write_state or _log_event subsequently fail (disk full,
++    sandbox-deny, JSONL log dir unwritable). The whole point of this
++    helper is to make SIGKILL's silent death loud — any error path that
++    hides it defeats P153's architectural purpose.
++    """
++    state["last_status"] = "incomplete"
++    state["abort_reason"] = "global_budget_exhausted"
++    state["attempt_count"] = state.get("attempt_count", 0) + 1
++    summary = tracker.to_summary()
++    banner = (f"⚠️ {key}: global budget exhausted before {phase_name} "
++              f"(remaining={summary['remaining_secs']:.0f}s)")
++    # Stderr first — last-resort channel that survives both write_state
++    # failure (state file unwritable) and _log_event failure (JSONL log
++    # dir unwritable). Cron output capture grabs stderr regardless.
++    sys.stderr.write(banner + "\n")
++    sys.stderr.flush()
++    # write_state can raise OSError (disk full, permission, sandbox-deny)
++    # or ValueError/TypeError (non-serializable state field). Catch + log
++    # so the abort still completes with a visible banner.
++    _safe_write_state(key, state, where=f"abort_budget_exhausted:{phase_name}")
++    _log(f"DISPATCH ABORTED (budget): {key} would-start={phase_name} "
++         f"remaining_secs={summary['remaining_secs']}")
++    _log_event("budget_exhausted_abort", key=key, phase=phase_name,
++               budget_summary=summary)
++    print(banner)
+ 
+ 
+ def main() -> None:
+@@ -1380,7 +1585,15 @@
+         # P148/MOL-498: stamp dispatch_start checkpoint BEFORE first phase so SIGKILL
+         # recovery on next tick can name the phase that died.
+         _set_checkpoint(state, "dispatch_start")
+-        write_state(key, state)
++        _safe_write_state(key, state, where="dispatch_start")
++
++        # P153/MOL-506: start the global wall-clock budget at dispatch_start.
++        # All six phase boundaries below (planner / skeptic / planner_revise /
++        # skeptic_revise / builder / reviewer) gate on tracker.can_start_phase(...)
++        # and each retry inside run_phase_with_fallback consults tracker.remaining().
++        tracker = BudgetTracker.start_now()
++        _log_event("budget_tracker_started", key=key,
++                   budget_summary=tracker.to_summary())
+ 
+         _log(f"Dispatching {key} (attempt {state['attempt_count'] + 1})")
+         _log_event("dispatch_start", key=key,
+@@ -1394,12 +1607,17 @@
+         _log(f"  Summary: {summary[:100]}")
+ 
+         # ── Phase 1: Planner ───────────────────────────────────────────
++        if not tracker.can_start_phase("planner"):  # P153/MOL-506
++            _abort_budget_exhausted(key, state, "planner", tracker)
++            dispatched_status = "incomplete"
++            dispatched += 1
++            break
+         _log("── Phase 1 (Planner) ──")
+-        p1 = phase_planner(key, summary, ticket_body, repo_path)
++        p1 = phase_planner(key, summary, ticket_body, repo_path, tracker=tracker)
+         if not p1["ok"]:
+             state["last_status"] = "failed"
+             state["attempt_count"] += 1
+-            write_state(key, state)
++            _safe_write_state(key, state, where="planner_failed")
+             _log(f"DISPATCH FAILED: {key} Phase 1 failed: {p1.get('error')}")
+             _log_event("phase_failed", key=key, phase="planner",
+                        error=str(p1.get("error", ""))[:300], tier=p1.get("tier"))
+@@ -1409,17 +1627,22 @@
+ 
+         plan_content = p1["plan_content"]
+         _set_checkpoint(state, "planner_done")
+-        write_state(key, state)
++        _safe_write_state(key, state, where="planner_done")
+         _log_event("phase_complete", key=key, phase="planner", tier=p1.get("tier"))
+ 
+         # ── Phase 2: Skeptic ───────────────────────────────────────────
++        if not tracker.can_start_phase("skeptic"):  # P153/MOL-506
++            _abort_budget_exhausted(key, state, "skeptic", tracker)
++            dispatched_status = "incomplete"
++            dispatched += 1
++            break
+         _log("── Phase 2 (Skeptic) ──")
+-        p2 = phase_skeptic(key, repo_path)
++        p2 = phase_skeptic(key, repo_path, tracker=tracker)
+ 
+         if p2["verdict"] == "RETHINK":
+             state["last_status"] = "incomplete"
+             state["attempt_count"] += 1
+-            write_state(key, state)
++            _safe_write_state(key, state, where="skeptic_rethink")
+             _log(f"DISPATCH INCOMPLETE: {key} Phase 2 RETHINK")
+             print(f"⚠️ {key}: plan-skeptic RETHINK — plan architecturally flawed")
+             dispatched_status = "incomplete"
+@@ -1427,24 +1650,37 @@
+             break
+ 
+         if p2["verdict"] == "REVISE":
++            # P153/MOL-506: both legs of the REVISE loop are full phases —
++            # gate each independently. A REVISE-retry that can't fit Phase 1
++            # is just budget exhaustion, not a retry failure.
++            if not tracker.can_start_phase("planner_revise"):
++                _abort_budget_exhausted(key, state, "planner_revise", tracker)
++                dispatched_status = "incomplete"
++                dispatched += 1
++                break
+             _log("Phase 2 REVISE — re-running Phase 1 with findings")
+             revised_body = ticket_body + f"\n\nSkeptic findings:\n{p2['output'][:2000]}"
+-            p1 = phase_planner(key, summary, revised_body, repo_path)
++            p1 = phase_planner(key, summary, revised_body, repo_path, tracker=tracker)
+             if not p1["ok"]:
+                 state["last_status"] = "failed"
+                 state["attempt_count"] += 1
+-                write_state(key, state)
++                _safe_write_state(key, state, where="planner_revise_failed")
+                 _log(f"DISPATCH FAILED: {key} Phase 1 retry failed")
+                 dispatched_status = "failed"
+                 dispatched += 1
+                 break
+ 
+             plan_content = p1["plan_content"]  # needed for phase_builder below
+-            p2 = phase_skeptic(key, repo_path)
++            if not tracker.can_start_phase("skeptic_revise"):  # P153/MOL-506
++                _abort_budget_exhausted(key, state, "skeptic_revise", tracker)
++                dispatched_status = "incomplete"
++                dispatched += 1
++                break
++            p2 = phase_skeptic(key, repo_path, tracker=tracker)
+             if p2["verdict"] in ("REVISE", "RETHINK", None):
+                 state["last_status"] = "incomplete"
+                 state["attempt_count"] += 1
+-                write_state(key, state)
++                _safe_write_state(key, state, where="skeptic_revise_failed")
+                 _log(f"DISPATCH INCOMPLETE: {key} Phase 2 retry: {p2['verdict']}")
+                 _log_event("phase_failed", key=key, phase="skeptic_retry",
+                            verdict=p2.get("verdict"), tier=p2.get("tier"))
+@@ -1455,19 +1691,24 @@
+                 break
+ 
+         _set_checkpoint(state, "skeptic_done")
+-        write_state(key, state)
++        _safe_write_state(key, state, where="skeptic_done")
+         _log_event("phase_complete", key=key, phase="skeptic",
+                    verdict=p2.get("verdict"), tier=p2.get("tier"))
+ 
+         # ── Phase 3: Builder ───────────────────────────────────────────
++        if not tracker.can_start_phase("builder"):  # P153/MOL-506
++            _abort_budget_exhausted(key, state, "builder", tracker)
++            dispatched_status = "incomplete"
++            dispatched += 1
++            break
+         _log("── Phase 3 (Builder) ──")
+-        p3 = phase_builder(key, plan_content, repo_path)
++        p3 = phase_builder(key, plan_content, repo_path, tracker=tracker)
+         pr_num = p3.get("pr_num")
+ 
+         if not p3["ok"] or not pr_num:
+             state["last_status"] = "incomplete"
+             state["attempt_count"] += 1
+-            write_state(key, state)
++            _safe_write_state(key, state, where="builder_failed")
+             _log(f"DISPATCH INCOMPLETE: {key} Phase 3 failed or no PR")
+             _log_event("phase_failed", key=key, phase="builder",
+                        error=str(p3.get("error", ""))[:300], tier=p3.get("tier"))
+@@ -1476,26 +1717,59 @@
+             break
+ 
+         _set_checkpoint(state, "builder_done")
+-        write_state(key, state)
++        _safe_write_state(key, state, where="builder_done")
+         _log_event("phase_complete", key=key, phase="builder",
+                    pr_num=pr_num, tier=p3.get("tier"))
+ 
+         # ── Phase 4: Reviewer ──────────────────────────────────────────
++        if not tracker.can_start_phase("reviewer"):  # P153/MOL-506
++            # P153/MOL-506: builder already opened a PR; record it on
++            # state so the next tick (or a manual sweep) can find + triage
++            # the un-reviewed PR instead of leaving it orphaned.
++            state["orphan_pr_num"] = pr_num
++            _abort_budget_exhausted(key, state, "reviewer", tracker)
++            dispatched_status = "incomplete"
++            dispatched += 1
++            break
+         _log("── Phase 4 (Reviewer) ──")
+-        p4 = phase_reviewer(key, pr_num, repo_path)
++        p4 = phase_reviewer(key, pr_num, repo_path, tracker=tracker)
+ 
+         # ── Bash gate ──────────────────────────────────────────────────
+         if p4["gate"] == 0:
+             _log(f"Merging PR #{pr_num}")
+             try:
+-                subprocess.run(
++                r = subprocess.run(
+                     ["gh", "pr", "merge", str(pr_num), "--squash", "--delete-branch"],
+                     capture_output=True, text=True, timeout=30,
+                     cwd=repo_path,
+                 )
+-                pr_state = "merged"
+-            except (OSError, subprocess.TimeoutExpired):
++                # gh pr merge returns non-zero for branch protection,
++                # mergeability conflicts, auth failure, network 5xx,
++                # rate-limit. Capturing the exit code prevents falsely
++                # marking the state as merged when the PR is still open
++                # (which would then trip the silent-skip path next tick).
++                if r.returncode == 0:
++                    pr_state = "merged"
++                else:
++                    pr_state = "open"
++                    _log_event("pr_merge_failed",
++                               key=key, pr_num=pr_num,
++                               exit_code=r.returncode,
++                               stderr_tail=_stderr_tail(r.stderr or ""))
++                    sys.stderr.write(
++                        f"⚠️ {key}: gh pr merge #{pr_num} "
++                        f"exit {r.returncode}: {(r.stderr or '')[:200]}\n")
++                    sys.stderr.flush()
++            except (OSError, subprocess.TimeoutExpired) as exc:
+                 pr_state = "open"
++                _log_event("pr_merge_exception",
++                           key=key, pr_num=pr_num,
++                           exc_type=type(exc).__name__,
++                           exc=str(exc)[:200])
++                sys.stderr.write(
++                    f"⚠️ {key}: gh pr merge exception: "
++                    f"{type(exc).__name__}: {str(exc)[:200]}\n")
++                sys.stderr.flush()
+         else:
+             pr_state = "open"
+ 
+@@ -1512,7 +1786,7 @@
+             state["last_status"] = "incomplete"
+             state["attempt_count"] += 1
+ 
+-        write_state(key, state)
++        _safe_write_state(key, state, where="dispatch_complete")
+ 
+         _log(f"DISPATCH COMPLETE: {key} status={state['last_status']} "
+              f"pr_state={pr_state}")
+@@ -1553,9 +1827,19 @@
+                         data["attempt_count"] = data.get("attempt_count", 0) + 1
+                         sf.write_text(json.dumps(data, indent=2) + "\n")
+                         _log(f"Rescued state: {sf.name} running → incomplete")
+-                except (json.JSONDecodeError, OSError):
+-                    pass
+-        except Exception:
+-            pass
++                except (json.JSONDecodeError, OSError) as inner_exc:
++                    _log_event("rescue_state_skipped",
++                               path=str(sf),
++                               exc_type=type(inner_exc).__name__,
++                               exc=str(inner_exc)[:200])
++        except Exception as rescue_exc:
++            # Meta-silence guard: the rescue path itself can fail
++            # (STATE_DIR.glob sandbox-deny, MemoryError on huge state
++            # files). Log loudly so operators don't see only the
++            # original FATAL with no clue whether rescue ran.
++            sys.stderr.write(
++                f"[symphony-bridge] RESCUE LOOP FAILED: "
++                f"{type(rescue_exc).__name__}: {rescue_exc}\n")
++            sys.stderr.flush()
+         print(f"[symphony-bridge] FATAL ERROR: {exc}")
+         raise

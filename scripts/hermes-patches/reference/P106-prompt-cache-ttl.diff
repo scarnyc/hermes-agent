@@ -1,0 +1,145 @@
+commit 7626f3702e3d39ed8c588f40dd46aa6aaa017326
+Author: WildCat Eng Manager <agent@wildcat.local>
+Date:   Sun Apr 19 13:40:52 2026 -0500
+
+    feat: read prompt caching cache_ttl from config
+    
+    - Load prompt_caching.cache_ttl in AIAgent (5m default, 1h opt-in)
+    - Document DEFAULT_CONFIG and developer guide example
+    - Add unit tests for default, 1h, and invalid TTL fallback
+    
+    Made-with: Cursor
+
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 58f874595..7678287a0 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -521,6 +521,12 @@ DEFAULT_CONFIG = {
+ 
+     },
+ 
++    # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
++    # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
++    "prompt_caching": {
++        "cache_ttl": "5m",
++    },
++
+     # AWS Bedrock provider configuration.
+     # Only used when model.provider is "bedrock".
+     "bedrock": {
+diff --git a/run_agent.py b/run_agent.py
+index f31554123..e68e8f544 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1036,8 +1036,21 @@ class AIAgent:
+         self._use_prompt_caching, self._use_native_cache_layout = (
+             self._anthropic_prompt_cache_policy()
+         )
+-        self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
+-        
++        # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from
++        # config.yaml under prompt_caching.cache_ttl; unknown values keep "5m".
++        # 1h tier costs 2x on write vs 1.25x for 5m, but amortizes across long
++        # sessions with >5-minute pauses between turns (#14971).
++        self._cache_ttl = "5m"
++        try:
++            from hermes_cli.config import load_config as _load_pc_cfg
++
++            _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
++            _ttl = _pc_cfg.get("cache_ttl", "5m")
++            if _ttl in ("5m", "1h"):
++                self._cache_ttl = _ttl
++        except Exception:
++            pass
++
+         # Iteration budget: the LLM is only notified when it actually exhausts
+         # the iteration budget (api_call_count >= max_iterations).  At that
+         # point we inject ONE message, allow one final API call, and if the
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index d8f33f67c..9c54daffe 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -685,6 +685,66 @@ class TestInit:
+             assert a.api_mode == "anthropic_messages"
+             assert a._use_prompt_caching is True
+ 
++    def test_prompt_caching_cache_ttl_defaults_without_config(self):
++        """cache_ttl stays 5m when prompt_caching is absent from config."""
++        with (
++            patch("run_agent.get_tool_definitions", return_value=[]),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("run_agent.OpenAI"),
++            patch("hermes_cli.config.load_config", return_value={}),
++        ):
++            a = AIAgent(
++                api_key="test-k...7890",
++                model="anthropic/claude-sonnet-4-20250514",
++                base_url="https://openrouter.ai/api/v1",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++            assert a._cache_ttl == "5m"
++
++    def test_prompt_caching_cache_ttl_custom_1h(self):
++        """prompt_caching.cache_ttl 1h is applied when present in config."""
++        with (
++            patch("run_agent.get_tool_definitions", return_value=[]),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("run_agent.OpenAI"),
++            patch(
++                "hermes_cli.config.load_config",
++                return_value={"prompt_caching": {"cache_ttl": "1h"}},
++            ),
++        ):
++            a = AIAgent(
++                api_key="test-k...7890",
++                model="anthropic/claude-sonnet-4-20250514",
++                base_url="https://openrouter.ai/api/v1",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++            assert a._cache_ttl == "1h"
++
++    def test_prompt_caching_cache_ttl_invalid_falls_back(self):
++        """Non-Anthropic TTL values keep default 5m without raising."""
++        with (
++            patch("run_agent.get_tool_definitions", return_value=[]),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("run_agent.OpenAI"),
++            patch(
++                "hermes_cli.config.load_config",
++                return_value={"prompt_caching": {"cache_ttl": "30m"}},
++            ),
++        ):
++            a = AIAgent(
++                api_key="test-k...7890",
++                model="anthropic/claude-sonnet-4-20250514",
++                base_url="https://openrouter.ai/api/v1",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++            assert a._cache_ttl == "5m"
++
+     def test_valid_tool_names_populated(self):
+         """valid_tool_names should contain names from loaded tools."""
+         tools = _make_tool_defs("web_search", "terminal")
+diff --git a/website/docs/developer-guide/context-compression-and-caching.md b/website/docs/developer-guide/context-compression-and-caching.md
+index 29008ebb7..bf7610c25 100644
+--- a/website/docs/developer-guide/context-compression-and-caching.md
++++ b/website/docs/developer-guide/context-compression-and-caching.md
+@@ -332,9 +332,9 @@ Prompt caching is automatically enabled when:
+ - The provider supports `cache_control` (native Anthropic API or OpenRouter)
+ 
+ ```yaml
+-# config.yaml — TTL is configurable
+-model:
+-  cache_ttl: "5m"   # "5m" or "1h"
++# config.yaml — TTL is configurable (must be "5m" or "1h")
++prompt_caching:
++  cache_ttl: "5m"
+ ```
+ 
+ The CLI shows caching status at startup:
