@@ -3156,7 +3156,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 protocol_violation = True
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
+                    "kanban_complete or kanban_block — protocol violation "
+                    "(P246/MOL-2011: the LAST tool call before exit MUST be "
+                    "kanban_complete or kanban_block. Use partial:true metadata "
+                    "if some work was done but not all.)"
                 )
                 event_kind = "protocol_violation"
                 event_payload = {

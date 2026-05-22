@@ -12569,3 +12569,85 @@ Phase 3 of MOL-623 (symphony three-agent loop). Adds `~/.hermes/skills/software-
 ## P234 / MOL-599 — _transition_jira target name matches MOL workflow
 
 `symphony_loop.py` `_transition_jira` target hardcode corrected from `"In Testing"` to `"Testing"` to match the actual MOL Jira workflow name. Paired deletion-class assertion (P151/MOL-502 pattern): stale `target = "In Testing"` must NOT reappear. Marker form: inline `MOL-599 P234:` banner. Reference diff at `scripts/hermes-patches/reference/P234-MOL-599-jira-transition-target-name.diff`.
+
+---
+
+## MOL-648 upstream cherry-picks — v2026.5.16 (tag 8487dfb5)
+
+11 meaningful commits cherry-picked from upstream v2026.5.16 by kanban-swarm worker (session 20260522_184307_08ce8d). 5 additional commits resolved as already-covered (empty after merge — our patches supersede upstream). All cherry-picks applied in chronological order via the kanban-swarm dispatch-don't-drive pipeline.
+
+---
+
+## P235 / MOL-648 — OAuth PKCE state/verifier separation (upstream fcd9011f8)
+
+`agent/anthropic_adapter.py` — separates OAuth PKCE state from code_verifier. Security fix: state was previously co-mingled with code_verifier, creating a potential state-leak vector. Cherry-picked clean (no conflicts).
+
+---
+
+## P236 / MOL-648 — DeepSeek thinking-mode via DeepSeekProfile (upstream cd9470f41)
+
+`plugins/model-providers/deepseek/__init__.py`, `agent/transports/chat_completions.py` — wires thinking-mode through DeepSeekProfile instead of legacy fallback. Replaces our P167 area. **Conflict expected and resolved**: preferred upstream DeepSeekProfile approach, kept P167 thinking.type mapping as fallback annotation. Cherry-picked clean after conflict resolution.
+
+---
+
+## P237 / MOL-648 — TUI DECSTBM scroll region fix (upstream 566d8f0d7)
+
+TUI component — keeps DECSTBM scroll region off the bottom row, preventing cursor-draw corruption during scroll. Cherry-picked clean.
+
+---
+
+## P238 / MOL-648 — TUI subagent timeout/error status handling (upstream 006937f7d)
+
+TUI component — handles timeout and error subagent statuses in `/agents` display. Previously these statuses caused rendering gaps. Cherry-picked clean.
+
+---
+
+## P239 / MOL-648 — TUI markdown table rendering (upstream 55c9f3206)
+
+TUI component — width-aware markdown table rendering with vertical fallback for narrow terminals. Cherry-picked clean.
+
+---
+
+## P240 / MOL-648 — TUI transcript scroll + Esc during prompts (upstream 44b63fc6d)
+
+TUI component — allows transcript scroll and Escape key during approval/clarify/confirm prompts. Previously these prompts locked the UI. Cherry-picked clean.
+
+---
+
+## P241 / MOL-648 — Retry malformed anthropic stream parser errors (upstream 9c304a7f5)
+
+`run_agent.py` — retries on malformed anthropic stream parser errors instead of failing immediately. Improves resilience against transient API malformations. Cherry-picked clean.
+
+---
+
+## P242 / MOL-648 — TUI cursor drift fix (upstream 70b663504)
+
+TUI component — keeps Ink displayCursor in sync with fast-echo writes so cursor stops drifting during rapid output. Cherry-picked clean.
+
+---
+
+## P243 / MOL-648 — Delegation honor api_mode + auto-detect URLs (upstream c445f48b7)
+
+`tools/delegate_tool.py` — honors api_mode setting and auto-detects anthropic_messages URLs in delegate dispatch. Fixes delegate routing to use correct API protocol. Cherry-picked clean.
+
+---
+
+## P244 / MOL-648 — MCP parallel tool calls support (upstream 395e9dd9e)
+
+`tools/mcp_tool.py` — adds `supports_parallel_tool_calls` for MCP servers. Enables concurrent MCP tool execution where supported. Cherry-picked clean.
+
+---
+
+## P245 / MOL-648 — Dangerous-command detection hardening (upstream 6ba35ec33)
+
+`tools/approval.py` — tightens dangerous-command detection patterns. Hardens the pre-execution safety filter against command-injection variants. Cherry-picked clean.
+
+---
+
+### Already-covered commits (no P-marker — changes already present in our fork)
+
+- **d725407c5** (CVE deps bump) — custom deps in our fork; accepted ours on empty resolution
+- **627f8a5f1** (tool error sanitization) — already covered by P167 + prior patches in `model_tools.py`
+- **585d6b643** (gateway TEXT follow-up merge) — already applied via prior cherry-picks in `gateway/platforms/base.py`
+- **d0a183cad** (suppress stale direct-key OAuth in doctor) — our provider auth already handles this in `hermes_cli/doctor.py`
+- **016c772e7** (plugins tool-override flag) — already covered by prior patches in `hermes_cli/plugins.py`, `tools/registry.py`
