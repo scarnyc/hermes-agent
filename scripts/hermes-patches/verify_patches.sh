@@ -3985,7 +3985,10 @@ else
     failed=$((failed + 1))
 fi
 # No hardcoded 600 remains (P105 regression guard already covers this, re-assert)
-if grep -q "timeout=600" "$DT_TOOL"; then
+if [ ! -f "$DT_TOOL" ]; then
+    [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m P145 hardcoded-600 regression check skipped (DT_TOOL missing): %s\n' "$DT_TOOL"
+    skipped=$((skipped + 1))
+elif grep -q "timeout=600" "$DT_TOOL"; then
     echo "FAIL: P145 hardcoded 600s timeout still present"
     failed=$((failed + 1))
 else
@@ -4031,7 +4034,10 @@ else
     failed=$((failed + 1))
 fi
 # No hardcoded 600s in delegate_tool.py
-if grep -q "timeout=600" "$DT_TOOL"; then
+if [ ! -f "$DT_TOOL" ]; then
+    [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m P146 hardcoded-600 regression check skipped (DT_TOOL missing): %s\n' "$DT_TOOL"
+    skipped=$((skipped + 1))
+elif grep -q "timeout=600" "$DT_TOOL"; then
     echo "FAIL: P146 hardcoded 600s timeout still present in $DT_TOOL"
     failed=$((failed + 1))
 else
@@ -6368,7 +6374,13 @@ done
 # Dual-write parity: both planner.md files MUST be byte-identical (catches
 # drift where one was edited and the other forgotten). Parity check still
 # applies post-P173 — F8 is dual-written exactly like F7 was.
-if [ -f "$P172_PLANNER_MD" ] && [ -f "$P172_PLANNER_MD_REPO" ]; then
+if [[ $REPO_ONLY -eq 1 ]]; then
+    # MOL-1984 Phase 4: under REPO_ONLY both vars point at the same repo file —
+    # diff would self-compare. Skip the parity check honestly rather than emit
+    # a tautological pass.
+    [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m P172 dual-write parity skipped (no runtime planner.md in CI)\n'
+    skipped=$((skipped + 1))
+elif [ -f "$P172_PLANNER_MD" ] && [ -f "$P172_PLANNER_MD_REPO" ]; then
     if diff -q "$P172_PLANNER_MD" "$P172_PLANNER_MD_REPO" > /dev/null; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m P172 planner.md dual-write parity (runtime == repo source-of-truth, post-P173)\n'
         passed=$((passed + 1))
@@ -6461,7 +6473,11 @@ check_marker_count "P181/MOL-550 marker in repo reference planner.md" \
     "$P173_PLANNER_MD_REPO" "P181/MOL-550" 1
 
 # Dual-write parity: both files MUST be byte-identical post-edit.
-if [ -f "$P173_PLANNER_MD" ] && [ -f "$P173_PLANNER_MD_REPO" ]; then
+if [[ $REPO_ONLY -eq 1 ]]; then
+    # MOL-1984 Phase 4: same self-compare guard as P172 above.
+    [[ $QUIET -eq 0 ]] && printf '  \033[0;33m[~]\033[0m P173 F8 dual-write parity skipped (no runtime planner.md in CI)\n'
+    skipped=$((skipped + 1))
+elif [ -f "$P173_PLANNER_MD" ] && [ -f "$P173_PLANNER_MD_REPO" ]; then
     if diff -q "$P173_PLANNER_MD" "$P173_PLANNER_MD_REPO" > /dev/null; then
         [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m P173 F8 planner.md dual-write parity (runtime == repo source-of-truth)\n'
         passed=$((passed + 1))
