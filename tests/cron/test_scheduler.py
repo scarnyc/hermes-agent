@@ -2386,3 +2386,184 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+class TestScrubFinalResponse:
+    """P73/MOL-305 — cron final_response scrubber.
+
+    Defends downstream cron delivery from LLM emitting (a) leading planning
+    prose, (b) wrapping the briefing in a code fence, (c) double-emitting
+    the briefing with a transition phrase. Conservative: returns input
+    unchanged when no malformation signals are present.
+    """
+
+    def _scrub(self, text):
+        from cron.scheduler import _scrub_cron_final_response
+        return _scrub_cron_final_response(text)
+
+    def test_a_real_world_malformed_payload(self):
+        """Reproduces the 2026-04-25 incident: preamble + fenced briefing +
+        'I will output exactly this' transition + raw repeat → single clean briefing.
+
+        Fixture is sized to match the real comprehensive-update briefing length
+        (~1500-2000 chars per copy) so the dedup heuristic's 200-byte minimum
+        offset is exercised under realistic conditions.
+        """
+        briefing_body = (
+            "GOOD MORNING CHIEF\n"
+            "\n"
+            "INFRA: DEGRADED -- Granola OAuth refresh failed\n"
+            "\n"
+            "EMAIL -- 20 unread\n"
+            "- URGENT: Ultimate Guide: In-App Surveys (from Aakash Gupta)\n"
+            "- FYI: 19 LinkedIn Job Alerts for Product Manager, AI roles\n"
+            "\n"
+            "CALENDAR -- 3 events\n"
+            "- 11:00 AM - 12:00 PM: Pick up groceries\n"
+            "- 12:00 PM - 1:00 PM: Dry clean / leather\n"
+            "- 5:00 PM - 5:15 PM: Meditate + Walk\n"
+            "\n"
+            "MEETINGS -- Unavailable\n"
+            "- Granola API unavailable, currently tracked via MOL-248\n"
+            "\n"
+            "JIRA -- 19 recent updates\n"
+            "- MOL-280: new-job-hunter verify + resume (Done)\n"
+            "- MOL-268: Reflection guardrails (Done)\n"
+            "- MOL-277: verify_patches.sh hardening (Done)\n"
+            "- MOL-275: One-time state.db scrub (Done)\n"
+            "- MOL-283: Hermes runtime upstream update (In Progress)\n"
+            "\n"
+            "NEWS\n"
+            "  FROM YOUR FEEDS\n"
+            "  - GPT-5.5 prompting guide (Simon Willison)\n"
+            "  - DeepSeek v4 (Hacker News)\n"
+            "  FROM THE WEB\n"
+            "  - AI Demand Exaggerated (HyperAI)\n"
+            "\n"
+            "FILES -- 0 modified\n"
+            "\n"
+            "TASKS -- Active Focus\n"
+            "- Resurrect job hunter agent\n"
+            "- Financial agent prep\n"
+            "\n"
+            "FOLLOW-UPS\n"
+            "- Granola OAuth: JIRA MOL-248 needs attention\n"
+            "\n"
+            "ANALYSIS\n"
+            "- Industry trends favor Anthropic (Google $40B investment)\n"
+            "- 19 new AI PM job alerts match active job hunt criteria\n"
+        )
+        malformed = (
+            "I need to output the final briefing in the specific plain text format provided.\n"
+            "\n"
+            "```\n"
+            + briefing_body
+            + "```\n"
+            "\n"
+            "I will output exactly this."
+            + briefing_body
+        )
+        cleaned = self._scrub(malformed)
+        # Exactly one briefing
+        assert cleaned.count("GOOD MORNING CHIEF") == 1
+        # No leading planning prose
+        assert not cleaned.lstrip().startswith("I need to")
+        assert not cleaned.lstrip().startswith("I will")
+        # No code fences
+        assert "```" not in cleaned
+        # No transition phrase
+        assert "I will output exactly this" not in cleaned
+        # Body intact (sample several sections from across the briefing)
+        assert "INFRA: DEGRADED -- Granola OAuth refresh failed" in cleaned
+        assert "MEETINGS -- Unavailable" in cleaned
+        assert "ANALYSIS" in cleaned
+        assert "Industry trends favor Anthropic" in cleaned
+        # Result is a single briefing, not noticeably bigger than the original body
+        assert len(cleaned) < len(malformed) * 0.7
+
+    def test_b_clean_briefing_unchanged(self):
+        """A well-formed briefing must pass through byte-for-byte."""
+        clean = (
+            "GOOD MORNING CHIEF\n"
+            "\n"
+            "INFRA: ALL GREEN\n"
+            "\n"
+            "EMAIL -- 5 unread\n"
+            "- urgent A\n"
+            "\n"
+            "CALENDAR -- 2 events\n"
+            "\n"
+            "JIRA -- 3 updates\n"
+            "\n"
+            "ANALYSIS\n"
+            "- insight one\n"
+        )
+        assert self._scrub(clean) == clean
+
+    def test_c_single_leading_meta_line_stripped(self):
+        """A response that begins with one 'I will' line and no other malformation —
+        strip the leading line, keep the body intact."""
+        text = (
+            "I will check the calendar tomorrow.\n"
+            "\n"
+            "GOOD MORNING CHIEF\n"
+            "\n"
+            "INFRA: ALL GREEN\n"
+            "\n"
+            "CALENDAR -- 2 events\n"
+        )
+        cleaned = self._scrub(text)
+        assert "I will check the calendar" not in cleaned
+        assert cleaned.lstrip().startswith("GOOD MORNING CHIEF")
+        assert "INFRA: ALL GREEN" in cleaned
+        assert "CALENDAR -- 2 events" in cleaned
+
+    def test_d_legitimate_repeated_substring_left_alone(self):
+        """Internal section headers that legitimately repeat MUST NOT trigger dedup.
+        Briefings often contain 'Generated: <date>' or similar lines in sub-reports.
+        The dedup heuristic keys off the FIRST non-meta line (here: GOOD MORNING CHIEF),
+        which appears only once — so no rescue mode triggers."""
+        long_filler = "x" * 250  # ensure inter-section distance > 200 bytes
+        text = (
+            "GOOD MORNING CHIEF\n"
+            "\n"
+            "CRON HEALTH\n"
+            "Generated: 2026-04-25 07:02:40\n"
+            f"{long_filler}\n"
+            "\n"
+            "OTHER REPORT\n"
+            "Generated: 2026-04-25 07:02:40\n"
+            f"{long_filler}\n"
+        )
+        assert self._scrub(text) == text
+
+    def test_idempotent_under_re_scrub(self):
+        """Scrubbing the output of scrubbing must not change it further."""
+        malformed = (
+            "I need to output the final briefing.\n"
+            "\n"
+            "```\n"
+            "GOOD MORNING CHIEF\n"
+            "INFRA: ALL GREEN\n"
+            "EMAIL -- 5 unread\n"
+            "CALENDAR -- 2 events\n"
+            "JIRA -- 3 updates\n"
+            "TASKS -- focus list\n"
+            "ANALYSIS -- insight\n"
+            "```\n"
+            "\n"
+            "I will output exactly this.GOOD MORNING CHIEF\n"
+            "INFRA: ALL GREEN\n"
+            "EMAIL -- 5 unread\n"
+            "CALENDAR -- 2 events\n"
+            "JIRA -- 3 updates\n"
+            "TASKS -- focus list\n"
+            "ANALYSIS -- insight\n"
+        )
+        once = self._scrub(malformed)
+        twice = self._scrub(once)
+        assert once == twice
+
+    def test_empty_input_passes_through(self):
+        assert self._scrub("") == ""
+        assert self._scrub(None) is None

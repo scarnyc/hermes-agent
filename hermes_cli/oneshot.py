@@ -1,5 +1,7 @@
 """Oneshot (-z) mode: send a prompt, get the final content block, exit.
 
+P104/MOL-420 — manual port of upstream 7c8c031f6 (homebrew sequence).
+
 Bypasses cli.py entirely.  No banner, no spinner, no session_id line,
 no stderr chatter.  Just the agent's final text to stdout.
 

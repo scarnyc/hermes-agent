@@ -200,6 +200,17 @@ def init_agent(
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
+    # P59/MOL-268 — per-platform cost cap circuit-breaker (config.yaml cost_caps)
+    agent._cost_cap_usd = None
+    agent._cost_cap_triggered = False
+    try:
+        from hermes_cli.config import load_config as _p59_load_cfg
+        _p59_caps = (_p59_load_cfg() or {}).get("cost_caps") or {}
+        _p59_val = _p59_caps.get(agent.platform)
+        if _p59_val is not None:
+            agent._cost_cap_usd = float(_p59_val)
+    except Exception:
+        pass
     agent._user_name = user_name
     agent._chat_id = chat_id
     agent._chat_name = chat_name
@@ -438,6 +449,16 @@ def init_agent(
     agent._last_activity_desc: str = "initializing"
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
+
+    # P33/MOL-525 + MOL-220 (proper fix, 2026-04-18): per-run tool-error
+    # accumulator. ``_record_tool_error`` (defined on AIAgent) appends a
+    # capped error dict here when _execute_tool_calls_{concurrent,
+    # sequential} sees ``is_error`` on a function-tool result. Cron's
+    # run_job copies this list into the 5th slot of its return tuple so
+    # _process_job can synthesize an empty-delivery surface line when
+    # final_response is empty AND tool_errors is non-empty (the cohort
+    # that previously vanished silently — see mol245_silent_miss_architecture).
+    agent._tool_errors: list = []
 
     # Rate limit tracking — updated from x-ratelimit-* response headers
     # after each API call.  Accessed by /usage slash command.
@@ -948,7 +969,7 @@ def init_agent(
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-            if _mem_provider_name:
+            if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
@@ -1040,6 +1061,18 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+
+    # P77/MOL-314: fallback on empty-completion exhaustion. When True
+    # (default), the empty-exhausted branch in conversation_loop activates
+    # the configured fallback chain (e.g. Kimi K2.6) before falling through
+    # to the bare "(empty)" sentinel. bool() wrapper normalizes loose YAML
+    # values (e.g. "yes", 1, null) to stable truthiness. Attribute is
+    # unconditionally set here so the wire-in can read it without a
+    # defensive getattr — partial-init bugs raise AttributeError loudly
+    # instead of silently masking as the False branch.
+    agent._fallback_on_empty_exhausted = bool(
+        _agent_section.get("fallback_on_empty_exhausted", True)
+    )
 
     # App-level API retry count (wraps each model API call).  Default 3,
     # overridable via agent.api_max_retries in config.yaml.  See #11616.

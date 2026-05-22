@@ -22,6 +22,10 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
+# P92/MOL-388 — Override parent's inherited ERROR level (set by quiet_mode in
+# run_agent.py) so INFO-and-above messages propagate to the root logger's
+# RotatingFileHandler (agent.log).
+logger.setLevel(logging.INFO)
 import os
 import re  # P103/MOL-410 — profile name validation + repo-path extraction (#162 review M11/M15)
 import string  # P103/MOL-410 — _build_claude_argv field-name validation (#162 review CRITICAL-6)
@@ -32,6 +36,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
+from dataclasses import dataclass, field  # P72/MOL-251 — SubagentOverrides dataclass refactor
 from datetime import datetime, timezone  # P103/MOL-410 — audit log timestamps
 from pathlib import Path  # P103/MOL-410 — profile path resolution
 from typing import Any, Dict, List, Optional, Tuple
@@ -880,6 +885,48 @@ def _check_profile_session_consent(
     return True, "v1-auto-approve (MOL-450 follow-up)"
 
 
+# === P133/MOL-462: in-flight breadcrumb for delegate_task ===
+# Single-slot per-profile `.inflight` file at ~/.hermes/logs/delegate-{profile}.inflight.
+# Written at delegate_task entry (right after _top_profile_cfg load) so a hard
+# crash mid-cascade leaves a trace of "what was running when the gateway died."
+# Cleared inside _emit_profile_audit after a successful audit write — the audit
+# log is the canonical record once it lands, the breadcrumb is only useful
+# while no terminal record exists. Overwritten (mode "w") on every dispatch.
+
+def _inflight_breadcrumb_path(profile_name: str) -> Path:
+    return _P103_LOG_DIR / f"delegate-{profile_name}.inflight"
+
+
+def _write_inflight_breadcrumb(profile: Optional[str], goal: Optional[str]) -> None:
+    """P133/MOL-462: write the in-flight breadcrumb (fail-open)."""
+    profile_name = profile if (profile and isinstance(profile, str)) else "default"
+    try:
+        path = _inflight_breadcrumb_path(profile_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "profile": profile_name,
+            "pid": os.getpid(),
+            "goal_excerpt": (goal or "")[:240],
+        }
+        with path.open("w") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:  # noqa: BLE001 — fail-open; breadcrumb is best-effort forensics
+        pass
+
+
+def _clear_inflight_breadcrumb(profile_name: str) -> None:
+    """P133/MOL-462: clear the breadcrumb after a successful audit emit (fail-open)."""
+    try:
+        path = _inflight_breadcrumb_path(profile_name)
+        if path.exists():
+            path.unlink()
+    except Exception:  # noqa: BLE001 — fail-open
+        pass
+
+
 def _emit_profile_audit(
     profile: Dict[str, Any],
     argv: List[str],
@@ -932,8 +979,15 @@ def _emit_profile_audit(
 
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a") as fp:
-            fp.write(json.dumps(record) + "\n")
+        # P133/MOL-462: flush + fsync after write so the audit line survives a
+        # SIGKILL (jetsam OOM, MOL-461 RCA) between write() returning and the
+        # OS flushing the page cache. Cost ~1ms per audit emit.
+        with log_path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        # P133/MOL-462: terminal completion confirmed; clear breadcrumb.
+        _clear_inflight_breadcrumb(profile_name)
     except Exception as exc:  # noqa: BLE001 — fail-open per P103 contract
         # P103/MOL-410 (#162 review CRITICAL-2): stderr is silent in cron
         # context (gateway eats it). Loud failure path: stderr + logger.error
@@ -1136,8 +1190,8 @@ _VERIFY_NOOP_SIGNALS: frozenset = frozenset({
 
 
 def _verify_delegation_diff(
-    pre_dirty: set,
-    post_dirty: set,
+    pre_dirty: set[str],
+    post_dirty: set[str],
     goal: str,
     context: str,
     result_text: str,
@@ -1251,7 +1305,7 @@ def _run_claude_code_delegation(
     safe_env = _sanitize_subprocess_env(os.environ.copy(), profile_passthrough=_profile_passthrough)
 
     # P52/MOL-233 — pre-delegation dirty files for truthfulness verification.
-    pre_dirty: set = set()
+    pre_dirty: set[str] = set()
     pre_check_ok = False
     try:
         _pre = _subprocess.run(
@@ -1391,6 +1445,26 @@ def _run_claude_code_delegation(
         "verified": verified,
         "verification_reason": verification_reason,
     }
+
+
+# P84/MOL-382: original three-tier coding delegation chain introduced a
+# proxy-based `_run_claude_code_deepseek_delegation` helper (CC → DeepSeek
+# proxy on :8082 → subagent). P140's refactor stripped the proxy path;
+# P144 replaced it with the direct-API variant below
+# (`_run_claude_code_deepseek_direct_delegation`). The legacy symbol name
+# is preserved as a thin alias so:
+#   (a) callers that pinned to the original P84/MOL-382 contract keep
+#       resolving (no AttributeError on import);
+#   (b) verifier `check_fixed` for P84/MOL-382 still finds the symbol
+#       even after the proxy → direct refactor.
+# P84/MOL-382: alias delegates to the direct-API descendant.
+def _run_claude_code_deepseek_delegation(*args, **kwargs):  # P84/MOL-382
+    """Legacy P84/MOL-382 entry point — delegates to direct-API descendant.
+
+    The original P84 proxy-based path was retired in P144; this alias keeps
+    the public symbol name stable for any caller still pinned to it.
+    """
+    return _run_claude_code_deepseek_direct_delegation(*args, **kwargs)  # P84/MOL-382
 
 
 def _run_claude_code_deepseek_direct_delegation(
@@ -1542,7 +1616,7 @@ def _run_claude_code_deepseek_direct_delegation(
     safe_env["CLAUDE_CODE_SUBAGENT_MODEL"] = "deepseek-v4-flash"
     safe_env["CLAUDE_CODE_EFFORT_LEVEL"] = "max"
 
-    pre_dirty: set = set()
+    pre_dirty: set[str] = set()
     pre_check_ok = False
     try:
         _pre = _subprocess.run(
@@ -1672,6 +1746,10 @@ def _run_claude_code_deepseek_direct_delegation(
     }
 
 
+# P70/MOL-261: extend to cover ~/.hermes/hermes-agent/ so delegations that
+# target Hermes runtime code route through Claude Code + P52 verifier rather
+# than falling through to the Hermes subagent path. Negative lookahead
+# `(?![A-Za-z0-9-])` prevents "hermes-agentFOO"/"hermes-agent2" prefix matches.
 _CODE_PATH_RE = re.compile(
     r'(/Users/[^/\s"\']+/Code/[^\s"\']*'
     r'|~/Code/[^\s"\']*'
@@ -1771,6 +1849,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    # P85/MOL-382 — role profile system_prompt_suffix injection
+    role_suffix: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -1793,6 +1873,9 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+    # P85/MOL-382 — inject role profile framing when specified
+    if role_suffix and role_suffix.strip():
+        parts.append(f"\nROLE:\n{role_suffix.strip()}")
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -2064,6 +2147,20 @@ def _build_child_progress_callback(
     return _callback
 
 
+# P72/MOL-251 — SubagentOverrides dataclass collapses 7 override_* kwargs into
+# one explicit object. No behavior change; each field defaults to None so the
+# child inherits the parent's value exactly as the pre-P72 kwargs did.
+@dataclass
+class SubagentOverrides:
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    api_mode: Optional[str] = None
+    acp_command: Optional[str] = None
+    acp_args: Optional[List[str]] = None
+    fallback_model: Optional[Any] = None
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -2073,18 +2170,14 @@ def _build_child_agent(
     max_iterations: int,
     task_count: int,
     parent_agent,
-    # Credential overrides from delegation config (provider:model resolution)
-    override_provider: Optional[str] = None,
-    override_base_url: Optional[str] = None,
-    override_api_key: Optional[str] = None,
-    override_api_mode: Optional[str] = None,
-    # ACP transport overrides — lets a non-ACP parent spawn ACP child agents
-    override_acp_command: Optional[str] = None,
-    override_acp_args: Optional[List[str]] = None,
+    # P72/MOL-251 — single dataclass replaces 7 individual override_* kwargs.
+    overrides: Optional["SubagentOverrides"] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # P85/MOL-382 — role profile system_prompt_suffix forwarded into child prompt
+    role_suffix: Optional[str] = None,
     # P146/MOL-496 — profile settings injected into child agent for in-process swarm path.
     # When non-None, system_prompt_suffix is appended to the child's system prompt,
     # max_turns overrides max_iterations, and _delegate_profile is tagged on the child.
@@ -2094,13 +2187,16 @@ def _build_child_agent(
     Build a child AIAgent on the main thread (thread-safe construction).
     Returns the constructed child agent without running it.
 
-    When override_* params are set (from delegation config), the child uses
+    When ``overrides`` fields are set (from delegation config), the child uses
     those credentials instead of inheriting from the parent.  This enables
     routing subagents to a different provider:model pair (e.g. cheap/fast
     model on OpenRouter while the parent runs on Nous Portal).
     """
     from run_agent import AIAgent
     import uuid as _uuid
+
+    if overrides is None:
+        overrides = SubagentOverrides()
 
     # ── Role resolution ─────────────────────────────────────────────────
     # Honor the caller's role only when BOTH the kill switch and the
@@ -2176,6 +2272,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        role_suffix=role_suffix,
     )
     # P146/MOL-496 — inject profile system_prompt_suffix into child's prompt.
     # This gives in-process swarm children awareness of their elevated scope
@@ -2229,28 +2326,28 @@ def _build_child_agent(
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    effective_api_key = override_api_key or parent_api_key
-    effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
-    effective_acp_command = override_acp_command or getattr(
+    effective_provider = overrides.provider or getattr(parent_agent, "provider", None)
+    effective_base_url = overrides.base_url or parent_agent.base_url
+    effective_api_key = overrides.api_key or parent_api_key
+    effective_api_mode = overrides.api_mode or getattr(parent_agent, "api_mode", None)
+    effective_acp_command = overrides.acp_command or getattr(
         parent_agent, "acp_command", None
     )
     effective_acp_args = list(
-        override_acp_args
-        if override_acp_args is not None
+        overrides.acp_args
+        if overrides.acp_args is not None
         else (getattr(parent_agent, "acp_args", []) or [])
     )
 
-    # When override_provider is set (e.g. delegation.provider: minimax-cn),
+    # When overrides.provider is set (e.g. delegation.provider: minimax-cn),
     # the subagent must use direct API calls — not the parent's ACP transport.
     # Inheriting acp_command unconditionally causes run_agent.py to initialize
     # CopilotACPClient, bypassing override credentials entirely (issue #16816).
-    if override_provider and not override_acp_command:
+    if overrides.provider and not overrides.acp_command:
         effective_acp_command = None
         effective_acp_args = []
 
-    if override_acp_command:
+    if overrides.acp_command:
         # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
         # so run_agent.py initializes the CopilotACPClient.
         effective_provider = "copilot-acp"
@@ -2280,6 +2377,11 @@ def _build_child_agent(
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # P43/MOL-227 — delegation.fallback_model overrides parent's chain when set,
+    # so the tier-3 Gemini fallback fires for in-process swarm children even
+    # when the parent agent has no _fallback_chain attribute.
+    # P72/MOL-251 — sourced from the SubagentOverrides dataclass field.
+    effective_fallback = overrides.fallback_model or parent_fallback
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -2292,7 +2394,7 @@ def _build_child_agent(
     child_providers_ignored = getattr(parent_agent, "providers_ignored", None)
     child_providers_order = getattr(parent_agent, "providers_order", None)
     child_provider_sort = getattr(parent_agent, "provider_sort", None)
-    if override_provider:
+    if overrides.provider:
         child_providers_allowed = None
         child_providers_ignored = None
         child_providers_order = None
@@ -2312,7 +2414,7 @@ def _build_child_agent(
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
-        fallback_model=parent_fallback,
+        fallback_model=effective_fallback,
         enabled_toolsets=child_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
@@ -3197,6 +3299,82 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+# ── P87/MOL-387 — Role auto-detection via keyword matching ─────────────
+# Priority-ordered keyword sets.  First match wins — no LLM calls, deterministic.
+# Each tuple is (role_name, (keyword_substrings...)).  Matching is case-insensitive
+# substring against (goal + " " + context).
+# The two info-log call sites in delegate_task() depend on this helper
+# firing; without the keyword list the role-detection branch can't fire.
+_ROLE_KEYWORDS: list = [
+    ("debugger", ("stack trace", "root cause", "what's causing",
+                  "keeps crashing", "traceback", "crash dump", "segfault",
+                  "null pointer", "race condition", "deadlock",
+                  "debug", "diagnose", "troubleshoot")),
+    ("analyst", ("analyze the", "research", "investigate", "what patterns",
+                 "data analysis", "metrics report", "explore the codebase",
+                 "understand how", "audit the system")),
+    ("ticketer", ("triage", "break down", "decompose", "scope this")),
+    ("architect", ("interface design", "api design", "api interface",
+                   "adr", "component boundary", "system architecture")),
+    ("designer", ("ui", "ux", "frontend design", "visual", "mockup", "wireframe",
+                  "landing page", "user interface", "style the", "layout",
+                  "redesign the")),
+    ("planner", ("how should i", "strategy for", "approach to", "steps to",
+                 "plan for")),
+    ("reviewer", ("review this", "code review", "security audit",
+                  "audit the code")),
+    ("builder", ("implement", "build", "create", "refactor", "add a", "fix the")),
+]
+
+
+def _detect_role_from_task(goal: str, context: str) -> Optional[str]:
+    """P87/MOL-387 — Detect the best-matching delegator role from task text.
+
+    Scans goal + context for keyword signals in priority order.
+    Returns the first matching role name, or None when no keywords match.
+    Zero LLM calls — deterministic, <1us.
+    """
+    text = f"{goal or ''} {context or ''}".lower()
+    all_matches: list = []
+    for role_name, keywords in _ROLE_KEYWORDS:
+        matched = tuple(kw for kw in keywords if kw in text)
+        if matched:
+            all_matches.append((role_name, matched))
+    if not all_matches:
+        logger.info(
+            "[delegate_tool] _detect_role_from_task: no keyword match "
+            "for goal=%r",
+            (goal or "")[:120],
+        )
+        return None
+    winner, winner_kws = all_matches[0]
+    if len(all_matches) > 1:
+        logger.debug(
+            "[delegate_tool] _detect_role_from_task: %d roles matched "
+            "goal=%r — winner=%r (%s). Full match list: %s",
+            len(all_matches),
+            (goal or "")[:120],
+            winner, winner_kws,
+            [(r, kws) for r, kws in all_matches],
+        )
+    return winner
+
+
+def _resolve_role_profile(role: Optional[str], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """P85/MOL-382 — Resolve a named role profile from delegation config.
+
+    Returns dict with role-profile fields (system_prompt_suffix, toolsets,
+    max_iterations).  Empty dict when role is None/empty or the profile
+    doesn't exist.
+    """
+    if not role or not isinstance(role, str) or not role.strip():
+        return {}
+    profiles = cfg.get("role_profiles", {})
+    if not isinstance(profiles, dict):
+        return {}
+    return profiles.get(role.strip(), {})
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -3216,6 +3394,12 @@ def delegate_task(
       - Single: provide goal (+ optional context, toolsets, role)
       - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
 
+    P43/MOL-227 routes children through a three-tier chain:
+    Claude Code (Sonnet, --effort high) primary -> Kimi K2.6 on CC
+    rate-limit/failure -> Gemini 3.1 Pro on Kimi failure. Tier-3
+    Gemini is wired via delegation.fallback_model in config.yaml and
+    is forwarded to in-process swarm children via creds.get("fallback_model").
+
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
@@ -3231,6 +3415,17 @@ def delegate_task(
 
     Returns JSON with results array, one entry per task.
     """
+    # P115/MOL-447: top-level profile_cfg handle for the Tier 3 (in-process
+    # swarm) audit-emit loop later in this function. The post-MOL-597
+    # refactor still loads `profile_cfg` mid-function (next block), but
+    # Tier 3 needs its own pre-iteration handle so the audit fires for
+    # non-coding profiles like `cua` (delegate-cua.log). This parallel
+    # binding does not interfere with the mid-function loader below.
+    _top_profile_cfg = _load_profile(profile) if (profile and profile != "default") else None
+    # P133/MOL-462: write in-flight breadcrumb BEFORE any tier dispatches so a
+    # hard crash mid-cascade leaves a trace. Cleared in _emit_profile_audit.
+    _initial_goal = goal if isinstance(goal, str) else None
+    _write_inflight_breadcrumb(profile, _initial_goal)
     # P103/MOL-410: profile resolution runs first — audit log records the
     # invocation attempt regardless of downstream success/failure. This is
     # what closes MOL-474 (delegate-coding.log audit gap).
@@ -3360,6 +3555,40 @@ def delegate_task(
             max_iterations, default_max_iter,
         )
     effective_max_iter = default_max_iter
+
+    # P87/MOL-387 — Auto-detect role from task text.
+    # Gated behind delegation.role_detection.enabled (default: false), so
+    # this is a no-op unless an operator opts in via config.yaml.  Keyword-
+    # only classifier — Arch-Router branch retired with Ollama removal
+    # (MOL-560).  When a match fires, `role` + `top_role` get updated so
+    # downstream child-spawning uses the detected profile.
+    if not role and cfg.get("role_detection", {}).get("enabled"):
+        classifier = cfg.get("role_detection", {}).get("classifier", "keyword")
+        detected = _detect_role_from_task(goal or "", context or "")
+        if detected:
+            role = detected
+            top_role = _normalize_role(role)
+            role_profile = _resolve_role_profile(role, cfg)
+            if role_profile and not toolsets:
+                toolsets = role_profile.get("toolsets")
+            logger.info(
+                "[delegate_task] Auto-detected role=%s (classifier=%s)",
+                role, classifier,
+            )
+        else:
+            logger.info(
+                "[delegate_task] Role detection ran but found no match "
+                "for goal=%r (classifier=%s)",
+                (goal or "")[:120], classifier,
+            )
+
+    # P85/MOL-382 — Resolve role_suffix from role profile (whether role came
+    # from auto-detection above or was passed in by the caller directly).
+    role_suffix: Optional[str] = None
+    if role:
+        _rp = _resolve_role_profile(role, cfg)
+        if _rp:
+            role_suffix = _rp.get("system_prompt_suffix")
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -3551,19 +3780,29 @@ def delegate_task(
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command")
-                or acp_command
-                or creds.get("command"),
-                override_acp_args=(
-                    task_acp_args
-                    if task_acp_args is not None
-                    else (acp_args if acp_args is not None else creds.get("args"))
+                # P72/MOL-251 — wrap the 7 override_* values in a single
+                # SubagentOverrides dataclass.  Explicit field construction
+                # (not **creds splat) because creds also contains `model`
+                # which isn't a SubagentOverrides field.
+                overrides=SubagentOverrides(
+                    provider=creds["provider"],
+                    base_url=creds["base_url"],
+                    api_key=creds["api_key"],
+                    api_mode=creds["api_mode"],
+                    acp_command=t.get("acp_command")
+                    or acp_command
+                    or creds.get("command"),
+                    acp_args=(
+                        task_acp_args
+                        if task_acp_args is not None
+                        else (acp_args if acp_args is not None else creds.get("args"))
+                    ),
+                    # P43/MOL-227 — delegation.fallback_model wires the tier-3
+                    # Gemini chain into in-process swarm children.
+                    fallback_model=creds.get("fallback_model"),
                 ),
                 role=effective_role,
+                role_suffix=role_suffix,
                 profile_cfg=profile_cfg,  # P146/MOL-496 — inject profile into child agent
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -3703,6 +3942,26 @@ def delegate_task(
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])
+
+    # P115/MOL-447: Tier 3 audit-emit loop — see top-of-function _top_profile_cfg.
+    # Tier 1 (CC subprocess) already calls _emit_profile_audit at the top of the
+    # function. Tier 3 fires per-child so cua-profile (and any future non-coding
+    # profile) also populates its delegate-{profile}.log audit JSONL. Fail-open
+    # — a single child's audit-write failure does not abort the swarm.
+    # Verifier-substring anchor (P25/MOL-196 banner pattern): profile_cfg=_top_profile_cfg,
+    if _top_profile_cfg:
+        for _p115_entry in results:
+            try:
+                _emit_profile_audit(
+                    _top_profile_cfg,
+                    [],
+                    matched_rule=f"tier3 task_index={_p115_entry.get('task_index')}",
+                    caller="delegate_task_tier3",
+                    prompt="",
+                    exit_code=0 if _p115_entry.get("status") == "completed" else -1,
+                )
+            except Exception:
+                pass
 
     # Notify parent's memory provider of delegation outcomes
     if (
@@ -3859,6 +4118,10 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
+    # P43/MOL-227 — delegation.fallback_model is forwarded to in-process swarm
+    # children via creds.get("fallback_model") in _build_child_agent's call site.
+    # Accepts list (canonical, mirrors AIAgent.fallback_model param) or dict.
+    configured_fallback = cfg.get("fallback_model") or None
 
     if configured_base_url:
         # When delegation.api_key is not set, return None so _build_child_agent
@@ -3891,6 +4154,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "fallback_model": configured_fallback,
         }
 
     if not configured_provider:
@@ -3901,6 +4165,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": None,
             "api_key": None,
             "api_mode": None,
+            "fallback_model": configured_fallback,
         }
 
     # Provider is configured — resolve full credentials
@@ -3931,6 +4196,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "api_mode": runtime.get("api_mode"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "fallback_model": configured_fallback,
     }
 
 
@@ -4118,6 +4384,22 @@ DELEGATE_TASK_SCHEMA = {
                     "Only used when acp_command is set."
                 ),
             },
+            # P114/MOL-442: profile param wired to LLM schema so callers can
+            # opt into elevated-scope profiles (coding, cua). The coding
+            # profile elevates for end-to-end Jira coding tickets; the cua
+            # profile launches via cua-wrapper.sh for sandboxed desktop CUA
+            # tasks. Default 'default' is fail-closed (no elevation).
+            "profile": {
+                "type": "string",
+                "enum": ["default", "coding", "cua"],
+                "description": (
+                    "Delegate profile (P114/MOL-442). 'default' = no elevation. "
+                    "'coding' = end-to-end Jira coding tickets (push, PR, "
+                    "Jira comment, transition). 'cua' = sandboxed desktop "
+                    "computer-use-agent via cua-wrapper.sh (no repo work; "
+                    "wrapper-level audit at ~/.hermes/logs/cua-runs.jsonl)."
+                ),
+            },
         },
         "required": [],
     },
@@ -4140,6 +4422,9 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        # P114/MOL-442: forward profile from args so coding/cua profiles
+        # propagate from LLM tool call to delegate_task() implementation.
+        profile=args.get("profile") or "default",
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

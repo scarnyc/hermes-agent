@@ -149,6 +149,13 @@ def is_managed() -> bool:
 
 def get_managed_update_command() -> Optional[str]:
     """Return the preferred upgrade command for a managed install."""
+    # P93/MOL-283: Block updates on patched trees.
+    # When the sentinel marker exists, return a no-op echo so that
+    # `recommended_update_command()` and any caller that reads the
+    # managed command won't silently fall through to `hermes update`.
+    _patched_marker = Path.home() / ".hermes" / ".patched-tree"
+    if _patched_marker.exists():
+        return "echo '✗ This Hermes installation has local patches — see MOL-283 for migration workflow'"
     managed_system = get_managed_system()
     if managed_system == "Homebrew":
         return "brew upgrade hermes-agent"
@@ -435,6 +442,15 @@ DEFAULT_CONFIG = {
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
         "gateway_timeout_warning": 900,
+        # P77/MOL-314: when the primary provider's _empty_content_retries
+        # exhausts (3 retries all returning no content / reasoning / tool
+        # calls) AND the P75 briefing-recovery branch returns None, activate
+        # the configured fallback chain (e.g. Kimi K2.6) instead of
+        # substituting the bare "(empty)" sentinel.  Catches non-briefing
+        # cron skills that don't pre-store via memory_observe.  Default
+        # True — empty completions are silent failures users see as
+        # "(empty)" deliveries; the cost of a fallback re-run is justified.
+        "fallback_on_empty_exhausted": True,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
@@ -678,8 +694,9 @@ DEFAULT_CONFIG = {
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
     },
 
-    # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
+    # P106/MOL-420: Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
+    # Manual port of upstream 7626f3702.
     "prompt_caching": {
         "cache_ttl": "5m",
     },
@@ -1002,6 +1019,13 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # P50/MOL-177 Phase 2 — tombstone supersession in the nightly
+        # consolidation job. Dry-run writes audit rows only (no mutation);
+        # flip to false after eyeballing 7 days of tombstone_audit output.
+        "consolidation": {
+            "tombstone_dry_run": True,
+            "tombstone_window_hours": 24,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -1013,6 +1037,10 @@ DEFAULT_CONFIG = {
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
+        # P43/MOL-227 — tier-3 fallback for the in-process swarm leg.
+        # Shape: {"provider": "openrouter", "model": "google/gemini-3.1-pro-preview"}.
+        # Empty dict = inherit parent's _fallback_chain (no tier-3 override).
+        "fallback_model": {},
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
@@ -1045,6 +1073,133 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        "coding": {
+            "enabled": False,
+            # P70/MOL-261: default roots that ship with every Hermes install.
+            # ~/.hermes/hermes-agent (Hermes runtime itself) is first-class so
+            # self-modifying delegations route through Claude Code + P52 verifier
+            # instead of falling through to the Hermes subagent path.
+            "allowed_write_roots": ["~/.hermes/hermes-agent"],
+            "max_iterations": 100,
+            # P84/MOL-382 — Tier 1: Claude Code (paid subscription).
+            # Model was hardcoded to "sonnet" before P84; now configurable.
+            # Use short aliases (sonnet/opus/haiku) — see PATCHES.md for proxy mapping.
+            "model": "sonnet",
+            "effort": "high",  # low/medium/high for Sonnet; xhigh/max are Opus-only
+            # P84/MOL-382 — Tier 2: free-claude-code + DeepSeek V4 proxy.
+            # Proxy maps: sonnet→deepseek-v4-flash, opus→deepseek-v4-pro.
+            # Set enabled:false to skip this tier entirely.
+            "fallback_deepseek": {
+                "enabled": True,
+                "proxy_url": "http://127.0.0.1:8082",
+                "proxy_start_script": "~/.claude/scripts/cc-deepseek.sh",
+                "model": "deepseek/deepseek-v4-pro",
+            },
+            # P84/MOL-382 — Tier 3: Fallback subagent (configurable provider/model).
+            # Default: OpenRouter Kimi K2.6 (no K2.6→K2.5 regression from direct Moonshot).
+            # For cost savings, switch to provider:"kimi-coding" + model:"kimi-for-coding".
+            "fallback_kimi": {
+                "enabled": True,
+                "provider": "openrouter",
+                "model": "moonshotai/kimi-k2.6",
+            },
+        },
+        # P85/MOL-382 — Agentic coding role profiles.
+        # Each role maps a name to a system_prompt_suffix injected into the child
+        # agent's system prompt, plus toolset and max_iterations overrides.
+        # Explicit args on delegate_task() always win over role defaults.
+        "role_profiles": {
+            "analyst": {
+                "description": "Researches, investigates patterns, and surfaces insights from code, data, and docs",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 80,
+                "system_prompt_suffix": (
+                    "You are an analyst. Research, investigate patterns, and surface "
+                    "insights from code, logs, data, and documentation. Your output: "
+                    "findings with evidence, patterns identified, and actionable "
+                    "recommendations. Do NOT implement code or plan implementation — "
+                    "your role is investigation and understanding."
+                ),
+            },
+            "ticketer": {
+                "description": "Triages, categorizes, and scopes tickets into discrete subtasks",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 40,
+                "system_prompt_suffix": (
+                    "You are a ticket manager. Your role is to triage, categorize, and scope "
+                    "Jira tickets. Break complex tickets into discrete, actionable subtasks. "
+                    "Never implement code — your output is task decomposition and scope analysis."
+                ),
+            },
+            "planner": {
+                "description": "Designs implementation strategies with step-by-step plans",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 60,
+                "system_prompt_suffix": (
+                    "You are a planner. Design implementation strategies with step-by-step "
+                    "plans, file paths, architecture decisions, and dependency ordering. "
+                    "Never write implementation code — your output is a plan document."
+                ),
+            },
+            "architect": {
+                "description": "Evaluates trade-offs, designs interfaces and component boundaries",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 80,
+                "system_prompt_suffix": (
+                    "You are a software architect. Evaluate trade-offs, design interfaces, "
+                    "and define component boundaries. Produce architecture decision records. "
+                    "Write interface/stub code only — never full implementations."
+                ),
+            },
+            "designer": {
+                "description": "Designs user interfaces, visual layouts, and interaction patterns",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 80,
+                "system_prompt_suffix": (
+                    "You are a UI/UX designer. Design user interfaces, visual layouts, "
+                    "and interaction patterns. Your output: design specifications, "
+                    "component layouts, style guidelines, and user flow diagrams. "
+                    "Write HTML/CSS prototypes and design mockups — never production "
+                    "backend code."
+                ),
+            },
+            "debugger": {
+                "description": "Diagnoses and root-causes issues with reproduction steps",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 100,
+                "system_prompt_suffix": (
+                    "You are a debugger. Diagnose and root-cause issues using terminal tools "
+                    "to reproduce, trace, and isolate bugs. Output: root cause analysis with "
+                    "reproduction steps and a fix recommendation. Do NOT implement fixes — "
+                    "your job is to find and explain the root cause."
+                ),
+            },
+            "builder": {
+                "description": "Implements code changes per the plan with tests",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 120,
+                "system_prompt_suffix": (
+                    "You are a builder. Implement code changes per the plan. Write clean, "
+                    "tested, working code. Follow the architect's interfaces and the "
+                    "planner's step sequence. Your output is working code with tests."
+                ),
+            },
+            "reviewer": {
+                "description": "Reviews implementations for correctness, security, and quality",
+                "toolsets": ["terminal", "file", "web"],
+                "max_iterations": 80,
+                "system_prompt_suffix": (
+                    "You are a code reviewer. Review implementations for correctness, "
+                    "security, performance, and code quality. Never modify code — your "
+                    "output is a structured review with findings, severity ratings, "
+                    "and specific fix suggestions."
+                ),
+            },
+        },
+        "role_detection": {
+            "enabled": False,
+            "classifier": "keyword",
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -1274,6 +1429,16 @@ DEFAULT_CONFIG = {
         "max_parallel_jobs": None,
     },
 
+    # P79 / MOL-215 — session maintenance (diary → revise-context → remember chain).
+    # See plugins/session-maintenance/__init__.py + scripts/session_maintenance_sweep.py.
+    # auto_mode=True skips per-step approval inside the chain (auto-mode user
+    # rule, see feedback_stop_chain_auto_no_approval.md).  enabled=False
+    # disables the plugin's marker-write entirely (chain never runs).
+    "session_maintenance": {
+        "enabled": True,
+        "auto_mode": False,
+    },
+
     # Kanban multi-agent coordination — controls the dispatcher loop that
     # spawns workers for ready tasks. The dispatcher ticks every N seconds
     # (default 60), reclaims stale claims, promotes dependency-satisfied
@@ -1401,6 +1566,15 @@ DEFAULT_CONFIG = {
 
     # MCP servers — top-level key so save_config() preserves it on round-trip.
     "mcp_servers": {},
+
+    # P56/MOL-246 — evening enrichment (daily-task-list peer cron at 21:00 ET).
+    # auto_apply defaults false; the orchestrator stays in --dry-run mode until a
+    # follow-up ticket observes N clean nights and flips the switch.  See
+    # ~/.hermes/scripts/evening_enrichment.py.
+    "enrichment": {
+        "auto_apply": False,
+        "dedup_window_days": 14,
+    },
 
     # Config schema version - bump this when adding new required fields
     "_config_version": 23,
@@ -3876,7 +4050,10 @@ def _normalize_root_model_keys(config: Dict[str, Any]) -> Dict[str, Any]:
     After migration the root-level keys are removed so they can't cause
     confusion on subsequent loads.
     """
-    # Only act if there are root-level keys to migrate
+    # P108/MOL-423: `context_length` is migrated alongside `provider` + `base_url`
+    # so users who write `context_length: 65536` at the YAML root (instead of under
+    # the `model:` section) don't have it silently ignored. Mirrors the upstream
+    # 0dd373ec4 fix; the migration tuple is the canonical anchor.
     has_root = any(config.get(k) for k in ("provider", "base_url", "context_length"))
     if not has_root:
         return config

@@ -6030,7 +6030,7 @@ Code review of the P87/P89 implementation surfaced four additional findings afte
 
 ---
 
-## P90 / MOL-376 — Autonomous Skill Patcher
+## P90 / MOL-376 — Autonomous Skill Patcher — **DROPPED 2026-05-20 by MOL-665 — feature retired by upstream MOL-597 modular refactor**
 
 **Status:** Applied 2026-05-03
 **Scope:** `tools/skill_patcher.py` (new), `cron/scheduler.py` (hook point), workspace docs
@@ -12501,3 +12501,71 @@ Note: Gemma 4 models were already listed in `agent/models_dev.py` and context le
 
 ### Verification
 - `pytest tests/hermes_cli/test_goals.py tests/run_agent/test_run_agent.py` — 359 passed
+
+---
+
+## P219 / MOL-623 — distill-goal skill + helper (Phase 3 AC-11)
+
+Phase 3 of MOL-623 (symphony three-agent loop). Adds `~/.hermes/skills/software-development/distill-goal/SKILL.md` and the `~/.hermes/scripts/distill_goal.py` helper that produces `goals/<ticket>/GOAL.md` from `RAW_INTENT.md`. SKILL.md pins `judge_role: goal_judge`. Helper signature: `distill(ticket, goal_dir)`. Atomic write via `_atomic_write(path, content)`.
+
+---
+
+## P220 / MOL-623 — raw_intent.py module (Phase 3 AC-10)
+
+`~/.hermes/scripts/raw_intent.py` — Phase 3 raw-intent stager. Public entry `stage_raw_intent(...)`, SHA helper `compute_body_plus_ac_sha(raw_text)`. cycle≥2 frozen branch + drift detection ("RAW_INTENT.md drift detected"). Sources: jira (via `jira issue view <ticket> --plain`), telegram, inline.
+
+---
+
+## P221 / MOL-623 — symphony_loop.py orchestrator (Phase 4 AC-9+AC-14+AC-15)
+
+`~/.hermes/scripts/symphony_loop.py` — three-agent loop orchestrator. Entry `run_loop(...)`. Verdicts: ALL_PASS, BUDGET_EXHAUSTED, MAX_CYCLES, GOAL_JUDGE_TURN_BUDGET, GOAL_AMBIGUITY. GOAL_AMBIGUITY sentinel "VERDICT: GOAL_AMBIGUITY". cycle==1 gate freezes GOAL.md after first distill. Fingerprint emitter `_log_fingerprint(...)` → `symphony-fingerprint.jsonl`. Imports: `stage_raw_intent`, `distill`, `run_builder`, clawpatch wrapper. ALL_PASS compound predicate checks `clawpatch_severity != CLAWPATCH_CRITICAL`.
+
+---
+
+## P222 / MOL-623 — raw_intent_coverage_check.py (Phase 4 AC-12)
+
+`~/.hermes/scripts/raw_intent_coverage_check.py` — drift detector with `check_coverage(raw_path, goal_path)`. ASPIRATIONAL_BLOCKLIST set rejects "comprehensive", "leverage", etc. `_light_stem(word)` stemmer + verbose `_IDENTIFIER_RE`. Drift kinds: count_mismatch, token_drop, aspirational_drift, schema_violation, double_mapping. Exit code 3 on drift. Audit log `raw-intent-coverage.jsonl`. CLI requires `--goal-dir`.
+
+---
+
+## P223 / MOL-623 — tests/test_raw_intent_coverage_check.py + _light_stem Step 1b (Phase 4 AC-13)
+
+`tests/test_raw_intent_coverage_check.py` covers clean-pair, aspirational-drift, identifier-drift, light_stem canonical forms, and CLI exit-3 contract. Uses `pytestmark = pytest.mark.skipif` for runtime-availability gate. Also extends `_light_stem` with Step 1b post-rule: doubled-consonant collapse after `-ed`/`-ing` for the consonant set `bdfgmnprt`.
+
+---
+
+## P224 / MOL-623 — tests/test_builder_write_scope.py (Phase 4 AC-16)
+
+`tests/test_builder_write_scope.py` enforces the symphony_builder write-scope invariants: LOG_FILE lands under `~/.hermes/logs/`, BUILDER_TOOLSETS match the declared allowlist (no memory/execute_code/subagent elevation surfaces), system prompt pins the no-runtime-write clause, source has no chdir/write under runtime, behavioral mtime snapshot, cwd restoration on failure path.
+
+---
+
+## P226 / MOL-623 — anthropic-direct api_mode + deepseek bracket-strip (Gap 4+5 post-ship hardening)
+
+`hermes_cli/runtime_provider.py` Gap 4 — dispatch `api.anthropic.com` URLs to `anthropic_messages` api_mode. Docstring carries the `P226/MOL-623 — Gap 4 fix` attribution. Branch wired in `_detect_api_mode_for_url`: `if hostname == "api.anthropic.com": return "anthropic_messages"`.
+
+`hermes_cli/model_normalize.py` Gap 5 — strip Hermes context-length bracket suffix before the canonical-models check in `_normalize_for_deepseek`. Carries `P226/MOL-623 — Gap 5 fix` attribution. Implementation: `bare = re.sub(r"\[[^\]]*\]$", "", bare)`. Reference diff at `scripts/hermes-patches/reference/P226-MOL-623-anthropic-api-mode-and-deepseek-bracket-strip.diff`.
+
+---
+
+## P225 / MOL-623 — symphony_bridge.py use_three_agent_loop gate (Phase 4 AC-17)
+
+`~/.hermes/scripts/symphony_bridge.py` — adds `_three_agent_loop_gate(...)` (config-read + tri-state return: True/"shadow"/False) and `_dispatch_three_agent_loop(...)` (verdict→RunResult mapping). Reads `role_routing.use_three_agent_loop`. Fails closed to legacy (False) on config-load exception (`routing_gate_unreadable` telemetry breadcrumb). Unrecognized values get `routing_gate_unrecognized` breadcrumb. Shadow literal recognized case-insensitively (`raw.lower() == "shadow"`). Per-tick gate read inside dispatch (`if _gate is True:`). Emits `routing_decision` telemetry event. Lazy import `from symphony_loop import run_loop` (no module-top coupling). Reference diff + tests at `scripts/hermes-patches/reference/P225-symphony-bridge-three-agent-loop-gate.diff` and `tests/test_three_agent_loop_gate.py`.
+
+---
+
+## P232 / MOL-599 — jira-cli --plain indent tolerance (parser+writer atomic fix)
+
+`distill_goal.py` four sites: `_AC_HEADING_RE`, `_OUT_OF_SCOPE_RE`, `_NEXT_H2_RE`, `_extract_body` — all get `^\s*` prefix tolerance for two-space indent that jira-cli `--plain` output emits. `raw_intent.py` three sites: `_AC_HEADING_RE`, `_NEXT_H2_RE`, `_TITLE_H1_RE` — same `^\s*` prefix tolerance. `_extract_body` H2 break check uses `line.lstrip().startswith("## ")`. Failing-test fixture `tests/test_distill_goal_indent.py` committed BEFORE the fix per systematic-debugging skill: `test_ac_heading_re_tolerates_two_space_indent`, `test_extract_body_returns_nonempty_against_indented_h1`, `test_extract_body_plus_ac_yields_nonempty_ac_slice`. Marker form: inline `MOL-599 P232:` banner in both touched files.
+
+---
+
+## P233 / MOL-599 — _AC_LINE_RE bare-checkbox AC item form tolerance
+
+`distill_goal.py` `_AC_LINE_RE` extended to recognize GitHub-style bare `[ ]`/`[x]`/`[X]` checkbox items in addition to numbered/bullet AC formats. Regex alternative `\s*\[[ xX]\]\s+` added. Tests: `test_ac_line_re_counts_bare_checkbox_items` + end-to-end `test_distill_against_mol599_fixture_produces_goal_md`. Marker form: inline `MOL-599 P233:` banner. Reference diff at `scripts/hermes-patches/reference/P233-MOL-599-ac-line-checkbox-tolerance.diff`.
+
+---
+
+## P234 / MOL-599 — _transition_jira target name matches MOL workflow
+
+`symphony_loop.py` `_transition_jira` target hardcode corrected from `"In Testing"` to `"Testing"` to match the actual MOL Jira workflow name. Paired deletion-class assertion (P151/MOL-502 pattern): stale `target = "In Testing"` must NOT reappear. Marker form: inline `MOL-599 P234:` banner. Reference diff at `scripts/hermes-patches/reference/P234-MOL-599-jira-transition-target-name.diff`.

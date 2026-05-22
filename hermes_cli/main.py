@@ -85,6 +85,126 @@ def _add_accept_hooks_flag(parser) -> None:
     )
 
 
+# === P80 / MOL-266: envchain re-exec for LLM-bearing CLI ===
+# Bootstraps envchain-injected secrets (OPENROUTER_API_KEY, JIRA, etc.) for
+# `hermes chat -q` style CLI invocations that bypass the launchd
+# envchain-wrapper.sh path. Recursion-guarded via HERMES_ENVCHAIN_REEXEC.
+# Scoped to model.provider == "openrouter" — Anthropic/OpenAI-direct users
+# with API keys already in env are unaffected.
+
+_LLM_BEARING_SUBCOMMANDS = frozenset({"chat"})
+_ENVCHAIN_BIN_DEFAULT = "/opt/homebrew/bin/envchain"
+
+
+def _detect_subcommand(argv):
+    for token in argv[1:]:
+        if not token.startswith("-"):
+            return token
+    return None
+
+
+def _envchain_bin_path():
+    found = shutil.which("envchain")
+    if found:
+        return found
+    if os.path.exists(_ENVCHAIN_BIN_DEFAULT):
+        return _ENVCHAIN_BIN_DEFAULT
+    return None
+
+
+def _bootstrap_log(msg):
+    try:
+        log_dir = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "agent.log", "a", encoding="utf-8") as f:
+            f.write(f"P80/MOL-266: {msg}\n")
+    except Exception:
+        pass
+
+
+def _envchain_namespace_has_key(namespace, key):
+    bin_path = _envchain_bin_path()
+    if not bin_path:
+        return False
+    try:
+        result = subprocess.run(
+            [bin_path, namespace, "printenv", key],
+            capture_output=True, timeout=10, text=True,
+        )
+        return result.returncode == 0 and result.stdout.strip() != ""
+    except subprocess.TimeoutExpired:
+        _bootstrap_log(f"envchain probe timeout: {namespace}/{key}")
+        return False
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        _bootstrap_log(f"envchain probe error ({type(e).__name__}): {namespace}/{key}")
+        return False
+
+
+def _read_primary_provider():
+    try:
+        import yaml
+        cfg_path = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")) / "config.yaml"
+        if not cfg_path.exists():
+            return None
+        with open(cfg_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        model = data.get("model") or {}
+        if isinstance(model, dict):
+            return model.get("provider") or None
+        return None
+    except Exception as e:
+        print(f"P80/MOL-266 config parse warning: {e}", file=sys.stderr)
+        return None
+
+
+def _envchain_reexec_if_needed():
+    subcmd = _detect_subcommand(sys.argv)
+    if subcmd not in _LLM_BEARING_SUBCOMMANDS:
+        return
+    if os.environ.get("HERMES_ENVCHAIN_REEXEC"):
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            print(
+                "P80/MOL-266: envchain re-exec ran but OPENROUTER_API_KEY is "
+                "still missing — Keychain locked, TCC denied, or namespace "
+                "lacks the key. Falling through to existing auth path.",
+                file=sys.stderr,
+            )
+        return
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return
+    provider = _read_primary_provider()
+    if provider != "openrouter":
+        return
+    bin_path = _envchain_bin_path()
+    if not bin_path:
+        print(
+            "P80/MOL-266: envchain not found in PATH and not at "
+            f"{_ENVCHAIN_BIN_DEFAULT}. Install via `brew install envchain`.",
+            file=sys.stderr,
+        )
+        return
+    if not _envchain_namespace_has_key("hermes-llm", "OPENROUTER_API_KEY"):
+        print(
+            "P80/MOL-266: envchain namespace hermes-llm lacks OPENROUTER_API_KEY. "
+            "Provision via `envchain --set hermes-llm OPENROUTER_API_KEY`.",
+            file=sys.stderr,
+        )
+        return
+    new_argv = [bin_path, "hermes-llm", bin_path, "hermes-jira"] + list(sys.argv)
+    _bootstrap_log(f"reexec: {bin_path} hermes-llm envchain hermes-jira ({len(new_argv)} tokens)")
+    dry_run_path = os.environ.get("HERMES_REEXEC_DRY_RUN")
+    if dry_run_path:
+        try:
+            with open(dry_run_path, "w", encoding="utf-8") as f:
+                json.dump(new_argv, f)
+        except Exception as e:
+            print(f"P80/MOL-266 dry-run write failed: {e}", file=sys.stderr)
+        return
+    os.environ["HERMES_ENVCHAIN_REEXEC"] = "1"
+    os.execvp(bin_path, new_argv)
+# === END P80 / MOL-266 ===
+
+
 def _require_tty(command_name: str) -> None:
     """Exit with a clear error if stdin is not a terminal.
 
@@ -209,6 +329,9 @@ load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 # the setup_logging() call below imports agent.redact, which reads the env var
 # exactly once. Env var in .env still wins — this is config.yaml fallback only.
 try:
+    # P124/MOL-455: HERMES_HOME-aware config read (profile-aware bootstrap).
+    # get_hermes_home() resolves HERMES_HOME env var → ~/.hermes/<profile>/ so
+    # `hermes -p artemis` reads the artemis profile config, not global.
     if "HERMES_REDACT_SECRETS" not in os.environ:
         import yaml as _yaml_early
 
@@ -224,6 +347,44 @@ try:
         del _cfg_path
 except Exception:
     pass  # best-effort — redaction stays at default (enabled) on config errors
+
+# P128/MOL-455 — None-vs-other-provider distinction breadcrumb.
+# Three None paths (cfg-missing, yaml-import-missing, parse error) used to
+# silently fall through the bootstrap gate, collapsing into the same skip
+# behavior as "primary is explicitly something other than openrouter". When
+# a user later hits a 401 from a missing API key, there's no trail back to
+# "bootstrap was skipped because we couldn't read the primary provider".
+# Emit an audit breadcrumb so the unknown-primary path stays distinguishable
+# in ~/.hermes/logs/bootstrap.log from the explicit-non-openrouter path.
+try:
+    def _bootstrap_log(event: str) -> None:
+        try:
+            from datetime import datetime as _bp_dt  # lazy: top-of-module datetime import lives at L293
+            _bp_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+            _bp_dir = Path(_bp_home) / "logs"
+            _bp_dir.mkdir(parents=True, exist_ok=True)
+            with open(_bp_dir / "bootstrap.log", "a", encoding="utf-8") as _bp_f:
+                _bp_f.write(f"{_bp_dt.utcnow().isoformat()}Z {event}\n")
+        except Exception:
+            pass
+
+    _primary = None
+    try:
+        import yaml as _yaml_p128
+        _p128_cfg = get_hermes_home() / "config.yaml"
+        if _p128_cfg.exists():
+            with open(_p128_cfg, encoding="utf-8") as _p128_f:
+                _p128_data = _yaml_p128.safe_load(_p128_f) or {}
+            _p128_model = _p128_data.get("model") or {}
+            if isinstance(_p128_model, dict):
+                _primary = (_p128_model.get("provider") or None)
+        del _p128_cfg
+    except Exception:
+        _primary = None
+    if _primary is None:
+        _bootstrap_log("primary_unknown_bootstrap_skipped")
+except Exception:
+    pass
 
 # Initialize centralized file logging early — all `hermes` subcommands
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
@@ -7072,6 +7233,24 @@ def cmd_update(args):
         managed_error("update Hermes Agent")
         return
 
+    # P93/MOL-283: Block updates on patched trees.
+    # `hermes update` (git pull --ff-only + pip install) and the ZIP-based
+    # fallback both discard uncommitted local patches.  Detect the sentinel
+    # marker that is created when patches are first applied and refuse to
+    # proceed until the operator explicitly removes it.
+    _patched_marker = PROJECT_ROOT.parent / ".patched-tree"
+    if _patched_marker.exists():
+        print("✗ This Hermes installation has local patches applied (P03–P86+).")
+        print("  `hermes update` is destructive — it will discard all patches.")
+        print()
+        print("  To upgrade safely, follow the MOL-283 migration workflow:")
+        print("    https://deep-agent-one.atlassian.net/browse/MOL-283")
+        print()
+        print("  If you are SURE you want to discard all local patches:")
+        print(f"    rm {_patched_marker}")
+        print("    hermes update")
+        sys.exit(1)
+
     if getattr(args, "check", False):
         _cmd_update_check()
         return
@@ -8917,6 +9096,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 # need to); extra entries would make us skip a real positional.
 _TOP_LEVEL_VALUE_FLAGS = frozenset(
     {
+        # P104/MOL-420 — -z/--oneshot single-shot mode (manual port of upstream 7c8c031f6).
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
@@ -8990,6 +9170,8 @@ def _plugin_cli_discovery_needed() -> bool:
 
 def main():
     """Main entry point for hermes CLI."""
+    # P80 / MOL-266: bootstrap envchain credentials before parser/heavy imports.
+    _envchain_reexec_if_needed()
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:
         from hermes_cli.stdio import configure_windows_stdio
@@ -11226,6 +11408,40 @@ Examples:
     completion_parser.set_defaults(func=lambda args: cmd_completion(args, parser))
 
     # =========================================================================
+    # models-stats command (P111/MOL-428)
+    # =========================================================================
+    # Per-model token/cost/session analytics from the local SessionDB.
+    # CLI surface replaces the upstream /api/analytics/models FastAPI
+    # endpoint since v0.8.0 ships no web frontend.  P111/MOL-428 manual
+    # port from upstream e6b05eaf6 + 113239f6e.
+    models_stats_parser = subparsers.add_parser(
+        "models-stats",
+        help="Per-model token + cost analytics from the local SessionDB",
+        description=(
+            "Roll up tokens, sessions, cost, tool calls per model over the "
+            "last N days.  Reads ~/.hermes/state.db (no network)."
+        ),
+    )
+    models_stats_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Look-back window in days (default 30)",
+    )
+    models_stats_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit raw JSON instead of the text table",
+    )
+
+    def _dispatch_models_stats(args):
+        from hermes_cli.models_stats import cmd_models_stats
+
+        return cmd_models_stats(args)
+
+    models_stats_parser.set_defaults(func=_dispatch_models_stats)
+
+    # =========================================================================
     # dashboard command
     # =========================================================================
     dashboard_parser = subparsers.add_parser(
@@ -11455,7 +11671,7 @@ Examples:
                 exc_info=True,
             )
 
-    # Handle top-level --oneshot / -z: single-shot mode, stdout = final
+    # P104/MOL-420: Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.
     if getattr(args, "oneshot", None):
         from hermes_cli.oneshot import run_oneshot

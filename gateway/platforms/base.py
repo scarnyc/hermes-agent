@@ -3122,6 +3122,8 @@ class BasePlatformAdapter(ABC):
                 if _active is not None:
                     _active.clear()
                 await _stop_typing_task()
+                # P97/MOL-405: in-band pending-message drain via fresh task
+                # (manual port of upstream 663ba9a58).
                 # Spawn a fresh task for the pending message instead of
                 # recursing.  Issue #17758: `await
                 # self._process_message_background(...)` here grew the

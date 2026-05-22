@@ -289,9 +289,10 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "gemini": "gemini-3.1-pro-preview",
     "zai": "glm-4.5-flash",
-    "kimi-coding": "kimi-k2-turbo-preview",
+    "kimi-coding": "kimi-k2.6",
     "stepfun": "step-3.5-flash",
-    "kimi-coding-cn": "kimi-k2-turbo-preview",
+    "kimi-coding-cn": "kimi-k2.6",
+    "deepseek": "deepseek-v4-pro",  # P118/MOL-455
     "gmi": "google/gemini-3.1-flash-lite-preview",
     "minimax": "MiniMax-M2.7",
     "minimax-oauth": "MiniMax-M2.7-highspeed",
@@ -1781,7 +1782,32 @@ _AUTO_PROVIDER_LABELS = {
     "_try_nous": "nous",
     "_try_custom_endpoint": "local/custom",
     "_resolve_api_key_provider": "api-key",
+    "_try_ollama": "ollama",  # P46/MOL-245
 }
+
+
+def _try_ollama() -> Tuple[Optional[OpenAI], Optional[str]]:
+    """P46/MOL-245: local Ollama as last-resort aux fallback.
+
+    Targets ``localhost:11434`` using ``qwen3:8b`` by default. Overridable
+    via ``OLLAMA_BASE_URL`` and ``AUXILIARY_OLLAMA_MODEL``. When every
+    aggregator/API-key provider is unavailable, the local model summarizes
+    session_search and other aux tasks so the agent loop doesn't starve.
+    """
+    ollama_base = (os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434/v1").strip()
+    ollama_model = (os.getenv("AUXILIARY_OLLAMA_MODEL") or "qwen3:8b").strip()
+    if not ollama_base or not ollama_model:
+        return None, None
+    try:
+        client = OpenAI(
+            api_key="ollama",
+            base_url=ollama_base,
+            timeout=30.0,
+        )
+        return client, ollama_model
+    except Exception as exc:
+        logger.debug("Auxiliary: could not construct Ollama client: %s", exc)
+        return None, None
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode")
 
@@ -1819,6 +1845,9 @@ def _get_provider_chain() -> List[tuple]:
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
+        # P46/MOL-245: local Ollama as last-resort so aux tasks survive
+        # full-cloud-provider outage.
+        ("ollama", _try_ollama),
     ]
 
 
@@ -2842,7 +2871,12 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     )
 
 
+# P129/MOL-460 — Vision text-only provider denylist (DeepSeek V4 is text-only;
+# its /anthropic endpoint rejects image content blocks with HTTP 400).
+_VISION_TEXT_ONLY_PROVIDERS = frozenset({"deepseek"})
+
 _VISION_AUTO_PROVIDER_ORDER = (
+    "kimi-coding",  # P129/MOL-460 — Kimi K2.6 native multimodal
     "openrouter",
     "nous",
 )
@@ -2859,6 +2893,8 @@ def _resolve_strict_vision_backend(
     provider = _normalize_vision_provider(provider)
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
+    if provider == "kimi-coding":  # P129/MOL-460 — Kimi K2.6 vision via Kimi Platform
+        return _try_kimi_direct()
     if provider == "openrouter":
         return _try_openrouter()
     if provider == "nous":
@@ -2890,7 +2926,14 @@ def get_available_vision_backends() -> List[str]:
     # 1. Active provider — if the user configured a provider, try it first.
     main_provider = _read_main_provider()
     if main_provider and main_provider not in ("auto", ""):
-        if main_provider in _VISION_AUTO_PROVIDER_ORDER:
+        # P129/MOL-460 — skip text-only primaries (DeepSeek) so the fallback
+        # chain owns vision routing instead of attempting a 400-guaranteed call.
+        if main_provider in _VISION_TEXT_ONLY_PROVIDERS:
+            logger.debug(
+                "P129/MOL-460 vision skip: main provider %s is text-only",
+                main_provider,
+            )
+        elif main_provider in _VISION_AUTO_PROVIDER_ORDER:
             if _strict_vision_backend_available(main_provider):
                 available.append(main_provider)
         else:
@@ -2963,6 +3006,15 @@ def resolve_vision_provider_client(
         #   4. Stop
         main_provider = _read_main_provider()
         main_model = _read_main_model()
+        # P129/MOL-460 — text-only primaries (DeepSeek) cannot serve vision;
+        # skip directly to aggregator chain rather than burning a 400 call.
+        if main_provider in _VISION_TEXT_ONLY_PROVIDERS:
+            logger.debug(
+                "P129/MOL-460 vision auto-detect: main provider %s is "
+                "text-only — falling through to aggregator chain",
+                main_provider,
+            )
+            main_provider = ""
         if main_provider and main_provider not in ("auto", ""):
             vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
             if main_provider == "nous":
@@ -4046,6 +4098,39 @@ def extract_content_or_reasoning(response) -> str:
     """
     import re
 
+    # P44/MOL-254 guard — defensive for malformed LLM responses. OpenRouter
+    # (and some upstreams) occasionally return HTTP 200 with an error body
+    # that lacks `choices`, or sends `choices` as a non-standard shape
+    # (dict-list from an error payload, string, etc.). Without this guard,
+    # the old behavior was a `'NoneType' object is not subscriptable` (when
+    # choices=None) or an `AttributeError` on `.message` (when choices is a
+    # dict-list) that propagated up through session_search and left the
+    # comprehensive-update briefing empty. The full shape check — not just
+    # a None-check — is necessary because the silent-failure-hunter review
+    # of MOL-254 verified that `not getattr(response, "choices", None)` alone
+    # passes for `choices=[{"error": "..."}]` and then crashes downstream.
+    choices = getattr(response, "choices", None) if response is not None else None
+    if (
+        response is None
+        or not isinstance(choices, list)
+        or not choices
+        or not hasattr(choices[0], "message")
+    ):
+        if response is None:
+            shape = "None response"
+        elif not isinstance(choices, list):
+            shape = f"choices is {type(choices).__name__}, not list"
+        elif not choices:
+            shape = "choices is empty list"
+        else:
+            shape = f"choices[0] has no .message (type={type(choices[0]).__name__})"
+        logger.warning(
+            "extract_content_or_reasoning: malformed response — %s. "
+            "Returning empty string (caller will retry or surface silently).",
+            shape,
+        )
+        return ""
+
     msg = response.choices[0].message
     content = (msg.content or "").strip()
 
@@ -4247,6 +4332,36 @@ async def async_call_llm(
                     raise
                 first_err = retry_err
 
+        # P130/MOL-460 — Kimi K2.6 with thinking-mode rejects caller-set
+        # temperature with "invalid temperature: only 1 is allowed for this
+        # model". Mirror the max_tokens retry shape: set temperature=1.0 and
+        # retry once. Provider-gated to kimi-coding so the substring match
+        # doesn't silently transform requests for other providers.
+        err_str = str(first_err)
+        if resolved_provider == "kimi-coding" and (
+            "invalid temperature" in err_str or "only 1 is allowed" in err_str
+        ):
+            logger.info(
+                "Auxiliary %s: kimi-coding rejected temperature, retrying with temperature=1.0",
+                task or "call",
+            )
+            kwargs["temperature"] = 1.0
+            try:
+                response = await client.chat.completions.create(**kwargs)
+                logger.info(
+                    "Auxiliary %s: kimi-coding temperature=1.0 retry succeeded",
+                    task or "call",
+                )
+                return _validate_llm_response(response, task)
+            except Exception as retry_err:
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
+                    logger.warning(
+                        "Auxiliary %s: kimi-coding temperature=1.0 retry failed with non-fallback error: %s",
+                        task or "call", retry_err,
+                    )
+                    raise
+                first_err = retry_err
+
         # ── Nous auth refresh parity with main agent ──────────────────
         client_is_nous = (
             resolved_provider == "nous"
@@ -4312,37 +4427,71 @@ async def async_call_llm(
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
 
-        # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
+        # ── P44/MOL-254: async payment/connection/rate-limit fallback ────
+        # Ported from sync `call_llm` (see P46/MOL-245 for the original).
+        # Before this patch, async_call_llm re-raised rate-limits/connection
+        # errors directly, which propagated up through session_search →
+        # empty briefing on Telegram when Gemini 3.1 upstream throttled.
+        # `_try_payment_fallback` returns a SYNC client we discard; we then
+        # re-instantiate via `_get_cached_client(..., async_mode=True)` so
+        # the fallback call is awaitable.
+        #
+        # Observability (per silent-failure-hunter review of MOL-254):
+        # - If fb_label is empty, the sync helper already logged "no
+        #   fallback available".
+        # - If fb_label is set but _get_cached_client returns (None, None),
+        #   we log a warning so "async fallback instantiation failed"
+        #   doesn't get masked by the re-raised primary error.
+        # - If the fallback call ITSELF raises, we log before re-raising so
+        #   the stacktrace isn't mistakenly blamed on the primary provider.
         should_fallback = (
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
         )
-        is_auto = resolved_provider in ("auto", "", None)
-        if should_fallback and is_auto:
+        if should_fallback:
             if _is_payment_error(first_err):
                 reason = "payment error"
-            elif _is_rate_limit_error(first_err):
-                reason = "rate limit"
-            else:
+            elif _is_connection_error(first_err):
                 reason = "connection error"
-            logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
-                        task or "call", reason, resolved_provider, first_err)
-            fb_client, fb_model, fb_label = _try_payment_fallback(
-                resolved_provider, task, reason=reason)
-            if fb_client is not None:
-                fb_kwargs = _build_call_kwargs(
-                    fb_label, fb_model, messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
+            else:
+                reason = "rate limit"
+            logger.info(
+                "Auxiliary %s: %s on %s (%s), trying async fallback",
+                task or "call", reason, resolved_provider, first_err,
+            )
+            _sync_fb_client, fb_model, fb_label = _try_payment_fallback(
+                resolved_provider, task, reason=reason,
+            )
+            if fb_label:
+                fb_async_client, fb_async_model = _get_cached_client(
+                    fb_label, fb_model, async_mode=True,
                 )
-                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
-                    fb_kwargs["model"] = async_fb_model
-                return _validate_llm_response(
-                    await async_fb.chat.completions.create(**fb_kwargs), task)
+                if fb_async_client is not None:
+                    fb_kwargs = _build_call_kwargs(
+                        fb_label, fb_async_model or fb_model, messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, timeout=effective_timeout,
+                        extra_body=effective_extra_body,
+                    )
+                    try:
+                        return await fb_async_client.chat.completions.create(**fb_kwargs)
+                    except Exception as fb_err:
+                        logger.warning(
+                            "Auxiliary %s: async fallback %s/%s ALSO failed: %s "
+                            "(re-raising primary error)",
+                            task or "call", fb_label,
+                            fb_async_model or fb_model, fb_err,
+                        )
+                        # Re-raise primary error so caller sees the original
+                        # throttle cause; fallback failure is logged above.
+                        raise first_err from fb_err
+                else:
+                    logger.warning(
+                        "Auxiliary %s: async fallback %s failed to instantiate "
+                        "(sync fallback helper returned a usable label but "
+                        "_get_cached_client(async_mode=True) returned None). "
+                        "Re-raising primary error.",
+                        task or "call", fb_label,
+                    )
         raise

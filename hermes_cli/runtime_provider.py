@@ -72,6 +72,10 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     - Kimi Code's ``api.kimi.com/coding`` endpoint also speaks the
       Anthropic Messages protocol (the /coding route accepts Claude
       Code's native request shape).
+    - Direct ``api.anthropic.com`` only serves ``/v1/messages`` —
+      defaulting to chat_completions sends ``POST /v1/chat/completions``
+      and Anthropic returns 404. Pin to ``anthropic_messages``.
+      (P226/MOL-623 — Gap 4 fix for the role_routing planner/skeptic lane.)
     """
     normalized = (base_url or "").strip().lower().rstrip("/")
     hostname = base_url_hostname(base_url)
@@ -79,6 +83,8 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         return "codex_responses"
     if hostname == "api.openai.com":
         return "codex_responses"
+    if hostname == "api.anthropic.com":
+        return "anthropic_messages"
     if normalized.endswith("/anthropic"):
         return "anthropic_messages"
     if hostname == "api.kimi.com" and "/coding" in normalized:

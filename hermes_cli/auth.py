@@ -282,6 +282,18 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
         base_url_env_var="ANTHROPIC_BASE_URL",
     ),
+    # P213/MOL-623 — Strict API-key-only Anthropic lane for role_routing
+    # (planner/skeptic Sonnet 4.6 high). Distinct from "anthropic" entry above
+    # which falls back to OAuth tokens. Never mutate that fallback list; deploys
+    # of the 3-agent loop must pin to ANTHROPIC_API_KEY only.
+    "anthropic-direct": ProviderConfig(
+        id="anthropic-direct",
+        name="Anthropic (Direct API Key)",
+        auth_type="api_key",
+        inference_base_url="https://api.anthropic.com",
+        api_key_env_vars=("ANTHROPIC_API_KEY",),
+        base_url_env_var="ANTHROPIC_BASE_URL",
+    ),
     "alibaba": ProviderConfig(
         id="alibaba",
         name="Alibaba Cloud (DashScope)",

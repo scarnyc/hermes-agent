@@ -178,6 +178,11 @@ def run_conversation(
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
     agent._post_tool_empty_retried = False
+    # P33/MOL-525 + MOL-220: clear the tool-error accumulator at turn start
+    # so cron's empty-delivery branch only sees errors from THIS turn.
+    # Without this, a prior turn's failures would leak into the next
+    # turn's surface line.
+    agent._tool_errors.clear()
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
@@ -532,6 +537,16 @@ def run_conversation(
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
+
+        # P59/MOL-268 — cost cap check at loop top
+        if agent._cost_cap_triggered:
+            _turn_exit_reason = "cost_cap_exceeded"
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n💰 Cost cap reached (${agent.session_estimated_cost_usd:.2f} ≥ "
+                    f"${agent._cost_cap_usd:.2f} for platform={agent.platform}). Stopping."
+                )
+            break
 
         # Check for interrupt request (e.g., user sent new message)
         if agent._interrupt_requested:
@@ -1551,7 +1566,23 @@ def run_conversation(
                                 "Token persistence failed (session=%s, tokens=%d): %s",
                                 agent.session_id, total_tokens, e,
                             )
-                    
+
+                    # P59/MOL-268 — cost cap check after token+cost update
+                    if (agent._cost_cap_usd is not None
+                        and not agent._cost_cap_triggered
+                        and agent.session_estimated_cost_usd >= agent._cost_cap_usd):
+                        agent._cost_cap_triggered = True
+                        logger.warning(
+                            "cost_cap_exceeded session=%s platform=%s est=$%.2f cap=$%.2f model=%s",
+                            agent.session_id, agent.platform,
+                            agent.session_estimated_cost_usd, agent._cost_cap_usd, agent.model,
+                        )
+                        try:
+                            if agent._session_db and agent.session_id:
+                                agent._session_db.end_session(agent.session_id, "cost_cap_exceeded")
+                        except Exception:
+                            pass
+
                     if agent.verbose_logging:
                         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                     
@@ -3469,6 +3500,22 @@ def run_conversation(
                             "retry %d/3 (model=%s)",
                             agent._empty_content_retries, agent.model,
                         )
+                        # P76/MOL-313: capture diagnostic data for root-cause
+                        # analysis. Fail-open helper — never blocks the loop.
+                        try:
+                            _ra()._log_empty_response_diagnostic(
+                                model=getattr(agent, "model", None),
+                                provider=getattr(agent, "provider", None),
+                                session_id=getattr(agent, "session_id", None),
+                                attempt=agent._empty_content_retries,
+                                finish_reason=finish_reason,
+                                has_reasoning=bool(_has_structured),
+                                message_count=len(messages),
+                                fallback_activated=False,
+                                outcome="retry",
+                            )
+                        except Exception:
+                            pass
                         agent._emit_status(
                             f"⚠️ Empty response from model — retrying "
                             f"({agent._empty_content_retries}/3)"
@@ -3481,7 +3528,16 @@ def run_conversation(
                     # chain.  This covers the case where a model
                     # (e.g. GLM-4.5-Air) consistently returns empty
                     # due to context degradation or provider issues.
-                    if _truly_empty and agent._fallback_chain:
+                    # P77/MOL-314: gated by agent._fallback_on_empty_exhausted
+                    # (default True). Setting the flag False in
+                    # config.yaml restores pre-P77 behavior — empty-
+                    # exhausted falls straight through to "(empty)"
+                    # without crossing into the fallback chain.
+                    if (
+                        _truly_empty
+                        and agent._fallback_chain
+                        and agent._fallback_on_empty_exhausted
+                    ):
                         logger.warning(
                             "Empty response after %d retries — "
                             "attempting fallback (model=%s, provider=%s)",
@@ -3503,7 +3559,58 @@ def run_conversation(
                                 "now using %s on %s",
                                 agent.model, agent.provider,
                             )
+                            # P76/MOL-313: terminal-cohort log row for the
+                            # fallback-activated outcome.
+                            try:
+                                _ra()._log_empty_response_diagnostic(
+                                    model=getattr(agent, "model", None),
+                                    provider=getattr(agent, "provider", None),
+                                    session_id=getattr(agent, "session_id", None),
+                                    attempt=0,
+                                    finish_reason=finish_reason,
+                                    has_reasoning=bool(_has_structured),
+                                    message_count=len(messages),
+                                    fallback_activated=True,
+                                    outcome="fallback_activated",
+                                )
+                            except Exception:
+                                pass
                             continue
+
+                    # P75/MOL-312: before "(empty)" terminal, try to recover
+                    # a briefing payload from a prior memory_observe tool
+                    # call. Protects against Gemini 3.1 Pro's high-context
+                    # transient empty-completion failure mode on
+                    # Comprehensive Update.
+                    if _truly_empty:
+                        _recovered = _ra()._recover_briefing_from_tool_calls(messages)
+                        if _recovered:
+                            logger.warning(
+                                "Empty response → recovered briefing from memory_observe "
+                                "tool call (len=%d, model=%s)",
+                                len(_recovered), agent.model,
+                            )
+                            # P76/MOL-313: terminal-cohort log row for the
+                            # recovered outcome.
+                            try:
+                                _ra()._log_empty_response_diagnostic(
+                                    model=getattr(agent, "model", None),
+                                    provider=getattr(agent, "provider", None),
+                                    session_id=getattr(agent, "session_id", None),
+                                    attempt=agent._empty_content_retries,
+                                    finish_reason=finish_reason,
+                                    has_reasoning=bool(_has_structured),
+                                    message_count=len(messages),
+                                    fallback_activated=False,
+                                    outcome="recovered",
+                                )
+                            except Exception:
+                                pass
+                            final_response = _recovered
+                            assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                            assistant_msg["content"] = _recovered
+                            messages.append(assistant_msg)
+                            break
 
                     # Exhausted retries and fallback chain (or no
                     # fallback configured).  Fall through to the

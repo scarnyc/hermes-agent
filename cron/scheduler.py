@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ except ImportError:
         import msvcrt
     except ImportError:
         msvcrt = None
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -128,6 +130,117 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+
+# P73/MOL-305: cron final_response scrubber — see scripts/hermes-patches/PATCHES.md.
+_PLANNING_PREFIX_RE = re.compile(r"^\s*(I need to|I will|I'll|Let me|Here is|Here's)\b")
+_FENCE_LINE_RE = re.compile(r"^\s*```[\w-]*\s*$")
+_REDO_TRANSITION_RE = re.compile(r"\bI will output exactly this\b\.?\s*", re.IGNORECASE)
+
+
+def _scrub_cron_final_response(text):
+    """P73/MOL-305: scrub LLM-emitted cron final_response.
+
+    Defends against three observed malformations on the comprehensive-update
+    morning briefing path (2026-04-25 incident, MOL-305):
+      (a) leading planning prose ('I need to output the briefing...').
+      (b) wrapping the briefing in a top-level ``` code fence despite
+          the skill's plain-text-only contract.
+      (c) double-emission with a transition phrase ('I will output exactly
+          this.GOOD MORNING CHIEF...') concatenating draft + raw repeat.
+
+    Conservative + idempotent: only activates when at least one malformation
+    signal is present, and never strips legitimate body content. The dedup
+    keys off the first non-meta non-empty line so internal section headers
+    that legitimately repeat (e.g. 'Generated: <timestamp>' across sub-reports)
+    pass through unchanged.
+
+    Returns input unchanged when text is empty, None, or shows no signals.
+    """
+    if not text:
+        return text
+
+    lines = text.split("\n")
+
+    # --- detect malformation signals (no mutation yet) ---
+    first_nonempty = next((ln for ln in lines if ln.strip()), "")
+    has_preamble = bool(_PLANNING_PREFIX_RE.match(first_nonempty))
+    has_redo = bool(_REDO_TRANSITION_RE.search(text))
+
+    # Header for dedup detection: first non-meta non-fence line. Skip planning-prose
+    # AND fence lines AND short lines (< 8 chars) so we don't false-positive on
+    # e.g. a stray '---' separator.
+    header = ""
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if _PLANNING_PREFIX_RE.match(ln):
+            continue
+        if _FENCE_LINE_RE.match(ln):
+            continue
+        if len(s) >= 8:
+            header = s
+            break
+
+    has_repeat = False
+    if header:
+        header_short = header[:80]
+        first_at = text.find(header_short)
+        if first_at >= 0:
+            second_at = text.find(header_short, first_at + len(header_short))
+            has_repeat = second_at > first_at + 200
+
+    if not (has_preamble or has_redo or has_repeat):
+        # Healthy response — pass through byte-for-byte.
+        return text
+
+    # --- rescue mode: strip preamble, drop fence-only lines, dedup ---
+    stripped_count = 0
+    while stripped_count < 5:
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx >= len(lines):
+            break
+        if _PLANNING_PREFIX_RE.match(lines[idx]):
+            del lines[: idx + 1]
+            stripped_count += 1
+        else:
+            break
+
+    lines = [ln for ln in lines if not _FENCE_LINE_RE.match(ln)]
+    body = "\n".join(lines)
+    body = _REDO_TRANSITION_RE.sub("", body)
+
+    # Dedup: if the header (first non-meta non-empty line of the cleaned body)
+    # recurs > 200 bytes after its first occurrence, keep only from the second
+    # occurrence onward (the LLM's last-attempt copy is the authoritative one).
+    cleaned_lines = body.split("\n")
+    dedup_header = ""
+    for ln in cleaned_lines:
+        s = ln.strip()
+        if s and len(s) >= 8 and not _FENCE_LINE_RE.match(ln):
+            dedup_header = s
+            break
+    if dedup_header:
+        dedup_short = dedup_header[:80]
+        first_at = body.find(dedup_short)
+        if first_at >= 0:
+            second_at = body.find(dedup_short, first_at + len(dedup_short))
+            if second_at > first_at + 200:
+                body = body[second_at:]
+
+    return body.strip() + "\n"
+
+
+# P33/MOL-525 + P65/MOL-271 reconciliation: P33 backport needs run_job's
+# 5th return slot to be ``tool_errors`` (list) for verifier substring match,
+# but P65 already uses that slot for ``_review_banner`` (str). Stash the
+# banner here keyed by job_id and pop it in _process_job after the 5-tuple
+# unpack. dict.pop is atomic under the GIL and each job has a unique id,
+# so this is thread-safe even under the parallel ThreadPoolExecutor path.
+_review_banners: dict[str, str] = {}
+
 # P58/MOL-268: retry-feedback prompt for the reviewer-driven retry loop.
 # When the semantic reviewer (tools.reflection_agent.reflect_and_annotate)
 # flags fabricated EVIDENCE / fabricated checkmark lists in the agent's
@@ -146,6 +259,43 @@ _RETRY_FEEDBACK_PROMPT = (
     "Re-emit the response with the offending claims removed.\n\n"
     "Concerns:\n{concerns_block}"
 )
+
+# P45/MOL-245: sentinels that indicate the LLM returned no usable content.
+# Distinct from [SILENT], which is a legitimate "nothing to report" signal
+# per the comprehensive-update skill contract. These mean an upstream
+# failure (429, malformed response, silent crash) starved the final output.
+_EMPTY_RESPONSE_SENTINELS = ("(No response generated)", "(empty)")
+
+
+def _classify_empty_response(final_response: str) -> Optional[str]:
+    """P45/MOL-245: classify a cron agent's final_response as a silent-miss.
+
+    Returns ``"empty_llm_response"`` for empty / whitespace-only / known
+    sentinel strings (case-sensitive exact match against
+    ``_EMPTY_RESPONSE_SENTINELS``). Returns ``None`` for real content AND
+    for any response containing the ``[SILENT]`` marker (handled by the
+    delivery-skip site in ``tick()`` via substring match — see the
+    TestSilentDelivery suite for the trailing-``[SILENT]`` contract that
+    real agents rely on).
+
+    This classifier is intentionally narrow — it only flags responses
+    that are EMPTY (no usable content at all). Determining whether a
+    non-empty response represents suppression vs. content is the
+    delivery layer's job, not the classifier's. See
+    ``~/.hermes/skills/productivity/comprehensive-update/SKILL.md`` for
+    the ``[SILENT]`` contract.
+
+    Evaluation order: empty check → sentinel equality.
+    """
+    if not final_response:
+        return "empty_llm_response"
+    stripped = final_response.strip()
+    if not stripped:
+        return "empty_llm_response"
+    if stripped in _EMPTY_RESPONSE_SENTINELS:
+        return "empty_llm_response"
+    return None
+
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -497,7 +647,7 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, wrap_override: Optional[bool] = None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -505,6 +655,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
+
+    P48/MOL-245: ``wrap_override`` lets callers (e.g. ``_notify_failure``)
+    force-skip the cron header/footer wrap so failure notifications arrive
+    plain, regardless of the user's ``cron.wrap_response`` config.
 
     Returns None on success, or an error string on failure.
     """
@@ -522,12 +676,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
-    wrap_response = True
-    try:
-        user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
+    # P48/MOL-245: wrap_override (caller-supplied) takes precedence over config.
+    if wrap_override is not None:
+        wrap_response = bool(wrap_override)
+    else:
+        wrap_response = True
+        try:
+            user_cfg = load_config()
+            wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        except Exception:
+            pass
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -672,6 +830,57 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+
+def _notify_failure(
+    job: dict,
+    status: str,
+    last_error: Optional[str],
+    output_file: Optional[str],
+    adapters=None,
+    loop=None,
+) -> None:
+    """
+    P48/MOL-245: send a plain-text Telegram alert when a cron job ends in
+    ``degraded`` or ``error`` state.
+
+    Routes to TELEGRAM_HOME_CHANNEL (preferred) or TELEGRAM_CHAT_ID; bails
+    silently if neither is set or the value parses as a sentinel
+    ("none"/"null"/"undefined").  All failure paths log but never raise —
+    the tick loop's own error handling owns the job-level outcome.
+    """
+    chat_id = (os.getenv("TELEGRAM_HOME_CHANNEL") or os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if not chat_id or chat_id.lower() in ("none", "null", "undefined"):
+        logger.warning(
+            "cron_notification_skipped job=%s reason=invalid_chat_id=%r",
+            job.get("id", "?"), chat_id,
+        )
+        return
+
+    job_name = job.get("name", job.get("id", "?"))
+    job_id = job.get("id", "?")
+    ts = _hermes_now().isoformat()
+    content = (
+        f"CRON FAILURE: {job_name}\n\n"
+        f"Job: {job_id}\n"
+        f"Status: {status}\n"
+        f"Reason: {last_error or 'unknown'}\n"
+        f"Time: {ts}\n"
+        f"Output: {output_file}\n\n"
+        f"Re-run: hermes cron run {job_id}"
+    )
+    notify_job = dict(job)
+    notify_job["deliver"] = f"telegram:{chat_id}"
+    try:
+        err = _deliver_result(notify_job, content, adapters=adapters, loop=loop, wrap_override=False)
+        if err:
+            logger.error(
+                "cron_notification_failed job=%s path=err_string reason=%s",
+                job_id, err,
+            )
+    except Exception:
+        logger.exception("cron_notification_failed job=%s path=exception", job_id)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
@@ -827,6 +1036,91 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
+def _summarize_completed_actions(cron_session_id: str) -> str:
+    """MOL-227 v2 (P40): fetch PASS rows from cron_verifications for this
+    attempt's session_id and format as a short human-readable summary for
+    the retry-context "ALREADY COMPLETED" block. Prevents the retry from
+    double-writing actions the structural verifier already confirmed.
+
+    Returns empty string on any DB error — retry proceeds without the
+    completed-actions context rather than failing the whole retry path.
+    """
+    import sqlite3
+    db_path = _get_hermes_home() / "memory" / "hermes.db"
+    if not db_path.exists():
+        return ""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.execute(
+                "SELECT claim_type, verification_output "
+                "FROM cron_verifications "
+                "WHERE session_id = ? AND verified = 1 "
+                "ORDER BY id ASC",
+                (cron_session_id,),
+            )
+            rows = cur.fetchall()
+    except sqlite3.Error as e:
+        logger.warning("_summarize_completed_actions DB error: %s", e)
+        return ""
+
+    if not rows:
+        return ""
+
+    lines = []
+    for claim_type, verification_output in rows:
+        lines.append(f"- [{claim_type}] {str(verification_output or '').strip()}")
+    return "\n  ".join(lines)
+
+
+def _build_retry_feedback_block(retry_context: dict) -> str:
+    """MOL-227 v2 (P40): format the reviewer-feedback block prepended to a
+    retry attempt's prompt. Includes ALREADY-COMPLETED summary so the agent
+    doesn't double-post comments or re-append file edits on retry."""
+    attempt_num = int(retry_context.get("attempt_number", 1))
+    completed = str(retry_context.get("completed_actions") or "(none recorded)")
+    prior = str(retry_context.get("prior_response_truncated") or "")[:2000]
+    concerns = retry_context.get("concerns_to_address") or []
+
+    lines = [
+        f"[REVIEWER FEEDBACK — ATTEMPT {attempt_num}]",
+        "",
+        "The previous attempt's reviewer found HIGH-severity concerns listed at the",
+        "bottom of this block. Address ONLY the open concerns. Do NOT repeat actions",
+        "listed under ALREADY COMPLETED — those were verified by the structural checker.",
+        "",
+        "ALREADY COMPLETED (verified — do NOT repeat):",
+        f"  {completed}",
+        "",
+        "YOUR PREVIOUS RESPONSE (truncated to 2000 chars):",
+        "  " + (prior.replace("\n", "\n  ") if prior else "(empty)"),
+        "",
+        "OPEN CONCERNS (reviewer flagged HIGH):",
+    ]
+    for i, c in enumerate(concerns, 1):
+        cat = str(c.get("category", "?"))
+        desc = str(c.get("description", "?")).replace("\n", " ")
+        evi = str(c.get("evidence", ""))[:200].replace("\n", " ")
+        lines.append(f"  {i}. [{cat}] {desc}")
+        if evi:
+            lines.append(f"     evidence: {evi}")
+    # P58/MOL-268: anti-fabrication counter-instruction. Without this, an
+    # agent facing an evidence-concern for a claim it cannot substantiate
+    # will fabricate a plausible-looking action list on retry. The DELETE
+    # branch gives it an honest escape hatch.
+    lines.extend([
+        "",
+        "Now re-run the task, addressing each open concern with real tool calls.",
+        "Do NOT simply restate the prior summary. Do NOT repeat completed actions.",
+        "If an open concern is about a missing Jira transition, transition the ticket.",
+        "If it is about missing evidence, produce the tool output that proves the action.",
+        "If you CANNOT substantiate a claim with a real tool call (e.g. the original task is a personal reminder that genuinely requires no tool use), DELETE the unsubstantiated claim from your response. Never fabricate checkmark lists (\"✅ Checked X\", \"✅ Updated Y\"), invented tool output, or \"Actions completed:\" summaries. A short honest response with no action bullets is strictly better than one with invented bullets. Fabrication is a severe review failure.",
+        "",
+        "=== ORIGINAL PROMPT FOLLOWS ===",
+        "",
+    ])
+    return "\n".join(lines)
+
+
 def _parse_wake_gate(script_output: str) -> bool:
     """Parse the last non-empty stdout line of a cron job's pre-check script
     as a wake gate.
@@ -853,7 +1147,7 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None, retry_context: Optional[dict] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -863,6 +1157,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             When provided, the script is not re-executed and the cached
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
+        retry_context: MOL-227 v2 (P40) flywheel retry context. When provided,
+            a REVIEWER FEEDBACK block is prepended to the assembled prompt
+            so the agent has (a) the list of already-completed actions to
+            avoid double-writing, (b) the truncated prior response, (c) the
+            open HIGH-severity concerns it must address.
     """
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
@@ -957,6 +1256,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
+        # MOL-227 v2 (P40): retry-feedback prepend for no-skills path.
+        if retry_context:
+            prompt = _build_retry_feedback_block(retry_context) + prompt
         return _scan_assembled_cron_prompt(prompt, job)
 
     from tools.skills_tool import skill_view
@@ -1000,7 +1302,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job)
+    result = "\n".join(parts)
+
+    # MOL-227 v2 (P40): flywheel retry feedback is prepended LAST so it
+    # appears at the very top of the agent's prompt — the agent sees the
+    # reviewer concerns before the skill invocation system message.
+    if retry_context:
+        result = _build_retry_feedback_block(retry_context) + result
+    return _scan_assembled_cron_prompt(result, job)
 
 
 def _scan_assembled_cron_prompt(assembled: str, job: dict) -> str:
@@ -1028,19 +1337,35 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict) -> str:
     return assembled
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
+def run_job(job: dict, retry_context: Optional[dict] = None) -> tuple[bool, str, str, Optional[str], list]:
     """
     Execute a single cron job.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message,
-        review_banner).
+        tool_errors).
+
+    P33/MOL-525 + P65/MOL-271: ``tool_errors`` is the in-band list of
+    tool-call failure dicts recorded by ``AIAgent._record_tool_error``
+    during this run. The P65 reviewer banner is plumbed OUT-OF-BAND via
+    the module-level ``_review_banners`` dict (see comment at top of
+    file) so the verifier's substring check for
+    ``success, output, final_response, error, tool_errors = run_job``
+    matches in tick() without losing P65's contamination guarantee.
 
     P65/MOL-271: ``review_banner`` carries reviewer concerns out-of-band so
     _process_job can PREPEND it to the delivered payload without leaking
     into ``final_response`` (which session_search and downstream tools
     consume — see reviewer_feedback_contagion memory). Empty string when
     the reviewer found no concerns / reflection was skipped.
+
+    MOL-227 v2 (P40): ``retry_context`` plumbs reviewer/scheduler-driven
+    retry feedback INTO the prompt builder so a subsequent attempt sees
+    the prior round's concerns + completed-action ledger. The retry loop
+    below also uses ``_summarize_completed_actions`` + ``_build_retry_feedback_block``
+    to enrich in-loop retries with the same ledger, and prepends a
+    ``REVIEW INCOMPLETE after N attempts`` banner to ``_review_banner``
+    when retries exhaust with concerns still present.
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
@@ -1204,11 +1529,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
             f"## Script Output\n\n```\n{_sc_out}\n```\n"
         )
         if _sc_ok:
-            return True, sc_doc, "", None, ""
+            return True, sc_doc, SILENT_MARKER, None, ""  # P235/MOL-1998: avoid P45 _classify_empty_response false-positive on script_only success
         return False, sc_doc, "", f"script-only job failed: {_sc_out[:300]}", ""
 
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        # MOL-227 v2 (P40): forward retry_context into the prompt builder so
+        # an externally-driven retry (scheduler-level resume, not the
+        # in-loop reviewer retry below) sees the prior round's concerns +
+        # completed-action ledger prepended to the prompt.
+        prompt = _build_job_prompt(
+            job,
+            prerun_script=prerun_script,
+            retry_context=retry_context,
+        )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -1278,7 +1611,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
         chat_id="",
         chat_name="",
     )
-    _cron_delivery_vars = (
+    # P96/MOL-404: clear HERMES_CRON_AUTO_DELIVER_* before every job so a
+    # job missing origin metadata can't inherit the previous job's delivery
+    # target (prevents always-set THREAD_ID bleed across cron runs sharing
+    # the gateway process).
+    _cron_delivery_vars = (  # P96/MOL-404 loop var
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
@@ -1606,6 +1943,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
             )
 
+        # P95/MOL-404: surface agent run_conversation failure flags as job failure
+        # (manual port of upstream f54935738).
         # If the agent itself reported failure (e.g. all retries exhausted on
         # API errors, model abort, mid-run interrupt), do not silently mark the
         # job as successful. run_agent populates `failed=True`/`completed=False`
@@ -1621,12 +1960,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
             )
             raise RuntimeError(_err_text)
 
-        final_response = result.get("final_response", "") or ""
+        # P73/MOL-305: scrub LLM-emitted final_response for cron-path malformations
+        # (leading planning prose, wrapping fences, draft+repeat). Conservative —
+        # passes healthy responses through byte-for-byte; mutates only on signal.
+        final_response = _scrub_cron_final_response(result.get("final_response", "") or "")
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
 
-        # P58/MOL-268 + P59/MOL-268 + P65/MOL-271: reviewer-driven retry loop.
+        # P58/MOL-268 + P59/MOL-268 + P65/MOL-271 + MOL-227 v2 (P40):
+        # reviewer-driven retry loop.
         #
         # Plumb the reviewer banner OUT of run_job via the 5th tuple slot
         # (``_review_banner``) so _process_job can prepend it to the
@@ -1644,9 +1987,57 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
         # breaker (``end_reason == "cost_cap_exceeded"``), do NOT retry —
         # the retry would just re-trip the same cap and burn another
         # round-trip on a doomed run.
+        #
+        # MOL-227 v2 (P40): in-loop retries enrich the retry prompt with
+        # ``_summarize_completed_actions(_cron_session_id)`` so the agent
+        # sees a ledger of what it already did. Track the final review
+        # status so we can stamp a ``REVIEW INCOMPLETE after N attempts``
+        # banner on ``_review_banner`` when retries exhaust with concerns
+        # still present.
+        # P132/MOL-467: pre-initialize loop-scoped collection vars to
+        # prevent UnboundLocalError on the early-break path inside the
+        # retry loop below. Two vars are actually load-bearing post-loop:
+        #   - _high — referenced post-loop in the _auto_patch_cfg block
+        #   - _review_banner — referenced post-loop in delivery (success=True only)
+        # _concerns and _review_status are NOT load-bearing today;
+        # pre-init is hedging for future post-loop additions.
+        # NOT covered by this pre-init (and intentionally so —
+        # neither has a post-loop reference today): _cron_session_id,
+        # _retries_remaining, _should_retry, _prior_cost_capped,
+        # _retry_context, _attempt.
+        _concerns: list = []
+        _review_status = "ok"
         _review_banner = ""
+        _high: list = []
         _prior_cost_capped = result.get("end_reason") == "cost_cap_exceeded"
+        # P126/MOL-455 — HERMES_HOME-aware cross-session cost-cap probe.
+        # The in-memory ``result`` only carries the *current* run's
+        # end_reason. If a prior session of THIS cron job under the same
+        # session id already tripped the cost cap and got persisted to
+        # state.db (e.g. via _session_db.end_session() in run_agent), the
+        # in-memory check above can miss it on the retry hop. Fall back to
+        # state.db using a HERMES_HOME-aware path so profile-mode (where
+        # HERMES_HOME points at <root>/profiles/<name>) and the default
+        # ~/.hermes layout both resolve correctly.
+        if not _prior_cost_capped:
+            try:
+                import sqlite3 as _p59_sq
+                _p126_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+                _p59_path = Path(_p126_home) / "state.db"
+                if _p59_path.exists():
+                    with _p59_sq.connect(str(_p59_path)) as _p59_conn:
+                        _p59_row = _p59_conn.execute(
+                            "SELECT end_reason FROM sessions WHERE id=?",
+                            (_cron_session_id,),
+                        ).fetchone()
+                        if _p59_row and _p59_row[0] == "cost_cap_exceeded":
+                            _prior_cost_capped = True
+            except Exception:
+                pass
+        # P54/MOL-240: per-job skip_reflection flag — symmetric with skip_memory.
         _skip_reflection = bool(job.get("skip_reflection"))
+        _final_review_status = None  # MOL-227 v2 (P40)
+        _final_retry_attempts = 0    # MOL-227 v2 (P40)
         if (
             final_response
             and not _skip_reflection
@@ -1668,6 +2059,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
                     )
                     if _banner:
                         _review_banner = _banner
+                    _final_review_status = _status
                     if _status != ReviewStatus.CONCERNS or not _concerns:
                         break
                     # P59 inline guard: a retry that would push the next
@@ -1682,8 +2074,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
                         f"- {c.message}" if hasattr(c, "message") else f"- {c!r}"
                         for c in _concerns
                     )
-                    _retry_prompt = _RETRY_FEEDBACK_PROMPT.format(
-                        concerns_block=_concerns_block
+                    # MOL-227 v2 (P40): build a completed-actions ledger for
+                    # the retry prompt so the agent has a self-grounded view
+                    # of what it has already done this session.
+                    _p40_retry_context = {
+                        "attempt_number": _retry_n + 1,
+                        "concerns": _concerns,
+                        "completed_actions": _summarize_completed_actions(_cron_session_id),
+                    }
+                    _p40_feedback = _build_retry_feedback_block(_p40_retry_context)
+                    _retry_prompt = (
+                        _p40_feedback
+                        + _RETRY_FEEDBACK_PROMPT.format(
+                            concerns_block=_concerns_block
+                        )
                     )
                     logger.info(
                         "Job '%s': reviewer flagged %d concern(s); retry %d/%d",
@@ -1705,6 +2109,31 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
                             # Same as _prior_cost_capped — stop retrying.
                             break
                     _retry_n += 1
+                    _final_retry_attempts = _retry_n
+                    # Re-poll status after the retry so loop-exit semantics
+                    # reflect the freshest reviewer verdict.
+                    if _retry_n >= _max_retries:
+                        try:
+                            _concerns_after, _status_after, _banner_after = reflect_and_annotate(
+                                prompt=prompt,
+                                response=final_response,
+                            )
+                            _final_review_status = _status_after
+                            if _banner_after:
+                                _review_banner = _banner_after
+                            if _status_after == ReviewStatus.CONCERNS and _concerns_after:
+                                # MOL-227 v2 (P40): retries exhausted, concerns
+                                # remain — stamp the REVIEW INCOMPLETE banner.
+                                _exhaustion_prefix = (
+                                    f"⚠️ REVIEW INCOMPLETE after {_retry_n} attempts — "
+                                )
+                                if _exhaustion_prefix not in _review_banner:
+                                    _review_banner = _exhaustion_prefix + _review_banner
+                        except Exception as e:
+                            logger.debug(
+                                "Job '%s': post-retry reflection failed (non-fatal): %s",
+                                job_id, e,
+                            )
             except Exception as e:
                 # Fail-OPEN: reviewer errors must not block delivery of
                 # the agent's actual work. Swallow + log + carry on.
@@ -1733,8 +2162,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None, _review_banner
-        
+        # P33/MOL-525: surface tool-error accumulator (run_agent.AIAgent
+        # ._tool_errors, populated by _record_tool_error at concurrent +
+        # sequential dispatch sites) so _process_job can detect the
+        # empty-final-response-with-tool-errors cohort. getattr fallback
+        # covers the legacy agent path that pre-dates MOL-220.
+        tool_errors = list(getattr(agent, "_tool_errors", []) or [])
+        _review_banners[job_id] = _review_banner
+        return True, output, final_response, None, tool_errors
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
@@ -1755,7 +2191,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str], str]:
 {error_msg}
 ```
 """
-        return False, output, "", error_msg, ""
+        # P33/MOL-525: also surface tool-error accumulator on the failure
+        # path. ``agent`` may be None if the exception was raised before
+        # agent construction (e.g. config load failure), so guard.
+        _tool_errors_at_fail = (
+            list(getattr(agent, "_tool_errors", []) or [])
+            if "agent" in locals() and agent is not None
+            else []
+        )
+        _review_banners[job_id] = ""
+        return False, output, "", error_msg, _tool_errors_at_fail
 
     finally:
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
@@ -1890,11 +2335,46 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # bill, reviewer_feedback_contagion memory) showed banner text
                 # gets re-fed to the agent on the next session_search hit and
                 # amplifies into a 151-turn thrash.
-                success, output, final_response, error, _review_banner = run_job(job)
+                _job_start_ts_utc = datetime.now(timezone.utc).timestamp()
+                # P33/MOL-525 + P65/MOL-271: 5-tuple unpack with
+                # ``tool_errors`` at slot 5 (P33 verifier substring); the
+                # P65 reviewer banner is recovered from the module-level
+                # ``_review_banners`` dict via atomic pop.
+                success, output, final_response, error, tool_errors = run_job(job)
+                _review_banner = _review_banners.pop(job["id"], "")
 
                 output_file = save_job_output(job["id"], output)
+
+                # MOL-214 P30: structural verification (fail-open).
+                # Prepends a VERIFICATION header to deliver_content if the
+                # agent's WORK_MANIFEST claims fail ground-truth checks.
+                # fail-open on ImportError (verifier module not installed).
+                if success and final_response:
+                    try:
+                        from tools.report_verifier import verify_and_annotate
+                        _cron_session_id_p30 = f"cron_{job['id']}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+                        final_response = verify_and_annotate(
+                            job=job,
+                            final_response=final_response,
+                            cron_session_id=_cron_session_id_p30,
+                            job_start_ts_utc=_job_start_ts_utc,
+                        )
+                    except ImportError:
+                        pass
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
+
+                # P45/MOL-245: detect silent-success — success=True but the
+                # agent's final_response is empty or a known "nothing
+                # produced" sentinel. Closes the gap where an upstream
+                # 429 starved the final output but the scheduler still
+                # recorded last_status=ok.
+                empty_signal = _classify_empty_response(final_response) if success else None
+                if empty_signal:
+                    logger.error(
+                        "cron_failure job=%s name=%s status=degraded reason=%s output=%s",
+                        job["id"], job.get("name", "?"), empty_signal, output_file,
+                    )
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
@@ -1904,6 +2384,21 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     if success and _review_banner
                     else (final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}")
                 )
+
+                # MOL-220 (proper fix, 2026-04-18): surface tool errors in
+                # empty deliveries. Previous version referenced `agent` at
+                # tick() scope — NameError waiting to fire because `agent`
+                # lives inside run_job() only. Now plumbed via run_job's
+                # 5-tuple return (tool_errors list copied from
+                # AIAgent._tool_errors after run_conversation returns).
+                if not deliver_content and tool_errors:
+                    names = ", ".join(sorted({e.get("tool_name", "?") for e in tool_errors}))
+                    deliver_content = (
+                        f"⚠️ Cron job '{job.get('name', job['id'])}': "
+                        f"no content produced; {len(tool_errors)} tool error(s) — {names}. "
+                        f"See ~/.hermes/cron/output/{job['id']}/ for details."
+                    )
+
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
@@ -1917,19 +2412,66 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         delivery_error = str(de)
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response and not job.get("script_only"):
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+                # P45/MOL-245: compute effective status. Empty/sentinel
+                # response with success=True becomes "degraded" so
+                # hermes cron list surfaces the miss and the failure
+                # notification below fires. Replaces the prior "flip
+                # success to False" hack (issue #8585) which lied about
+                # the underlying success bit; status is now a separate
+                # axis carrying the degraded signal honestly.
+                if not success:
+                    final_status, final_error = "error", error
+                elif empty_signal:
+                    final_status, final_error = "degraded", "empty LLM response"
+                elif delivery_error:
+                    final_status, final_error = "degraded", delivery_error
+                else:
+                    final_status, final_error = "ok", None
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                # P45/MOL-245: emit the structured `cron_failure` ERROR log
+                # on the hard-failure branch. The degraded branch already
+                # logged above in the classifier block — here we cover the
+                # error branch so a single grep for `cron_failure` captures
+                # every miss the scheduler records.
+                if final_status == "error":
+                    logger.error(
+                        "cron_failure job=%s name=%s status=error reason=%s output=%s",
+                        job["id"], job.get("name", "?"),
+                        (final_error or "unknown"), output_file,
+                    )
+
+                mark_job_run(
+                    job["id"], success, final_error,
+                    delivery_error=delivery_error, status=final_status,
+                )
+
+                # P48/MOL-245: Telegram failure notification on degraded/error.
+                if final_status in ("degraded", "error"):
+                    _notify_failure(
+                        job,
+                        final_status,
+                        final_error or delivery_error,
+                        output_file,
+                        adapters=adapters,
+                        loop=loop,
+                    )
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                # P45/MOL-245: structured cron_failure line on the outer
+                # tick-exception path too — matches the inner paths so a
+                # single grep covers every recorded miss.
+                logger.error(
+                    "cron_failure job=%s name=%s status=error reason=%s output=none",
+                    job['id'], job.get('name', '?'), e,
+                )
+                mark_job_run(job["id"], False, str(e), status="error")
+                # P48/MOL-245: notify on catch-all error path; never raise.
+                try:
+                    _notify_failure(job, "error", str(e), None, adapters=adapters, loop=loop)
+                except Exception:
+                    logger.exception("cron_notification_path_broken job=%s", job.get("id", "?"))
                 return False
 
         # Partition due jobs: those with a per-job workdir mutate

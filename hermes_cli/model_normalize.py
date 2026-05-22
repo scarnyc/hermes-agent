@@ -165,6 +165,14 @@ def _normalize_for_deepseek(model_name: str) -> str:
     """
     bare = _strip_vendor_prefix(model_name).lower()
 
+    # Strip Hermes context-length bracket suffix (e.g. ``[1m]``, ``[200k]``).
+    # DeepSeek's API rejects bracket suffixes — they are a Hermes routing-
+    # table convention used to pin a context-length tier, never a real
+    # model ID. P164/MOL-549 strips it on the delegate_tool Tier 1/3 path;
+    # this mirrors the strip onto the role_routing / AIAgent path.
+    # (P226/MOL-623 — Gap 5 fix for the three-agent loop Builder lane.)
+    bare = re.sub(r"\[[^\]]*\]$", "", bare)
+
     if bare in _DEEPSEEK_CANONICAL_MODELS:
         return bare
 

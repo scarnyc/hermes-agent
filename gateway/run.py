@@ -7226,6 +7226,9 @@ class GatewayRunner:
                 ))
                 or ("400" in _err_str_for_classify and len(history) > 50)
             )
+            # P99/MOL-405: Persist user message on transient agent failures.
+            # Overflow → skip persistence (would grow session); transient → log
+            # and persist so conversation context is preserved on retry.
             if is_context_overflow_failure:
                 logger.info(
                     "Skipping transcript persistence for context-overflow "
@@ -7262,12 +7265,13 @@ class GatewayRunner:
 
             ts = datetime.now().isoformat()
             
-            # If this is a fresh session (no history), write the full tool
-            # definitions as the first entry so the transcript is self-describing
-            # -- the same list of dicts sent as tools=[...] in the API request.
-            if is_context_overflow_failure:
-                pass  # Skip all transcript writes — don't grow a broken session
-            elif not history:
+            # P99/MOL-405: If this is a fresh session (no history), write the
+            # full tool definitions as the first entry so the transcript is
+            # self-describing -- the same list of dicts sent as tools=[...] in
+            # the API request. Gate on `if not is_context_overflow_failure:`
+            # because overflow path must skip ALL transcript writes (would
+            # grow a broken session).
+            if not is_context_overflow_failure and not history:
                 tool_defs = agent_result.get("tools", [])
                 self.session_store.append_to_transcript(
                     session_entry.session_id,
@@ -7279,7 +7283,7 @@ class GatewayRunner:
                         "timestamp": ts,
                     }
                 )
-            
+
             # Find only the NEW messages from this turn (skip history we loaded).
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
@@ -14303,6 +14307,8 @@ class GatewayRunner:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            if turn_route.get("label"):
+                logger.info("smart_route model=%s label=%s", turn_route.get("model"), turn_route.get("label"))
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -15566,6 +15572,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    HEARTBEAT_EVERY = 5      # P94/MOL-400: emit liveness log every 5 ticks (5 min @ 60s)
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
@@ -15573,9 +15580,14 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
         try:
             cron_tick(verbose=False, adapters=adapters, loop=loop)
         except Exception as e:
-            logger.debug("Cron tick error: %s", e)
+            # P94/MOL-400: surface tick exceptions at WARNING with traceback
+            # so silent ticker failures are visible without DEBUG logging.
+            logger.warning("Cron tick error: %s", e, exc_info=True)
 
         tick_count += 1
+
+        if tick_count % HEARTBEAT_EVERY == 0:
+            logger.info("Cron ticker alive: tick=%d interval=%ds", tick_count, interval)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:

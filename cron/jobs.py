@@ -826,15 +826,21 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 status: Optional[str] = None):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``status`` (P45/MOL-245): optional explicit status override. Callers use
+    this to record "degraded" for silent-miss detection (success=True but
+    response was empty) without having to invert ``success``. When None,
+    status derives from ``success`` as before: ok or error.
     """
     with _jobs_file_lock:
         jobs = load_jobs()
@@ -842,8 +848,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
-                job["last_error"] = error if not success else None
+                # P45/MOL-245: honor explicit status override for "degraded".
+                if status:
+                    job["last_status"] = status
+                else:
+                    job["last_status"] = "ok" if success else "error"
+                # Persist error for any non-ok status (covers degraded + error).
+                job["last_error"] = error if job["last_status"] != "ok" else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 

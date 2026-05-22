@@ -143,6 +143,30 @@ class TestFTSSearch:
         results = db.search_fts("hidden")
         assert len(results) == 0
 
+    def test_fts_title_outranks_content_match(self, db):
+        """P74 / MOL-310: bm25(memory_fts, 5.0, 1.0) weights title 5x over content.
+
+        With a query term appearing once in entry-A's title and once in entry-B's
+        content (similar lengths), the title-match must rank first.
+        """
+        title_match_id = db.insert_entry(
+            "Quantum entanglement primer",
+            "An overview of basic physics concepts.",
+            "project",
+        )
+        content_match_id = db.insert_entry(
+            "Physics overview",
+            "Topics include classical mechanics and quantum entanglement.",
+            "project",
+        )
+        results = db.search_fts("quantum")
+        assert len(results) == 2
+        assert results[0]["id"] == title_match_id, (
+            f"Expected title-match ({title_match_id}) first; got {results[0]['id']}. "
+            "P74 BM25 column weighting may have regressed."
+        )
+        assert results[1]["id"] == content_match_id
+
 
 class TestVecSearch:
     def test_vec_search(self, db_with_vec):

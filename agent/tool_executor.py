@@ -371,6 +371,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                # P33/MOL-525 + MOL-220: record on the agent-level accumulator
+                # so cron's run_job can surface the failure when final_response
+                # is empty (see mol245_silent_miss_architecture).
+                agent._record_tool_error(function_name, result_preview, function_args)
 
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
@@ -804,6 +808,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            # P33/MOL-525 + MOL-220: record on the agent-level accumulator
+            # so cron's run_job can surface the failure when final_response
+            # is empty (see mol245_silent_miss_architecture).
+            agent._record_tool_error(function_name, result_preview, function_args)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 

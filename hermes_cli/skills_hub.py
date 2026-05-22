@@ -423,6 +423,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         quarantine_bundle, install_from_quarantine, HubLockFile,
     )
     from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
+    from tools.skills_guard import check_denylist, run_cisco_scanner
 
     c = console or _console
     ensure_hub_dirs()
@@ -436,6 +437,16 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         identifier = _resolve_short_name(identifier, sources, c)
         if not identifier:
             return
+
+    # MOL-170: Pre-fetch denylist check on raw user identifier
+    _deny_tier, _deny_reason = check_denylist(identifier)
+    if _deny_tier == "deny":
+        c.print(f"\n[bold red]BLOCKED (denylist):[/] {_deny_reason}")
+        c.print(f"[dim]Identifier: {identifier}[/]\n")
+        from tools.skills_hub import append_audit_log
+        append_audit_log("DENIED", identifier, "unknown", "unknown",
+                         "denylist_prefetch", _deny_reason[:100])
+        return
 
     c.print(f"\n[bold]Fetching:[/] {identifier}")
 
@@ -460,6 +471,19 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         else:
             c.print()
         return
+
+    # MOL-170: Post-fetch denylist re-check with resolved identifier
+    if _deny_tier != "deny":
+        _deny_tier, _deny_reason = check_denylist(bundle.identifier, source=bundle.source)
+        if _deny_tier == "deny":
+            c.print(f"\n[bold red]BLOCKED (denylist):[/] {_deny_reason}")
+            c.print(f"[dim]Resolved identifier: {bundle.identifier} (source: {bundle.source})[/]\n")
+            from tools.skills_hub import append_audit_log
+            append_audit_log("DENIED", bundle.name, bundle.source,
+                             bundle.trust_level, "denylist_postfetch", _deny_reason[:100])
+            return
+    if _deny_tier == "allow":
+        c.print(f"[dim]First-party repo — fast-track install (Cisco scanner skipped)[/]")
 
     # URL-sourced skills may arrive with an empty name when SKILL.md has no
     # ``name:`` in frontmatter AND the URL path doesn't yield a valid
@@ -547,6 +571,21 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     scan_source = getattr(bundle, "identifier", "") or getattr(meta, "identifier", "") or identifier
     result = scan_skill(q_path, source=scan_source)
     c.print(format_scan_report(result))
+
+    # MOL-170: Run Cisco Skill Scanner as second pass (fail-closed)
+    if _deny_tier != "allow":
+        c.print("[bold]Running Cisco Skill Scanner...[/]")
+        cisco_passed, cisco_report = run_cisco_scanner(q_path)
+        if not cisco_passed:
+            c.print(f"\n[bold red]Installation blocked (Cisco scanner):[/]")
+            c.print(f"[dim]{cisco_report[:400]}[/]\n")
+            shutil.rmtree(q_path, ignore_errors=True)
+            from tools.skills_hub import append_audit_log
+            append_audit_log("BLOCKED", bundle.name, bundle.source,
+                             bundle.trust_level, "cisco_fail",
+                             cisco_report[:100])
+            return
+        c.print(f"[green]Cisco scanner: PASSED[/]")
 
     # Check install policy
     allowed, reason = should_allow_install(result, force=force)

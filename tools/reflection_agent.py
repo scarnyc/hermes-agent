@@ -50,11 +50,11 @@ from tools import report_verifier as rv
 
 logger = logging.getLogger(__name__)
 
-_MODEL = "moonshotai/kimi-k2.5"
-_BASE_URL = "https://openrouter.ai/api/v1"
-_API_KEY_ENV = "OPENROUTER_API_KEY"
-_REVIEWER_TEMP = 1.0  # Kimi K2.5 requires temperature=1.0 (provider-imposed).
-# Kimi K2.5 thinking mode can burn 2-4k tokens on reasoning before producing
+_MODEL = "kimi-k2.6"
+_BASE_URL = os.environ.get("HERMES_MOCK_LLM_URL", "").strip() or "https://api.moonshot.ai/v1"
+_API_KEY_ENV = "KIMI_API_KEY"
+_REVIEWER_TEMP = 1.0  # Kimi K2.6 requires temperature=1.0 (provider-imposed).
+# Kimi K2.6 thinking mode can burn 2-4k tokens on reasoning before producing
 # content. 4096 was too tight — a 20k-char review prompt left zero tokens for
 # message.content. 16384 gives comfortable headroom for both reasoning + JSON.
 _MAX_TOKENS = 16384
@@ -468,6 +468,7 @@ def reflect_and_annotate(
             return ([], "unavailable", banner)
 
         # P65/MOL-271: banner is returned separately — never folded into the body.
+        # P54/MOL-240: empty header on clean attempt 1 → no banner.
         banner = _format_reviewer_header(concerns, "ok", attempt)
         return (concerns, "ok", banner)
 

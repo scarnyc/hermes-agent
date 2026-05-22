@@ -728,6 +728,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             explicit_base_url=fb_base_url_hint,
             explicit_api_key=fb_api_key_hint)
         if fb_client is None:
+            # P47/MOL-245: observability — log fallback attempts that
+            # fail to resolve a client, so silent misses are traceable
+            # in 30 seconds instead of reconstructing from provider
+            # error bodies.
+            logging.info(
+                "fallback.decision engaged=false from=%s to=%s provider=%s "
+                "reason=provider_not_configured index=%d/%d",
+                agent.model, fb_model, fb_provider,
+                agent._fallback_index, len(agent._fallback_chain),
+            )
             logging.warning(
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
@@ -780,6 +790,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+
+        # P47/MOL-245: observability at fallback engagement point.
+        # One INFO line per successful fallback swap — makes cron
+        # silent-miss debugging take seconds.
+        logging.info(
+            "fallback.decision engaged=true from=%s to=%s provider=%s "
+            "index=%d/%d",
+            old_model, fb_model, fb_provider,
+            agent._fallback_index, len(agent._fallback_chain),
+        )
 
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use

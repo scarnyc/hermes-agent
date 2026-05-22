@@ -1693,6 +1693,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            # P25: prevent Telegram markdown rendering of backticks in command
+            # previews by wrapping in <pre> + html.escape (HTML parse mode).
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
             text = (
                 f"⚠️ <b>Command Approval Required</b>\n\n"

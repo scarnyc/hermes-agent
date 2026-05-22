@@ -22,12 +22,20 @@ Usage:
         print(format_scan_report(result))
 """
 
-import re
+import fnmatch
 import hashlib
+import json
+import logging
+import os
+import re
+import subprocess
+import yaml
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -36,21 +44,147 @@ from typing import List, Tuple
 # Hardcoded trust configuration
 # ---------------------------------------------------------------------------
 
-TRUSTED_REPOS = {"openai/skills", "anthropics/skills"}
+TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "anthropics/claude-plugins-official", "anthropics/knowledge-work-plugins"}
 
 INSTALL_POLICY = {
     #                  safe      caution    dangerous
     "builtin":       ("allow",  "allow",   "allow"),
     "trusted":       ("allow",  "allow",   "block"),
     "community":     ("allow",  "block",   "block"),
-    # Agent-created: "ask" on dangerous surfaces as an error to the agent,
-    # which can retry without the flagged content. This gate only runs when
-    # skills.guard_agent_created is enabled (off by default) — see
-    # tools/skill_manager_tool.py::_guard_agent_created_enabled.
     "agent-created": ("allow",  "allow",   "ask"),
 }
 
 VERDICT_INDEX = {"safe": 0, "caution": 1, "dangerous": 2}
+
+
+# ---------------------------------------------------------------------------
+# Denylist & Cisco Skill Scanner (P23 — MOL-170)
+# ---------------------------------------------------------------------------
+
+_DENYLIST_PATH = Path.home() / ".hermes" / "config" / "plugin-denylist.yaml"
+
+
+def load_denylist() -> dict:
+    """Load the plugin denylist YAML. Returns empty dict on missing file."""
+    if not _DENYLIST_PATH.exists():
+        return {}
+    try:
+        with open(_DENYLIST_PATH) as f:
+            result = yaml.safe_load(f)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {"_parse_error": True}
+
+
+def check_denylist(identifier: str, source: str = "") -> Tuple[str, str]:
+    """Check identifier against the three-tier plugin policy.
+
+    Three-pass deny matching:
+      1. deny.identifiers — exact match (case-insensitive)
+      2. deny.patterns — fnmatch glob (case-insensitive)
+      3. deny.slugs — bare skill name match (case-insensitive)
+
+    Then check allow.repos — extract owner/repo prefix and match.
+    Default: "gate" (full scanning required).
+
+    Returns:
+        (tier, reason) — tier is "allow", "gate", or "deny".
+    """
+    denylist = load_denylist()
+
+    if denylist.get("_parse_error"):
+        return "deny", "Denylist YAML is invalid — refusing all community installs (fail-closed)"
+
+    tiers = denylist.get("tiers", {})
+    deny = tiers.get("deny", {})
+    reasons = deny.get("reasons", {})
+
+    normalized = identifier.lower().strip()
+
+    # Pass 1: exact identifier match
+    for denied in deny.get("identifiers", []):
+        if normalized == denied.lower():
+            return "deny", reasons.get(denied, f"Permanently denied: {denied}")
+
+    # Pass 2: glob pattern match
+    for pattern in deny.get("patterns", []):
+        if fnmatch.fnmatch(normalized, pattern.lower()):
+            return "deny", reasons.get(pattern, f"Matches deny pattern: {pattern}")
+
+    # Pass 3: bare slug match (for ClawHub-style identifiers)
+    slug = normalized.split("/")[-1]  # Extract bare name from any path
+    for denied_slug in deny.get("slugs", []):
+        if slug == denied_slug.lower():
+            return "deny", reasons.get(denied_slug, f"Denied slug: {denied_slug}")
+
+    # Check allow repos
+    allow = tiers.get("allow", {})
+    allow_repos = [r.lower() for r in allow.get("repos", [])]
+    parts = identifier.split("/")
+    if len(parts) >= 2:
+        repo = f"{parts[0]}/{parts[1]}".lower()
+        if repo in allow_repos:
+            return "allow", ""
+
+    return "gate", ""
+
+
+def run_cisco_scanner(skill_path: Path) -> Tuple[bool, str]:
+    """Run the Cisco Skill Scanner on a skill directory.
+
+    Returns:
+        (passed, report) — passed is True if no high/critical findings.
+
+    Fail-closed: any error (missing binary, timeout, crash) returns (False, msg).
+    """
+    import shutil as _shutil
+    scanner = _shutil.which("skill-scanner")
+    if not scanner:
+        scanner_path = Path.home() / ".local" / "bin" / "skill-scanner"
+        if scanner_path.exists():
+            scanner = str(scanner_path)
+        else:
+            return False, "Cisco Skill Scanner not installed (fail-closed)"
+
+    cmd = [
+        scanner, "scan", str(skill_path),
+        "--format", "json",
+        "--fail-on-severity", "high",
+        "--use-behavioral",
+        "--policy", "strict",
+    ]
+
+    # Add LLM analysis if ANTHROPIC_API_KEY available
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        cmd.append("--use-llm")
+
+    # Add VirusTotal if key available
+    vt_key = os.environ.get("VIRUSTOTAL_API_KEY", "")
+    if vt_key:
+        cmd.extend(["--use-virustotal", "--vt-api-key", vt_key])
+
+    # Add AI Defense if key available
+    aid_key = os.environ.get("AI_DEFENSE_API_KEY", "")
+    if aid_key:
+        cmd.extend(["--use-aidefense", "--aidefense-api-key", aid_key])
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Cisco Skill Scanner timed out after 120s (fail-closed)"
+    except FileNotFoundError:
+        return False, "Cisco Skill Scanner binary not found (fail-closed)"
+    except Exception as exc:
+        return False, f"Cisco Skill Scanner error: {exc} (fail-closed)"
+
+    report = result.stdout or result.stderr or "(no output)"
+
+    if result.returncode != 0:
+        return False, f"Cisco scanner FAILED (exit {result.returncode}):\n{report[:500]}"
+
+    return True, f"Cisco scanner PASSED:\n{report[:300]}"
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1009,55 @@ def _unicode_char_name(char: str) -> str:
     }
     return names.get(char, f"U+{ord(char):04X}")
 
+
+def _parse_llm_response(text: str, skill_name: str) -> List[Finding]:
+    """Parse the LLM's JSON response into Finding objects."""
+    import json as json_mod
+
+    # Extract JSON from the response (handle markdown code blocks)
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+
+    try:
+        data = json_mod.loads(text)
+    except json_mod.JSONDecodeError:
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    findings = []
+    for item in data.get("findings", []):
+        if not isinstance(item, dict):
+            continue
+        desc = item.get("description", "")
+        severity = item.get("severity", "medium")
+        if severity not in ("critical", "high", "medium", "low"):
+            severity = "medium"
+        if desc:
+            findings.append(Finding(
+                pattern_id="llm_audit",
+                severity=severity,
+                category="llm-detected",
+                file="(LLM analysis)",
+                line=0,
+                match=desc[:120],
+                description=f"LLM audit: {desc}",
+            ))
+
+    return findings
+
+
+def _get_configured_model() -> str:
+    """Load the user's configured model from ~/.hermes/config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        return config.get("model", "")
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------

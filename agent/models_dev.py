@@ -142,6 +142,9 @@ class ProviderInfo:
 PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "openrouter": "openrouter",
     "anthropic": "anthropic",
+    # P213/MOL-623 — anthropic-direct reuses Anthropic's models.dev metadata so
+    # claude-sonnet-4-6 inherits supports_reasoning=True via entry["reasoning"].
+    "anthropic-direct": "anthropic",
     "openai": "openai",
     "openai-codex": "openai",
     "zai": "zai",

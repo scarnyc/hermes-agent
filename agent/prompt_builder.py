@@ -1445,17 +1445,22 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     return "# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n" + "\n".join(sections)
 
 
-# P189/MOL-330: session-maintenance marker consumer.
-# Producer side (on_session_finalize in plugins/session-maintenance + the daily
-# sweep cron) writes JSON markers to ~/.hermes/state/maintenance-pending-*.json
-# when a session crosses the heuristic threshold. Until P189 there was NO
-# consumer in the runtime — markers piled up indefinitely. This function is
-# the consumer: on every session start, glob pending markers and prepend a
-# system message instructing the agent to run the diary → revise-context →
-# remember chain for each marker. The remember skill deletes the marker and
-# inserts the maintenance_runs tombstone as its last step.
+# P189/MOL-330 (supersedes P79 / MOL-215): session-maintenance marker consumer.
+# P235/MOL-1995: imperative-first-turn rewrite. P189 wired the consumer but
+# the directive was soft guidance — telemetry across 20260520_062952_f6448827,
+# 20260520_180037_be4d4a4d, 20260521_054752_69548ed2 confirmed the maintenance
+# block reached the model (system_prompt pos=38214/38434) but the LLM deferred
+# to the user's first-turn task on each occasion. Only one P189-driven
+# consumption ever occurred (20260519_054252_ee6f6666 self-tombstone). P235
+# reframes the block as a REQUIRED FIRST ACTION with a numbered three-step
+# tool sequence and scopes the requirement to the OLDEST marker only — the
+# LLM drains one per session instead of being asked to clear the backlog all
+# at once, which keeps user-task latency bounded.
 def build_maintenance_marker_prompt(marker_dir: Optional[str] = None) -> str:
-    """Return a system-prepend listing pending maintenance markers, or ""."""
+    """P79 / MOL-215 (P235/MOL-1995 rewrite) — return a system-prepend that
+    REQUIRES the agent to run the diary → revise-context → remember chain on
+    the oldest pending maintenance marker before addressing the user's first
+    message. Returns "" when no markers are pending."""
     try:
         if marker_dir is None:
             marker_dir = str(Path(get_hermes_home()) / "state")
@@ -1481,12 +1486,21 @@ def build_maintenance_marker_prompt(marker_dir: Optional[str] = None) -> str:
         if len(markers) > 5:
             overflow = f"\n  - ... and {len(markers) - 5} more pending marker(s)"
         return (
-            "# Pending session-maintenance work\n\n"
-            f"{len(markers)} prior session(s) ended without completing the "
-            "maintenance chain. For each marker below, run the "
-            "diary → revise-context → remember skill chain. Pass the "
-            "session_id and heuristic_hit values to the remember skill so it "
-            "tombstones the run and deletes the marker.\n\n"
+            f"# REQUIRED FIRST ACTION — session-maintenance backlog ({len(markers)} pending) [P235/MOL-1995]\n\n"
+            f"{len(markers)} prior session(s) ended without completing the diary chain. "
+            "As your VERY FIRST action this turn — before reading the user's message, "
+            "before any other tool call — you MUST run the diary → revise-context → "
+            "remember skill chain on the OLDEST marker listed below.\n\n"
+            "Steps (one tool call each, in order):\n"
+            "  1. Invoke the `diary` skill, naming the oldest pending session_id.\n"
+            "  2. Invoke the `revise-context` skill.\n"
+            "  3. Invoke the `remember` skill, passing the same session_id and "
+            "heuristic_hit. The remember skill tombstones the run in state.db "
+            "maintenance_runs and deletes the marker file as its last step.\n\n"
+            "After step 3 completes, address the user's actual request. The remaining "
+            "markers will be consumed on subsequent session starts (one per session) — "
+            "do NOT attempt to drain the full backlog this turn.\n\n"
+            "Pending markers (oldest first):\n"
             f"{chr(10).join(entries)}{overflow}\n"
         )
     except Exception as exc:

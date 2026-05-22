@@ -1,5 +1,7 @@
 """Cross-agent file state coordination.
 
+P89/MOL-387: per-agent read/write tracking with staleness detection.
+
 Prevents mangled edits when concurrent subagents (same process, same
 filesystem) touch the same file. Complements the single-agent path-overlap
 check in ``run_agent._should_parallelize_tool_batch`` — this module catches

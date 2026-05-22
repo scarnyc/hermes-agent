@@ -63,9 +63,12 @@ def classify_with_intent_keywords(
     if _COS_PIN_RE.search(text):
         return None
 
-    # Image attachments: primary (Gemini) is stronger at vision than fallbacks.
+    # P120/MOL-455: image attachments route to jira_or_coding (Kimi K2.6 native multimodal).
+    # Pre-MOL-455 primary was Gemini (vision-capable); post-swap primary is
+    # DeepSeek V4 (text-only), so images would silently drop content. K2.6
+    # carries the vision load via the existing bucket.
     if _IMAGE_MARKER_RE.search(text):
-        return None
+        return "jira_or_coding"  # P120/MOL-455
 
     lowered = text.lower()
 

@@ -24,6 +24,7 @@ from tools.delegate_tool import (
     _get_max_concurrent_children,
     _LEGACY_EVENT_MAP,
     MAX_DEPTH,
+    SubagentOverrides,  # P72/MOL-251 — dataclass refactor
     check_delegate_requirements,
     delegate_task,
     _build_child_agent,
@@ -1138,10 +1139,12 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(mock_build.call_count, 2)
             for call in mock_build.call_args_list:
                 self.assertEqual(call.kwargs.get("model"), "meta-llama/llama-4-scout")
-                self.assertEqual(call.kwargs.get("override_provider"), "openrouter")
-                self.assertEqual(call.kwargs.get("override_base_url"), "https://openrouter.ai/api/v1")
-                self.assertEqual(call.kwargs.get("override_api_key"), "sk-or-batch")
-                self.assertEqual(call.kwargs.get("override_api_mode"), "chat_completions")
+                overrides = call.kwargs.get("overrides")
+                self.assertIsNotNone(overrides, "overrides kwarg missing")
+                self.assertEqual(overrides.provider, "openrouter")
+                self.assertEqual(overrides.base_url, "https://openrouter.ai/api/v1")
+                self.assertEqual(overrides.api_key, "sk-or-batch")
+                self.assertEqual(overrides.api_mode, "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -1175,12 +1178,14 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             delegate_task(goal="ACP delegation test", parent_agent=parent)
 
             _, kwargs = mock_build.call_args
-            self.assertEqual(kwargs.get("override_provider"), "copilot-acp")
-            self.assertEqual(kwargs.get("override_base_url"), "acp://copilot")
-            self.assertEqual(kwargs.get("override_api_key"), "copilot-acp")
-            self.assertEqual(kwargs.get("override_api_mode"), "chat_completions")
-            self.assertEqual(kwargs.get("override_acp_command"), "custom-copilot")
-            self.assertEqual(kwargs.get("override_acp_args"), ["--stdio-custom"])
+            overrides = kwargs.get("overrides")
+            self.assertIsNotNone(overrides, "overrides kwarg missing")
+            self.assertEqual(overrides.provider, "copilot-acp")
+            self.assertEqual(overrides.base_url, "acp://copilot")
+            self.assertEqual(overrides.api_key, "copilot-acp")
+            self.assertEqual(overrides.api_mode, "chat_completions")
+            self.assertEqual(overrides.acp_command, "custom-copilot")
+            self.assertEqual(overrides.acp_args, ["--stdio-custom"])
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -1713,8 +1718,10 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent_agent=parent,
             )
             _, kwargs = mock_build.call_args
-            self.assertEqual(kwargs["override_acp_command"], "claude")
-            self.assertEqual(kwargs["override_acp_args"], ["--acp", "--stdio"])
+            overrides = kwargs.get("overrides")
+            self.assertIsNotNone(overrides, "overrides kwarg missing")
+            self.assertEqual(overrides.acp_command, "claude")
+            self.assertEqual(overrides.acp_args, ["--acp", "--stdio"])
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
@@ -2450,6 +2457,124 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestP70CodePathRegex(unittest.TestCase):
+    """P70/MOL-261 — _CODE_PATH_RE must match hermes-agent paths AND reject
+    sibling-prefix collisions (hermes-agent2, hermes-agent-old, hermes-agentFOO).
+    Complements the existing smoke test in PATCHES.md P70 with pytest coverage
+    so `hermes update` → test-suite drift surfaces immediately.
+    """
+
+    def _match(self, s):
+        from tools.delegate_tool import _CODE_PATH_RE
+        m = _CODE_PATH_RE.search(s)
+        return m.group(1) if m else None
+
+    # Positive cases — these MUST match.
+    def test_matches_tilde_hermes_agent(self):
+        self.assertEqual(self._match("~/.hermes/hermes-agent"), "~/.hermes/hermes-agent")
+
+    def test_matches_tilde_hermes_agent_subpath(self):
+        self.assertEqual(
+            self._match("~/.hermes/hermes-agent/tools/delegate_tool.py"),
+            "~/.hermes/hermes-agent/tools/delegate_tool.py",
+        )
+
+    def test_matches_absolute_hermes_agent(self):
+        self.assertEqual(
+            self._match("/Users/wills_mac_mini/.hermes/hermes-agent/run_agent.py"),
+            "/Users/wills_mac_mini/.hermes/hermes-agent/run_agent.py",
+        )
+
+    def test_matches_tilde_code(self):
+        self.assertEqual(
+            self._match("~/Code/hermes-poc/foo.py"),
+            "~/Code/hermes-poc/foo.py",
+        )
+
+    def test_matches_absolute_code(self):
+        self.assertEqual(
+            self._match("/Users/will/Code/hermes-poc"),
+            "/Users/will/Code/hermes-poc",
+        )
+
+    def test_matches_hermes_agent_in_sentence(self):
+        self.assertEqual(
+            self._match("please fix ~/.hermes/hermes-agent/run_agent.py today"),
+            "~/.hermes/hermes-agent/run_agent.py",
+        )
+
+    # Negative-lookahead cases — these MUST NOT match (prevent prefix collision).
+    def test_rejects_hermes_agent2(self):
+        self.assertIsNone(self._match("~/.hermes/hermes-agent2/foo"))
+
+    def test_rejects_hermes_agent_dash_old(self):
+        self.assertIsNone(self._match("~/.hermes/hermes-agent-old/foo"))
+
+    def test_rejects_hermes_agentFOO(self):
+        self.assertIsNone(self._match("~/.hermes/hermes-agentFOO/x"))
+
+    # Unrelated paths — these MUST NOT match.
+    def test_rejects_hermes_skills(self):
+        self.assertIsNone(self._match("edit ~/.hermes/skills/foo"))
+
+    def test_rejects_claude_plans(self):
+        self.assertIsNone(self._match("~/.claude/plans"))
+
+    def test_rejects_prose_only(self):
+        self.assertIsNone(self._match("what time is it"))
+
+
+class TestP72SubagentOverridesDataclass(unittest.TestCase):
+    """P72/MOL-251 — locks SubagentOverrides shape + _build_child_agent signature.
+
+    The dataclass collapses 7 individual override_* kwargs into one object;
+    these tests prevent silent field drift or accidental re-introduction of
+    the old kwargs.
+    """
+
+    def test_field_count(self):
+        import dataclasses
+        self.assertEqual(len(dataclasses.fields(SubagentOverrides)), 7)
+
+    def test_default_none_semantics(self):
+        o = SubagentOverrides()
+        self.assertIsNone(o.provider)
+        self.assertIsNone(o.base_url)
+        self.assertIsNone(o.api_key)
+        self.assertIsNone(o.api_mode)
+        self.assertIsNone(o.acp_command)
+        self.assertIsNone(o.acp_args)
+        self.assertIsNone(o.fallback_model)
+
+    def test_explicit_construction_round_trip(self):
+        o = SubagentOverrides(
+            provider="openrouter",
+            base_url="https://u",
+            api_key="k",
+            api_mode="chat",
+            acp_command="cmd",
+            acp_args=["-x"],
+            fallback_model={"provider": "p", "model": "m"},
+        )
+        self.assertEqual(o.provider, "openrouter")
+        self.assertEqual(o.base_url, "https://u")
+        self.assertEqual(o.api_key, "k")
+        self.assertEqual(o.api_mode, "chat")
+        self.assertEqual(o.acp_command, "cmd")
+        self.assertEqual(o.acp_args, ["-x"])
+        self.assertEqual(o.fallback_model, {"provider": "p", "model": "m"})
+
+    def test_build_child_agent_signature(self):
+        import inspect
+        from tools.delegate_tool import _build_child_agent
+        params = list(inspect.signature(_build_child_agent).parameters.keys())
+        self.assertIn("overrides", params)
+        self.assertFalse(
+            any(p.startswith("override_") for p in params),
+            f"stale override_* kwarg in signature: {params}",
+        )
 
 
 if __name__ == "__main__":
