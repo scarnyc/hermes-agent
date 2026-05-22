@@ -20,6 +20,8 @@ import enum
 import hashlib  # P103/MOL-410 — prompt_hash in audit log
 import json
 import logging
+import urllib.error
+import urllib.request
 
 logger = logging.getLogger(__name__)
 # P92/MOL-388 — Override parent's inherited ERROR level (set by quiet_mode in
@@ -3326,6 +3328,33 @@ _ROLE_KEYWORDS: list = [
     ("builder", ("implement", "build", "create", "refactor", "add a", "fix the")),
 ]
 
+# P91/MOL-387-Phase2 — Arch-Router semantic role classifier (cloud API path).
+# Ollama was retired in MOL-560; this uses DeepSeek API as the semantic
+# fallback when classifier=arch-router in config. Keyword fallback (P87)
+# catches any API failure deterministically.
+_ROLE_ALIASES: dict[str, str] = {
+    "debug": "debugger", "design": "designer", "code review": "reviewer",
+    "plan": "planner", "architect": "architect", "build": "builder",
+    "implement": "builder", "test": "debugger", "analyze": "analyst",
+    "audit": "analyst", "research": "analyst", "review": "reviewer",
+    "ticket": "planner", "triage": "ticketer",
+}
+
+_ARCH_ROUTER_API_URL = "https://api.deepseek.com/v1/chat/completions"
+_ARCH_ROUTER_API_KEY_ENV = "DEEPSEEK_API_KEY"
+_ARCH_ROUTER_MODEL = "deepseek-v4-pro"
+_ARCH_ROUTER_TIMEOUT = 5  # seconds (cold-start safety margin)
+
+_ARCH_ROLE_SYSTEM = (
+    "You are a task classifier. Given a task description, output exactly "
+    "one word: the role best suited to handle it.\n"
+    "Available roles: {role_names}.\n"
+    "{role_descriptions}\n\n"
+    "Output ONLY the role name, nothing else. No punctuation, no explanation."
+)
+
+_ARCH_ROLE_USER_TEMPLATE = "Classify this task into exactly one role: {task_text}"
+
 
 def _detect_role_from_task(goal: str, context: str) -> Optional[str]:
     """P87/MOL-387 — Detect the best-matching delegator role from task text.
@@ -3358,6 +3387,129 @@ def _detect_role_from_task(goal: str, context: str) -> Optional[str]:
             [(r, kws) for r, kws in all_matches],
         )
     return winner
+
+
+# P91/MOL-387-Phase2 — semantic role classifier via cloud API.
+# Returns canonical role name or None (caller falls back to P87 keyword matching).
+def _detect_role_with_arch_router(
+    goal: str, context: str, cfg: Dict[str, Any]
+) -> Optional[str]:
+    """Classify a delegation task into a role using the DeepSeek API.
+
+    Returns the canonical role name on success, or None on any failure
+    (API error, timeout, malformed response, missing config).  The caller
+    is responsible for falling back to ``_detect_role_from_task``.
+    """
+    role_profiles = cfg.get("role_profiles") or {}
+    if not role_profiles:
+        logger.debug(
+            "[delegate_tool] _detect_role_with_arch_router: "
+            "role_profiles missing or empty — returning None"
+        )
+        return None
+
+    # Build role names + descriptions for the classifier prompt.
+    role_names: list[str] = []
+    role_descriptions: list[str] = []
+    for name, profile in sorted(role_profiles.items()):
+        if not isinstance(profile, dict):
+            continue
+        role_names.append(name)
+        desc = profile.get("description", name)
+        role_descriptions.append(f"- {name}: {desc}")
+
+    if not role_names:
+        logger.debug(
+            "[delegate_tool] _detect_role_with_arch_router: "
+            "no valid role profiles after filtering"
+        )
+        return None
+
+    system_msg = _ARCH_ROLE_SYSTEM.format(
+        role_names=", ".join(role_names),
+        role_descriptions="\n".join(role_descriptions),
+    )
+    task_text = f"{goal or ''} {context or ''}".strip()[:2000]
+    user_msg = _ARCH_ROLE_USER_TEMPLATE.format(task_text=task_text)
+
+    api_key = os.environ.get(_ARCH_ROUTER_API_KEY_ENV)
+    if not api_key:
+        logger.warning(
+            "[delegate_tool] _detect_role_with_arch_router: "
+            "%s not in environment — returning None",
+            _ARCH_ROUTER_API_KEY_ENV,
+        )
+        return None
+
+    payload = json.dumps({
+        "model": _ARCH_ROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0,
+        "max_tokens": 5,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        _ARCH_ROUTER_API_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        # Safe: _ARCH_ROUTER_API_URL is a module-level HTTPS constant.
+        with urllib.request.urlopen(req, timeout=_ARCH_ROUTER_TIMEOUT) as resp:  # nosec B310
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError,
+            ValueError, KeyError, IndexError) as exc:
+        logger.debug(
+            "[delegate_tool] _detect_role_with_arch_router: "
+            "API call failed: %s",
+            exc,
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "[delegate_tool] _detect_role_with_arch_router: "
+            "unexpected error: %s",
+            exc,
+        )
+        return None
+
+    try:
+        raw = body["choices"][0]["message"]["content"].strip().lower()
+    except (KeyError, IndexError, TypeError) as exc:
+        logger.debug(
+            "[delegate_tool] _detect_role_with_arch_router: "
+            "malformed response body: %s",
+            exc,
+        )
+        return None
+
+    # Strip punctuation that LLMs sometimes emit ("debugger." → "debugger").
+    raw = raw.rstrip(".,;:!?")
+
+    # Check full-text alias first, then first-word alias.
+    canonical = _ROLE_ALIASES.get(raw) or _ROLE_ALIASES.get(raw.split()[0] if raw else "")
+
+    if canonical and canonical in role_profiles:
+        logger.info(
+            "[delegate_tool] _detect_role_with_arch_router: "
+            "classified role=%s (raw=%r)",
+            canonical, raw,
+        )
+        return canonical
+
+    logger.debug(
+        "[delegate_tool] _detect_role_with_arch_router: "
+        "unrecognized role %r — returning None",
+        raw,
+    )
+    return None
 
 
 def _resolve_role_profile(role: Optional[str], cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -3556,15 +3708,37 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # P87/MOL-387 — Auto-detect role from task text.
-    # Gated behind delegation.role_detection.enabled (default: false), so
-    # this is a no-op unless an operator opts in via config.yaml.  Keyword-
-    # only classifier — Arch-Router branch retired with Ollama removal
-    # (MOL-560).  When a match fires, `role` + `top_role` get updated so
-    # downstream child-spawning uses the detected profile.
+    # P87/MOL-387 + P91/MOL-387-Phase2 — Auto-detect role from task text.
+    # Gated behind delegation.role_detection.enabled (default: false).
+    # Two classifiers: "keyword" (P87, deterministic, <1us) and "arch-router"
+    # (P91, semantic via DeepSeek API, ~1-3s).  Arch-router falls back to
+    # keyword on any failure.  Unknown classifier values fall back to keyword
+    # with a WARNING.
     if not role and cfg.get("role_detection", {}).get("enabled"):
         classifier = cfg.get("role_detection", {}).get("classifier", "keyword")
-        detected = _detect_role_from_task(goal or "", context or "")
+        detected = None
+        if classifier == "arch-router":
+            # P91/MOL-387-Phase2 — semantic classifier via cloud API.
+            detected = _detect_role_with_arch_router(
+                goal or "", context or "", cfg
+            )
+            if not detected:
+                detected = _detect_role_from_task(goal or "", context or "")
+                if detected:
+                    logger.info(
+                        "[delegate_task] Arch-Router failed — "
+                        "keyword fallback detected role=%s",
+                        detected,
+                    )
+        elif classifier == "keyword":
+            detected = _detect_role_from_task(goal or "", context or "")
+        else:
+            logger.warning(
+                "[delegate_task] Unknown classifier=%r — "
+                "falling back to keyword matching",
+                classifier,
+            )
+            detected = _detect_role_from_task(goal or "", context or "")
         if detected:
             role = detected
             top_role = _normalize_role(role)

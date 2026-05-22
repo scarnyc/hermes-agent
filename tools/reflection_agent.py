@@ -16,7 +16,7 @@ for the structural verifier:
     MOL-TBD — catches the MOL-236 "created 4 sub-tickets and called it done"
     pattern).
 
-Uses Kimi K2.5 via OpenRouter as the reviewer (single-turn, JSON output).
+Uses Kimi K2.6 via direct Moonshot API as the reviewer (single-turn, JSON output).
 Writes concerns to stdout and appends one JSONL line per invocation to
 ~/.hermes/logs/reflection-agent.log.
 
@@ -95,7 +95,7 @@ def _get_client():
 
 
 def _call_kimi(prompt: str) -> str:
-    """Single-turn Kimi K2.5 call. Returns response content string.
+    """Single-turn Kimi K2.6 call. Returns response content string.
 
     Kimi gotchas honored (per CLAUDE.md):
       - temperature fixed at 1.0 (provider-imposed).
@@ -500,7 +500,7 @@ REFLECT_ON_OUTPUT_SCHEMA = {
     "function": {
         "name": "reflect_on_output",
         "description": (
-            "Run the semantic reviewer (Kimi K2.5) on a block of agent output "
+            "Run the semantic reviewer (Kimi K2.6) on a block of agent output "
             "and return a JSON-serialized list of concerns (severity, "
             "category, description, evidence). Use when you want a second-pass "
             "check on a long answer before delivering it."

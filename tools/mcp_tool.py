@@ -90,7 +90,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -3327,6 +3327,40 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
     finally:
         _stop_mcp_loop()
 
+    return result
+
+
+# === P78 / MOL-324: tool inventory in system prompt ===
+def get_registered_tools_by_server() -> Dict[str, List[Tuple[str, str]]]:
+    """Return ``{server_name: [(prefixed_tool_name, description), ...]}``
+    from the live ``_servers`` registry.
+
+    Reads what is already connected at agent init — no I/O, safe for hot-path
+    use during system-prompt assembly.  Empty dict if no servers connected.
+    """
+    from tools.registry import registry
+
+    result: Dict[str, List[Tuple[str, str]]] = {}
+    with _lock:
+        servers_snapshot = list(_servers.items())
+    for name, server in servers_snapshot:
+        registered = list(server._registered_tool_names)
+        if not registered:
+            continue
+        pairs: List[Tuple[str, str]] = []
+        for prefixed in registered:
+            schema = registry.get_schema(prefixed)
+            if schema is None:
+                logger.warning(
+                    "MCP tool '%s' in server '%s' _registered_tool_names "
+                    "but absent from central registry — skipping in inventory",
+                    prefixed, name,
+                )
+                continue
+            description = schema.get("function", {}).get("description", "") or ""
+            pairs.append((prefixed, description))
+        if pairs:
+            result[name] = pairs
     return result
 
 

@@ -172,7 +172,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, build_maintenance_marker_prompt, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, build_maintenance_marker_prompt, build_tool_inventory_prompt, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -2662,11 +2662,80 @@ class AIAgent:
                 "error": str(error)[:1000],
                 "args": args_repr,
             })
+            # P51/MOL-233 — increment per-tool error counter for retry cap.
+            # Cap-key is (tool_name, normalized target/URL) so same-tool
+            # different-URL calls don't share a counter.
+            try:
+                cap_key = self._mol233_cap_key(
+                    str(tool_name),
+                    str(args_repr) if args_repr else "",
+                )
+                self._tool_error_history[cap_key] = (
+                    self._tool_error_history.get(cap_key, 0) + 1
+                )
+            except Exception:
+                pass  # recording failure must not break the tool-execution path
         except Exception as exc:
             # Never let error-recording itself raise — but DO log so future
             # debugging is possible if self._tool_errors ever becomes
             # non-list or similar invariant breaks.
             logger.debug("_record_tool_error swallowed exception: %r", exc)
+
+    # P51/MOL-233 — tool retry-cap class attrs.
+    _MOL233_CAPPED_TOOLS = frozenset({
+        "browser_navigate", "web_extract", "web_search",
+    })
+    _MOL233_ERROR_CAP = 3  # max errors per (tool, target) before synthetic failure
+
+    # P51/MOL-233 — normalize a tool target for the cap key.
+    # For browser/web tools the target is a URL; strip query/hash for
+    # stability so example.com/page?a=1 and example.com/page?b=2 share a key.
+    @staticmethod
+    def _mol233_normalize_target(target: str) -> str:
+        """Normalize a tool target (URL) for retry-cap grouping."""
+        t = str(target).strip()
+        if not t:
+            return ""
+        # Strip query string and fragment from URLs.
+        for sep in ("?", "#"):
+            idx = t.find(sep)
+            if idx > 0:
+                t = t[:idx]
+        # Strip trailing slash for consistency.
+        return t.rstrip("/")
+
+    # P51/MOL-233 — build the retry-cap lookup key.
+    @staticmethod
+    def _mol233_cap_key(tool_name: str, target: str) -> tuple[str, str]:
+        """Return the (tool_name, normalized_target) key for cap tracking."""
+        return (str(tool_name), AIAgent._mol233_normalize_target(target))
+
+    # P51/MOL-233 — check whether a tool+target has exceeded the error cap.
+    def _mol233_check_cap(self, tool_name: str, target: str) -> bool:
+        """Return True if further retries should be blocked for this tool+target.
+
+        Increments _tool_call_history on every call.  When the error count
+        for (tool_name, normalized_target) exceeds _MOL233_ERROR_CAP AND the
+        tool is in _MOL233_CAPPED_TOOLS, returns True (block).  Otherwise
+        returns False (allow).
+        """
+        if tool_name not in self._MOL233_CAPPED_TOOLS:
+            return False
+        cap_key = self._mol233_cap_key(tool_name, target)
+        self._tool_call_history[cap_key] = (
+            self._tool_call_history.get(cap_key, 0) + 1
+        )
+        errors = self._tool_error_history.get(cap_key, 0)
+        if errors > self._MOL233_ERROR_CAP:
+            logger.info(
+                "tool_retry_cap exceeded for %s/%s "
+                "(errors=%d, cap=%d, total_calls=%d)",
+                tool_name, self._mol233_normalize_target(target),
+                errors, self._MOL233_ERROR_CAP,
+                self._tool_call_history[cap_key],
+            )
+            return True
+        return False
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.

@@ -1208,6 +1208,130 @@ def build_skills_system_prompt(
     return result
 
 
+# === P78 / MOL-324: tool inventory in system prompt ===
+# Hand-maintained one-liners keyed by MCP server name.  Servers missing from
+# this map fall back to the first registered tool's description (truncated).
+MCP_SERVER_PURPOSES: "dict[str, str]" = {
+    "context7": "library docs (React, Next.js, Prisma, etc.) — current versions, not training data",
+    "copilotkit": "CopilotKit + AG-UI documentation and code search for generative-UI / frontend tools",
+    "chrome-devtools": "browser automation, performance traces, Lighthouse audits, accessibility checks",
+    "markitdown": "convert PDF / DOCX / PPTX / XLSX / HTML to Markdown",
+}
+
+# Denylist for plumbing tools excluded from the Built-in section.  Currently
+# empty — the empty-description and "Internal:" prefix heuristic catches every
+# plumbing tool today.  Extension point for tools the heuristic can't catch.
+INTERNAL_TOOL_DENYLIST: "frozenset[str]" = frozenset()
+
+# CLI tools available through the ``terminal`` tool — not in any registry,
+# but materially how Hermes builds and tests UIs.
+CLI_TOOLS_VIA_TERMINAL: "list[tuple[str, str]]" = [
+    ("shadcn", "shadcn/ui component installer (pnpm dlx shadcn@latest add <component>)"),
+    ("playwright-cli", "headed browser automation (token-light vs Playwright MCP)"),
+    ("crawl4ai-wrapper.sh", "URL → markdown extraction with SSRF guard"),
+    ("gws", "Google Workspace CLI (calendar, gmail, drive, docs)"),
+    ("jira", "Atlassian Jira CLI (issue list / view / edit, comment add)"),
+]
+
+
+def build_tool_inventory_prompt(
+    valid_tool_names: "set[str] | None" = None,
+    tool_schemas: "list[dict] | None" = None,
+) -> str:
+    """Build a ``<tool_inventory>`` block listing the agent's actual tools.
+
+    Three sections, all sorted for byte-stable output across restarts:
+    1. Built-in tools — filtered through INTERNAL_TOOL_DENYLIST and the
+       empty / Internal: description heuristic.
+    2. MCP servers connected — one sub-block per server from the live
+       _servers registry.  Server purpose from MCP_SERVER_PURPOSES.
+    3. CLI tools available via terminal — hardcoded list.
+    """
+    parts: list[str] = []
+
+    # Build a name → schema lookup once.
+    schema_by_name: "dict[str, dict]" = {}
+    if tool_schemas:
+        for s in tool_schemas:
+            fn = s.get("function") if isinstance(s, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            n = fn.get("name")
+            if isinstance(n, str):
+                schema_by_name[n] = fn
+
+    # ── Section 1: Built-in tools ──
+    builtin_lines: list[str] = []
+    if valid_tool_names:
+        for name in sorted(valid_tool_names):
+            if name.startswith("mcp_"):
+                continue
+            if name in INTERNAL_TOOL_DENYLIST:
+                continue
+            fn = schema_by_name.get(name, {})
+            desc = (fn.get("description") or "").strip()
+            if not desc or desc.startswith("Internal:"):
+                continue
+            desc_one_line = " ".join(desc.split())
+            if len(desc_one_line) > 200:
+                desc_one_line = desc_one_line[:197] + "..."
+            builtin_lines.append(f"- {name}: {desc_one_line}")
+    if builtin_lines:
+        parts.append("## Built-in tools\n" + "\n".join(builtin_lines))
+
+    # ── Section 2: MCP servers connected ──
+    mcp_block_lines: list[str] = []
+    try:
+        from tools.mcp_tool import get_registered_tools_by_server
+        mcp_by_server = get_registered_tools_by_server()
+    except (ImportError, AttributeError) as exc:
+        logger.warning(
+            "MCP registry accessor unavailable for tool inventory "
+            "(P78 not applied or upstream drift?): %s", exc,
+        )
+        mcp_by_server = {}
+
+    for server_name in sorted(mcp_by_server.keys()):
+        tools = mcp_by_server[server_name]
+        if not tools:
+            continue
+        sorted_tools = sorted(tools, key=lambda t: t[0])
+        purpose = MCP_SERVER_PURPOSES.get(server_name, "")
+        if not purpose:
+            first_desc = " ".join((sorted_tools[0][1] or "").split())
+            purpose = (first_desc[:80] + "...") if len(first_desc) > 80 else first_desc
+        header = f"### {server_name}" + (f" — {purpose}" if purpose else "")
+        mcp_block_lines.append(header)
+        for tool_name, desc in sorted_tools:
+            d = " ".join((desc or "").split())
+            if len(d) > 200:
+                d = d[:197] + "..."
+            mcp_block_lines.append(f"- {tool_name}: {d}" if d else f"- {tool_name}")
+
+    if mcp_block_lines:
+        parts.append("## MCP servers connected\n" + "\n".join(mcp_block_lines))
+
+    # ── Section 3: CLI tools via terminal ──
+    if CLI_TOOLS_VIA_TERMINAL:
+        cli_lines = [f"- {name}: {desc}" for name, desc in CLI_TOOLS_VIA_TERMINAL]
+        parts.append(
+            "## CLI tools available via terminal\n" + "\n".join(cli_lines)
+        )
+
+    if not parts:
+        return ""
+
+    body = "\n\n".join(parts)
+    return (
+        "<tool_inventory>\n"
+        "When asked about your capabilities, enumerate from this list; "
+        "do not search docs about yourself.\n"
+        "\n"
+        + body + "\n"
+        "</tool_inventory>"
+    )
+
+
 def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:
     """Build a compact Nous subscription capability block for the system prompt."""
     try:

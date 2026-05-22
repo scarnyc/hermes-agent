@@ -1342,19 +1342,18 @@ done
 RUNAG="$HERMES_AGENT/run_agent.py"
 GWR="$HERMES_AGENT/gateway/run.py"
 
-# DEFERRED — see MOL-1974 (P51/MOL-233 tool-retry-cap symbols scrubbed from runtime: _tool_call_history,
-# _tool_error_history, _mol233_normalize_target/_cap_key/_check_cap, _MOL233_CAPPED_TOOLS frozenset,
-# tool_retry_cap log, gateway retry_cap_exceeded surface. Only _tool_call_history survives in a
-# legacy test file. Functionality removed by upstream modular refactor — restore via followup.)
-# check "P51 _tool_call_history init"              "$RUNAG" "self\._tool_call_history: dict"
-# check "P51 _tool_error_history init"             "$RUNAG" "self\._tool_error_history: dict"
-# check "P51 _mol233_normalize_target method"      "$RUNAG" "def _mol233_normalize_target"
-# check "P51 _mol233_cap_key method"               "$RUNAG" "def _mol233_cap_key"
-# check "P51 _mol233_check_cap method"             "$RUNAG" "def _mol233_check_cap"
-# check "P51 _MOL233_CAPPED_TOOLS frozenset"       "$RUNAG" "_MOL233_CAPPED_TOOLS = frozenset"
-# check "P51 clear() in run_conversation"          "$RUNAG" "self\._tool_error_history\.clear\(\)"
-# check "P51 tool_retry_cap log string"            "$RUNAG" "tool_retry_cap tool=%s target=%s"
-# check "P51 gateway surfaces retry_cap_exceeded"  "$GWR"   "retry_cap_exceeded"
+# P51/MOL-233 tool-retry-cap — re-implemented 2026-05-22 (MOL-1974 Phase 2-Restart).
+# Dict init moved to agent/agent_init.py; helpers in run_agent.py; cap checks in
+# agent/tool_executor.py; clear in agent/conversation_loop.py; gateway surface in gateway/run.py.
+check "P51 _tool_call_history init"              "$HERMES_AGENT/agent/agent_init.py" "agent\._tool_call_history: dict"
+check "P51 _tool_error_history init"             "$HERMES_AGENT/agent/agent_init.py" "agent\._tool_error_history: dict"
+check "P51 _mol233_normalize_target method"      "$RUNAG" "def _mol233_normalize_target"
+check "P51 _mol233_cap_key method"               "$RUNAG" "def _mol233_cap_key"
+check "P51 _mol233_check_cap method"             "$RUNAG" "def _mol233_check_cap"
+check "P51 _MOL233_CAPPED_TOOLS frozenset"       "$RUNAG" "_MOL233_CAPPED_TOOLS = frozenset"
+check "P51 clear() in run_conversation"          "$HERMES_AGENT/agent/conversation_loop.py" "agent\._tool_error_history\.clear\(\)"
+check "P51 _mol233_check_cap in tool_executor"   "$HERMES_AGENT/agent/tool_executor.py" "agent\._mol233_check_cap"
+check "P51 gateway surfaces retry_cap_exceeded"  "$GWR"   "retry_cap_exceeded"
 
 # ---------------------------------------------------------------------------
 # P52 — MOL-233 delegation truthfulness verification.
@@ -1428,33 +1427,31 @@ check "P53+P64 no-cosplay warning (inverted)"    "$AGENTSMD" "Do NOT cosplay a s
 # `grep_c_footgun` and `verify_patches_marker_drift_guard`). Implementation-
 # string checks don't catch wrong-P-number re-applies; these do.
 # ---------------------------------------------------------------------------
-# DEFERRED — see MOL-1974 (P51/MOL-233 tool-retry-cap markers scrubbed from
-# run_agent.py + gateway/run.py by upstream modular refactor; sibling of P51
-# main check-block above. P52 marker loop below retained — delegate_tool.py
-# markers still present.)
-# [[ $QUIET -eq 0 ]] && echo ""
-# [[ $QUIET -eq 0 ]] && echo "=== P51/P52 MOL-233 patch-marker presence (renumber-drift guard) ==="
-#
-# for _spec in "run_agent.py|$RUNAG|5" "gateway/run.py|$GWR|1"; do
-#     _name="${_spec%%|*}"
-#     _rest="${_spec#*|}"
-#     _path="${_rest%|*}"
-#     _min="${_rest##*|}"
-#     total=$((total + 1))
-#     if [ ! -f "$_path" ]; then
-#         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m P51/MOL-233 markers in %s — file missing\n' "$_name"
-#         failed=$((failed + 1))
-#         continue
-#     fi
-#     _count=$(grep -c "P51/MOL-233" "$_path")
-#     if [ "$_count" -ge "$_min" ]; then
-#         [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m P51/MOL-233 markers in %s (>=%s, have %s)\n' "$_name" "$_min" "$_count"
-#         passed=$((passed + 1))
-#     else
-#         [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m P51/MOL-233 markers in %s (expected >=%s, have %s)\n' "$_name" "$_min" "$_count"
-#         failed=$((failed + 1))
-#     fi
-# done
+# P51/MOL-233 patch-marker presence (renumber-drift guard).
+# Re-implemented 2026-05-22 across 5 files post-MOL-597 refactor.
+[[ $QUIET -eq 0 ]] && echo ""
+[[ $QUIET -eq 0 ]] && echo "=== P51/P52 MOL-233 patch-marker presence (renumber-drift guard) ==="
+
+for _spec in "run_agent.py|$RUNAG|5" "gateway/run.py|$GWR|1" "agent/agent_init.py|$HERMES_AGENT/agent/agent_init.py|1" "agent/tool_executor.py|$HERMES_AGENT/agent/tool_executor.py|1" "agent/conversation_loop.py|$HERMES_AGENT/agent/conversation_loop.py|1"; do
+    _name="${_spec%%|*}"
+    _rest="${_spec#*|}"
+    _path="${_rest%|*}"
+    _min="${_rest##*|}"
+    total=$((total + 1))
+    if [ ! -f "$_path" ]; then
+        [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m P51/MOL-233 markers in %s — file missing\n' "$_name"
+        failed=$((failed + 1))
+        continue
+    fi
+    _count=$(grep -c "P51/MOL-233" "$_path")
+    if [ "$_count" -ge "$_min" ]; then
+        [[ $QUIET -eq 0 ]] && printf '  \033[0;32m[✓]\033[0m P51/MOL-233 markers in %s (>=%s, have %s)\n' "$_name" "$_min" "$_count"
+        passed=$((passed + 1))
+    else
+        [[ $QUIET -eq 0 ]] && printf '  \033[0;31m[✗]\033[0m P51/MOL-233 markers in %s (expected >=%s, have %s)\n' "$_name" "$_min" "$_count"
+        failed=$((failed + 1))
+    fi
+done
 
 for _spec in "tools/delegate_tool.py|$DELEGATE|3"; do
     _name="${_spec%%|*}"
@@ -2138,42 +2135,35 @@ check_fixed "P77 pytest class TestFallbackOnEmptyExhaustedConfig present" \
 # silent header drift.  Includes post-review hardening:
 # - INTERNAL_TOOL_DENYLIST is a frozenset (immutable; was set with dead names)
 # - registry_tools_by_server logs WARNING on schema-None invariant
-# - prompt_builder logs WARNING on accessor ImportError/AttributeError
-# - sorted_tools[0] fallback for unmapped MCP servers
-# DEFERRED — see MOL-1974 (P78/MOL-324 tool inventory in system prompt scrubbed from runtime:
-# get_registered_tools_by_server, build_tool_inventory_prompt, MCP_SERVER_PURPOSES,
-# CLI_TOOLS_VIA_TERMINAL, INTERNAL_TOOL_DENYLIST frozenset, schema-None warning, pytest class.
-# Only documentation/verifier refs survive. Restore in followup.)
-# check_fixed "P78 get_registered_tools_by_server defined" \
-#     "$HERMES_AGENT/tools/mcp_tool.py" \
-#     "def get_registered_tools_by_server"
-# check_fixed "P78 build_tool_inventory_prompt defined" \
-#     "$HERMES_AGENT/agent/prompt_builder.py" \
-#     "def build_tool_inventory_prompt"
-# check_fixed "P78 build_tool_inventory_prompt imported in run_agent" \
-#     "$HERMES_AGENT/run_agent.py" \
-#     "build_tool_inventory_prompt"
-# check_marker_count "P78/MOL-324 markers in run_agent.py at 2 sites" \
-#     "$HERMES_AGENT/run_agent.py" \
-#     "P78 / MOL-324" 2
-# check_fixed "P78 MCP_SERVER_PURPOSES constant present" \
-#     "$HERMES_AGENT/agent/prompt_builder.py" \
-#     "MCP_SERVER_PURPOSES"
-# check_fixed "P78 CLI_TOOLS_VIA_TERMINAL constant present" \
-#     "$HERMES_AGENT/agent/prompt_builder.py" \
-#     "CLI_TOOLS_VIA_TERMINAL"
-# check_fixed "P78 INTERNAL_TOOL_DENYLIST is frozenset (immutability lock)" \
-#     "$HERMES_AGENT/agent/prompt_builder.py" \
-#     "INTERNAL_TOOL_DENYLIST: \"frozenset"
-# check_fixed "P78 schema-None warning in registry accessor" \
-#     "$HERMES_AGENT/tools/mcp_tool.py" \
-#     "absent from central registry"
-# check_fixed "P78 WARNING-level on accessor failure (not silent debug)" \
-#     "$HERMES_AGENT/agent/prompt_builder.py" \
-#     "MCP registry accessor unavailable"
-# check_fixed "P78 pytest class TestBuildToolInventoryPrompt present" \
-#     "$HERMES_AGENT/tests/agent/test_prompt_builder.py" \
-#     "class TestBuildToolInventoryPrompt"
+# P78/MOL-324 tool inventory — re-implemented 2026-05-22 (MOL-1974 Phase 2-Restart).
+# Post-MOL-597: injection moved from run_agent.py to agent/system_prompt.py.
+check_fixed "P78 get_registered_tools_by_server defined" \
+    "$HERMES_AGENT/tools/mcp_tool.py" \
+    "def get_registered_tools_by_server"
+check_fixed "P78 build_tool_inventory_prompt defined" \
+    "$HERMES_AGENT/agent/prompt_builder.py" \
+    "def build_tool_inventory_prompt"
+check_fixed "P78 build_tool_inventory_prompt imported in run_agent" \
+    "$HERMES_AGENT/run_agent.py" \
+    "build_tool_inventory_prompt"
+check_fixed "P78 injected in system_prompt.py" \
+    "$HERMES_AGENT/agent/system_prompt.py" \
+    "build_tool_inventory_prompt"
+check_fixed "P78 MCP_SERVER_PURPOSES constant present" \
+    "$HERMES_AGENT/agent/prompt_builder.py" \
+    "MCP_SERVER_PURPOSES"
+check_fixed "P78 CLI_TOOLS_VIA_TERMINAL constant present" \
+    "$HERMES_AGENT/agent/prompt_builder.py" \
+    "CLI_TOOLS_VIA_TERMINAL"
+check_fixed "P78 INTERNAL_TOOL_DENYLIST is frozenset (immutability lock)" \
+    "$HERMES_AGENT/agent/prompt_builder.py" \
+    "INTERNAL_TOOL_DENYLIST: \"frozenset"
+check_fixed "P78 schema-None warning in registry accessor" \
+    "$HERMES_AGENT/tools/mcp_tool.py" \
+    "absent from central registry"
+check_fixed "P78 WARNING-level on accessor failure (not silent debug)" \
+    "$HERMES_AGENT/agent/prompt_builder.py" \
+    "MCP registry accessor unavailable"
 
 # === P79 / MOL-215: session-maintenance framework ===
 # Five runtime patch sites: (1) host wrapper script, (2) runtime plugin
@@ -2422,40 +2412,38 @@ fi
 #     "P87/MOL-387" 1
 
 [[ $QUIET -eq 0 ]] && echo "=== P91 / MOL-387-Phase2: Arch-Router Intelligent Role Auto-Detection ==="
-# DEFERRED — see MOL-1974 (P91/MOL-387-Phase2 Arch-Router intelligent role auto-detection scrubbed:
-# _detect_role_with_arch_router, _ROLE_ALIASES, classifier=='arch-router' dispatch, classifier key
-# in DEFAULT_CONFIG, P91 markers. Blocked on P87 restore — Arch-Router was Phase 2 of the 8-role
-# system; restore P87 prerequisite first.)
-# check_fixed "P91 _detect_role_with_arch_router function defined" \
-#     "$HERMES_AGENT/tools/delegate_tool.py" \
-#     "def _detect_role_with_arch_router("
-# check_fixed "P91 _ROLE_ALIASES defined" \
-#     "$HERMES_AGENT/tools/delegate_tool.py" \
-#     "_ROLE_ALIASES"
-# check_fixed "P91 classifier == arch-router dispatch" \
-#     "$HERMES_AGENT/tools/delegate_tool.py" \
-#     'classifier == "arch-router"'
-# check_fixed "P91 classifier key in config.py DEFAULT_CONFIG" \
-#     "$HERMES_AGENT/hermes_cli/config.py" \
-#     '"classifier": "keyword"'
-# check_marker_count "P91/MOL-387-Phase2 marker in delegate_tool.py" \
-#     "$HERMES_AGENT/tools/delegate_tool.py" \
-#     "P91/MOL-387-Phase2" 3
-# check_marker_count "P91/MOL-387-Phase2 marker in config.py" \
-#     "$HERMES_AGENT/hermes_cli/config.py" \
-#     "P91/MOL-387-Phase2" 1
+# P91/MOL-387-Phase2 Arch-Router — re-implemented 2026-05-22 (MOL-1974 Phase 2-Restart).
+# Cloud-API path via DeepSeek (Ollama retired in MOL-560). P87 keyword fallback catches failures.
+check_fixed "P91 _detect_role_with_arch_router function defined" \
+    "$HERMES_AGENT/tools/delegate_tool.py" \
+    "def _detect_role_with_arch_router("
+check_fixed "P91 _ROLE_ALIASES defined" \
+    "$HERMES_AGENT/tools/delegate_tool.py" \
+    "_ROLE_ALIASES"
+check_fixed "P91 classifier == arch-router dispatch" \
+    "$HERMES_AGENT/tools/delegate_tool.py" \
+    'classifier == "arch-router"'
+check_fixed "P91 classifier key in config.py DEFAULT_CONFIG" \
+    "$HERMES_AGENT/hermes_cli/config.py" \
+    '"classifier": "keyword"'
+check_marker_count "P91/MOL-387-Phase2 marker in delegate_tool.py" \
+    "$HERMES_AGENT/tools/delegate_tool.py" \
+    "P91/MOL-387-Phase2" 3
+check_marker_count "P91/MOL-387-Phase2 marker in config.py" \
+    "$HERMES_AGENT/hermes_cli/config.py" \
+    "P91/MOL-387-Phase2" 1
 
 [[ $QUIET -eq 0 ]] && echo "=== P91 keyword/logging fix (2026-05-03) ==="
-# DEFERRED — see MOL-1974 (P91 keyword/logging fix — sibling of P91 Arch-Router; same scrubbed surface.)
-# check_fixed "P91 debug keyword in debugger tuple" \
-#     "$HERMES_AGENT/tools/delegate_tool.py" \
-#     '"debug"'
-# check_fixed "P91 no keyword match debug log" \
-#     "$HERMES_AGENT/tools/delegate_tool.py" \
-#     "no keyword match"
-# check_fixed "P91 role detection no-match log in delegate_task" \
-#     "$HERMES_AGENT/tools/delegate_tool.py" \
-#     "Role detection ran but found no match"
+# P91/P87 keyword+logging surface — present since P87 re-implementation.
+check_fixed "P91 debug keyword in debugger tuple" \
+    "$HERMES_AGENT/tools/delegate_tool.py" \
+    '"debug"'
+check_fixed "P91 no keyword match debug log" \
+    "$HERMES_AGENT/tools/delegate_tool.py" \
+    "no keyword match"
+check_fixed "P91 role detection no-match log in delegate_task" \
+    "$HERMES_AGENT/tools/delegate_tool.py" \
+    "Role detection ran but found no match"
 
 [[ $QUIET -eq 0 ]] && echo "=== P88 / MOL-387: Kanban Board ==="
 check_fixed "P88 kanban_tools.py module exists" \

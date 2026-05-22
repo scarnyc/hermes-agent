@@ -460,6 +460,13 @@ def init_agent(
     # that previously vanished silently — see mol245_silent_miss_architecture).
     agent._tool_errors: list = []
 
+    # P51/MOL-233 — per-tool retry-cap tracking.
+    # Keys are (tool_name, normalized_target); values are attempt counts.
+    # _tool_call_history counts ALL attempts; _tool_error_history counts
+    # errors only.  _mol233_check_cap() gates on error count vs _MOL233_ERROR_CAP.
+    agent._tool_call_history: dict[tuple[str, str], int] = {}
+    agent._tool_error_history: dict[tuple[str, str], int] = {}
+
     # Rate limit tracking — updated from x-ratelimit-* response headers
     # after each API call.  Accessed by /usage slash command.
     agent._rate_limit_state: Optional["RateLimitState"] = None

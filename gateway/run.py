@@ -7558,7 +7558,7 @@ class GatewayRunner:
         ]
 
         # Show endpoint for local/custom setups
-        if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
+        if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):  # nosec B104
             lines.append(f"◆ Endpoint: {base_url}")
 
         return "\n".join(lines)
@@ -14742,6 +14742,23 @@ class GatewayRunner:
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                # P51/MOL-233 — surface retry-cap hits in the empty-response
+                # message so the user sees which tools were blocked and why.
+                if _agent is not None:
+                    _tool_errors = getattr(_agent, "_tool_errors", []) or []
+                    _capped = [
+                        e for e in _tool_errors
+                        if isinstance(e, dict) and "retry_cap_exceeded" in str(e.get("error", ""))
+                    ]
+                    if _capped:
+                        _capped_names = {e.get("tool_name", "?") for e in _capped}
+                        _capped_note = (
+                            "\n\nSome tools were skipped after repeated failures: "
+                            + ", ".join(sorted(_capped_names))
+                            + ". If the page requires JavaScript rendering, "
+                            + "the tool may not be able to read it."
+                        )
+                        error_msg = (error_msg + _capped_note) if error_msg else _capped_note.strip()
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),

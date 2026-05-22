@@ -177,6 +177,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         stable_parts.append(skills_prompt)
 
+    # === P78 / MOL-324: tool inventory in system prompt ===
+    # Renders <tool_inventory> with three sections (built-ins, MCP servers,
+    # CLI tools).  Boundary try/except — a rendering bug shouldn't 500 the
+    # agent turn.  WARNING-level so the symptom is visible at prod log level.
+    try:
+        from agent.prompt_builder import build_tool_inventory_prompt
+        _inventory = build_tool_inventory_prompt(
+            valid_tool_names=agent.valid_tool_names,
+            tool_schemas=agent.tools,
+        )
+        if _inventory:
+            stable_parts.append(_inventory)
+    except Exception as exc:
+        logger.warning("build_tool_inventory_prompt failed: %s", exc)
+
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
     # so the agent can correctly report which model it is (workaround for API bug).
@@ -295,7 +310,31 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     warm across turns.
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
-    return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    assembled = "\n\n".join(
+        p for p in (parts["stable"], parts["context"], parts["volatile"]) if p
+    )
+
+    # === P78 / MOL-324: prompt-build instrumentation ===
+    # Env-var-gated dump for verifying tool-inventory rendering and tracking
+    # prompt-cache stability.  Cheap variant (size + sha) can stay on; FULL
+    # variant writes the payload to /tmp.
+    if os.getenv("HERMES_DUMP_SYSTEM_PROMPT") == "1":
+        import hashlib
+        try:
+            sha = hashlib.sha256(assembled.encode("utf-8")).hexdigest()[:12]
+            logger.info(
+                "system_prompt_built bytes=%d sha=%s tools=%d",
+                len(assembled), sha, len(agent.tools or []),
+            )
+            if os.getenv("HERMES_DUMP_SYSTEM_PROMPT_FULL") == "1":
+                import tempfile
+                _dump_path = os.path.join(tempfile.gettempdir(), "hermes-system-prompt.txt")
+                with open(_dump_path, "w", encoding="utf-8") as _f:
+                    _f.write(assembled)
+        except OSError as _exc:
+            logger.debug("system-prompt dump failed (disk / perm): %s", _exc)
+
+    return assembled
 
 
 def invalidate_system_prompt(agent: Any) -> None:

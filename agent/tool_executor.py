@@ -233,6 +233,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception:
                 pass
         start = time.time()
+        # P51/MOL-233 — check retry cap before executing (concurrent path).
+        # Same pattern as sequential dispatch — emit synthetic error on cap hit.
+        _cap_target = function_args.get("url", function_args.get("query", "")) if isinstance(function_args, dict) else ""
+        if agent._mol233_check_cap(function_name, str(_cap_target)):
+            _cap_msg = (
+                f"Error: {function_name} has failed more than "
+                f"{agent._MOL233_ERROR_CAP} times for target "
+                f"'{agent._mol233_normalize_target(str(_cap_target))}'. "
+                f"Skipping further attempts for this target."
+            )
+            results[index] = (function_name, function_args, _cap_msg, 0.0, True, False)
+            # P51/MOL-233 — must run worker cleanup before early return
+            # (normally runs after try/except, which we're bypassing).
+            with agent._tool_worker_threads_lock:
+                agent._tool_worker_threads.discard(_worker_tid)
+            return
         try:
             result = agent._invoke_tool(
                 function_name,
@@ -505,6 +521,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_args = {}
         if not isinstance(function_args, dict):
             function_args = {}
+
+        # P51/MOL-233 — check retry cap before executing.
+        # If this tool+target has errored too many times, emit a synthetic
+        # error result and skip execution (same pattern P33 uses for cron).
+        _cap_target = function_args.get("url", function_args.get("query", "")) if isinstance(function_args, dict) else ""
+        if agent._mol233_check_cap(function_name, str(_cap_target)):
+            _cap_msg = (
+                f"Error: {function_name} has failed more than "
+                f"{agent._MOL233_ERROR_CAP} times for target "
+                f"'{agent._mol233_normalize_target(str(_cap_target))}'. "
+                f"Skipping further attempts for this target."
+            )
+            _cap_tool_msg = {
+                "role": "tool",
+                "name": function_name,
+                "content": _cap_msg,
+                "tool_call_id": tool_call.id,
+            }
+            messages.append(_cap_tool_msg)
+            agent._record_tool_error(
+                function_name,
+                f"retry_cap_exceeded: {_cap_msg}",
+                function_args,
+            )
+            continue
 
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
