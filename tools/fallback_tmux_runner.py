@@ -137,6 +137,75 @@ def kill_session(session: str) -> None:
     # Don't raise — session may already be dead
 
 
+# ── TmuxRunner class ──────────────────────────────────────────────────────
+
+class TmuxRunner:
+    """Manages a single named tmux session lifecycle.
+
+    Usage:
+        runner = TmuxRunner("hermes-fallback-abc123")
+        runner.create(workdir="/path/to/repo")
+        runner.inject("claude")
+        output = runner.wait_for_completion()
+        runner.kill()
+
+    Or use the context manager form:
+        with TmuxRunner("hermes-fallback-abc123") as r:
+            r.create()
+            r.inject("echo hello")
+            output = r.wait_for_completion()
+    """
+
+    def __init__(self, session_name: str | None = None) -> None:
+        self.session = session_name or f"hermes-fb-{uuid.uuid4().hex[:12]}"
+
+    # ── Prerequisite ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def is_available() -> bool:
+        """Return True if the tmux binary is on PATH."""
+        return check_tmux()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    def create(self, workdir: str | None = None) -> "TmuxRunner":
+        """Create the detached tmux session. Returns self for chaining."""
+        create_session(self.session, workdir=workdir)
+        return self
+
+    def inject(self, text: str) -> None:
+        """Send text + Enter to the session pane."""
+        inject_prompt(self.session, text)
+
+    def capture(self) -> str:
+        """Return current visible pane content."""
+        return capture_output(self.session)
+
+    def wait_for_completion(
+        self,
+        idle_timeout: int = 5,
+        max_wait_seconds: int = 3600,
+    ) -> str:
+        """Poll until output is stable; return final pane content."""
+        return wait_for_completion(
+            self.session,
+            idle_timeout=idle_timeout,
+            max_wait_seconds=max_wait_seconds,
+        )
+
+    def kill(self) -> None:
+        """Kill the session (no-op if already dead)."""
+        kill_session(self.session)
+
+    # ── Context manager ───────────────────────────────────────────────────
+
+    def __enter__(self) -> "TmuxRunner":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.kill()
+
+
 # ── High-level runner ─────────────────────────────────────────────────────
 
 def run_claude_tmux(
