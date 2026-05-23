@@ -3910,6 +3910,56 @@ def delegate_task(
                 except Exception as e:
                     logger.warning("[delegate_task] DeepSeek direct routing error: %s", e)
 
+    # ── Tier 2.5: Tmux-based Claude Code fallback (MOL-568) ─────────────
+    # When both native CC and DeepSeek CC are rate-limited or fail, try
+    # running claude in interactive mode inside a tmux session. Interactive
+    # claude may retry rate limits internally where -p mode exits immediately.
+    if remaining_indices:
+        ft_cfg = coding_cfg.get("fallback_tmux_cc", {})
+        if ft_cfg.get("enabled", True):
+            for i in sorted(remaining_indices):
+                t = task_list[i]
+                repo_path = _task_repo_cache.get(i) or _detect_repo_path(t["goal"], t.get("context", ""))
+                if not repo_path:
+                    continue
+                try:
+                    from tools.fallback_tmux_runner import (
+                        check_tmux, run_claude_tmux,
+                    )
+                except ImportError:
+                    logger.warning("[delegate_task] fallback_tmux_runner not importable, skipping tmux fallback")
+                    break
+
+                if not check_tmux():
+                    logger.warning("[delegate_task] tmux not available, skipping tmux fallback for task %d", i)
+                    break
+
+                logger.info("[delegate_task] Tier 2.5 tmux fallback for task %d (repo: %s)", i, repo_path)
+                try:
+                    tmux_timeout = ft_cfg.get("timeout_seconds", 1800)
+                    tmux_output = run_claude_tmux(
+                        repo_path=repo_path,
+                        goal=t["goal"],
+                        context=t.get("context", ""),
+                        timeout_seconds=tmux_timeout,
+                    )
+                    if tmux_output and len(tmux_output) > 100:
+                        claude_code_results[i] = {
+                            "task_index": i,
+                            "status": "completed",
+                            "summary": tmux_output,
+                            "error": None,
+                            "api_calls": 0,
+                            "duration_seconds": 0,
+                            "delegation": "claude-code-tmux",
+                        }
+                        remaining_indices.discard(i)
+                    else:
+                        logger.warning("[delegate_task] tmux fallback produced insufficient output for task %d (%d chars)",
+                                       i, len(tmux_output) if tmux_output else 0)
+                except Exception as e:
+                    logger.warning("[delegate_task] tmux fallback error for task %d: %s", i, e)
+
     # If all tasks were handled by CC, skip the in-process subagent path entirely.
     if not remaining_indices:
         results = list(claude_code_results.values())

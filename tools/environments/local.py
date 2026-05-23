@@ -18,6 +18,31 @@ _IS_WINDOWS = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
 
 
+# ── MOL-568: tmux prerequisite check at module load ────────────────────
+# Lazy import to avoid circular deps; log warning if tmux is missing
+# (non-blocking — terminal exec still works without tmux fallback).
+_checked_tmux = False
+
+
+def _check_tmux_on_startup():
+    global _checked_tmux
+    if _checked_tmux:
+        return
+    _checked_tmux = True
+    try:
+        from tools.fallback_tmux_runner import check_tmux
+        if check_tmux():
+            logger.info("tmux: available (fallback ready)")
+        else:
+            logger.warning("tmux: not found on PATH — tmux fallback disabled")
+    except Exception:
+        logger.warning("tmux: fallback_tmux_runner import failed — tmux fallback disabled")
+
+# Trigger on first local environment instantiation, not at import time,
+# to avoid slowing down tool discovery with a subprocess call.
+# The LocalEnvironment.__init__ below calls this after super().__init__.
+
+
 def _resolve_safe_cwd(cwd: str) -> str:
     """Return ``cwd`` if it exists as a directory, else the nearest existing
     ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
@@ -393,6 +418,7 @@ class LocalEnvironment(BaseEnvironment):
         if cwd:
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        _check_tmux_on_startup()  # MOL-568: lazy one-shot tmux prerequisite check
         self.init_session()
 
     def get_temp_dir(self) -> str:
