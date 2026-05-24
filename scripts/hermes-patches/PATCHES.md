@@ -7,7 +7,7 @@ with verified line numbers from `origin/main` at commit `7e60b092` (2026-04-10).
 state and will not apply cleanly with `git apply`. Use the human-readable instructions
 below, which have verified line numbers for the current upstream.
 
-**Application order:** P08 → P04 → P03 → P06 → P05 → P07 → P09 → P10 → P11 → P12 → P13 → P14 → P14b → P15 → P17 → P18 → P19 → P20 → P21 → P22 → P25 → P25c → P26 → P27 → P28 → P29 (simplest first)
+**Application order:** P08 → P04 → P03 → P06 → P05 → P07 → P09 → P10 → P11 → P12 → P13 → P14 → P14b → P15 → P17 → P18 → P19 → P20 → P21 → P22 → P25 → P25c → P26 → P27 → P28 → P29 → P246 (simplest first)
 
 **Note:** P16 (PID file early-claim) was **superseded by P17** (flock mutex) on 2026-04-11. P16 was based on a wrong model of the bug — it moved `write_pid_file()` earlier but the underlying `os.kill(pid, 0)`-based duplicate check was still broken under sandbox-exec. P17 replaces both the early-claim and the duplicate check with a kernel-enforced `fcntl.flock`. **Do not apply P16 — it conflicts with P17.**
 
@@ -12641,6 +12641,12 @@ TUI component — keeps Ink displayCursor in sync with fast-echo writes so curso
 ## P245 / MOL-648 — Dangerous-command detection hardening (upstream 6ba35ec33)
 
 `tools/approval.py` — tightens dangerous-command detection patterns. Hardens the pre-execution safety filter against command-injection variants. Cherry-picked clean.
+
+---
+
+## P246 / MOL-2016 — Single-tier DeepSeek CC delegate dispatch
+
+`tools/delegate_tool.py` — removed Tier 1 (tmux CC interactive) and Tier 3 (in-process Kimi K2.6 subagents) from the delegate_task dispatch. All delegation now goes through Tier 2: `claude -p` via DeepSeek's Anthropic-compatible API (`api.deepseek.com/anthropic`). Net removal: 359 lines. Authored locally — not cherry-picked.
 
 ---
 

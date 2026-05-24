@@ -3820,442 +3820,83 @@ def delegate_task(
 
     overall_start = time.monotonic()
 
-    # ── MOL-2016: Tier routing (tmux CC → DeepSeek CC → in-process) ──
-    # Tier 1 (native Anthropic claude -p) removed — rate-limited and broken.
-    # New order: (1) tmux CC interactive, (2) claude -p DS V4, (3) in-process Kimi K2.6.
-    claude_code_results: Dict[int, dict] = {}
-    remaining_indices = set(range(len(task_list)))
-    # Cache repo paths across tiers to avoid re-extraction.
-    _task_repo_cache: Dict[int, str] = {}
-
+    # ── MOL-2016 v2: Single-tier DeepSeek direct CC dispatch ─────────────
+    # Tiers 1 (tmux) and 3 (in-process) removed — all delegation goes through
+    # claude -p via DeepSeek's Anthropic-compatible API (api.deepseek.com/anthropic).
     coding_cfg = cfg.get("coding", {})
+    fd_cfg = coding_cfg.get("fallback_deepseek_cc", {})
 
-    # ── Tmux prerequisite check ───────────────────────────────────────────
-    # Warn once at startup if tmux is missing; tasks fall through to Tier 2.
-    _tmux_available: Optional[bool] = None
-    try:
-        from tools.fallback_tmux_runner import check_tmux as _check_tmux
-        _tmux_available = _check_tmux()
-        if not _tmux_available:
-            logger.warning(
-                "[delegate_task] tmux not found on PATH — Tier 1 (tmux CC) unavailable; "
-                "tasks will fall through to Tier 2 (DeepSeek CC) or in-process."
-            )
-    except ImportError:
-        logger.warning(
-            "[delegate_task] fallback_tmux_runner not importable — Tier 1 (tmux CC) unavailable."
-        )
-
-    # ── Tier 1: Tmux-based Claude Code interactive (MOL-568) ─────────────
-    # Launch Claude Code in interactive mode inside dedicated tmux sessions.
-    # Interactive claude retries rate limits internally where -p mode exits immediately.
-    if remaining_indices and _tmux_available:
-        ft_cfg = coding_cfg.get("fallback_tmux_cc", {})
-        if ft_cfg.get("enabled", True):
-            try:
-                from tools.fallback_tmux_runner import run_claude_tmux as _run_claude_tmux
-            except ImportError:
-                _run_claude_tmux = None  # type: ignore[assignment]
-            if _run_claude_tmux is not None:
-                for i in sorted(remaining_indices):
-                    t = task_list[i]
-                    repo_path = _detect_repo_path(t["goal"], t.get("context", ""))
-                    if not repo_path:
-                        continue
-                    _task_repo_cache[i] = repo_path
-                    logger.info("[delegate_task] Tier 1 tmux CC for task %d (repo: %s)", i, repo_path)
-                    try:
-                        tmux_timeout = ft_cfg.get("timeout_seconds", 1800)
-                        tmux_output = _run_claude_tmux(
-                            repo_path=repo_path,
-                            goal=t["goal"],
-                            context=t.get("context", ""),
-                            timeout_seconds=tmux_timeout,
-                        )
-                        if tmux_output and len(tmux_output) > 100:
-                            claude_code_results[i] = {
-                                "task_index": i,
-                                "status": "completed",
-                                "summary": tmux_output,
-                                "error": None,
-                                "api_calls": 0,
-                                "duration_seconds": 0,
-                                "delegation": "claude-code-tmux",
-                            }
-                            remaining_indices.discard(i)
-                        else:
-                            logger.warning(
-                                "[delegate_task] Tier 1 tmux produced insufficient output for task %d (%d chars)",
-                                i, len(tmux_output) if tmux_output else 0,
-                            )
-                    except Exception as e:
-                        logger.warning("[delegate_task] Tier 1 tmux error for task %d: %s", i, e)
-
-    # ── Tier 2: DeepSeek direct CC fallback ─────────────────────────────
-    if remaining_indices:
-        fd_cfg = coding_cfg.get("fallback_deepseek_cc", {})
-        if fd_cfg.get("enabled", True):
-            for i in sorted(remaining_indices):
-                t = task_list[i]
-                repo_path = _task_repo_cache.get(i) or _detect_repo_path(t["goal"], t.get("context", ""))
-                if not repo_path:
-                    continue
-                logger.info("[delegate_task] Tier 2 DeepSeek direct for task %d (repo: %s)", i, repo_path)
-                try:
-                    ds_result = _run_claude_code_deepseek_direct_delegation(
-                        goal=t["goal"],
-                        context=t.get("context", ""),
-                        repo_path=repo_path,
-                        max_iterations=t.get("max_iterations") or effective_max_iter,
-                        parent_agent=parent_agent,
-                        skip_hitl=True,
-                        profile_cfg=profile_cfg,
-                    )
-                    if "error" not in ds_result:
-                        _verified = ds_result.get("verified", True)
-                        _v_reason = ds_result.get("verification_reason", "")
-                        _status = "completed" if _verified else "completed_unverified"
-                        _error = None
-                        if not _verified:
-                            _error = f"⚠️ VERIFICATION FAILED: {_v_reason}"
-                        claude_code_results[i] = {
-                            "task_index": i,
-                            "status": _status,
-                            "summary": ds_result.get("result", ""),
-                            "error": _error,
-                            "api_calls": ds_result.get("num_turns", 0),
-                            "duration_seconds": ds_result.get("duration_seconds", 0),
-                            "delegation": "claude-code-deepseek-direct",
-                        }
-                        remaining_indices.discard(i)
-                        continue
-                    if ds_result.get("rate_limited"):
-                        logger.warning("[delegate_task] DeepSeek direct rate-limited for task %d", i)
-                    else:
-                        logger.warning("[delegate_task] DeepSeek direct failed: %s", str(ds_result.get("error", ""))[:200])
-                except Exception as e:
-                    logger.warning("[delegate_task] DeepSeek direct routing error: %s", e)
-
-    # If all tasks were handled by CC tiers, skip the in-process subagent path entirely.
-    if not remaining_indices:
-        results = list(claude_code_results.values())
-        results.sort(key=lambda r: r["task_index"])
-        total_duration = round(time.monotonic() - overall_start, 2)
-        return json.dumps({"results": results, "total_duration_seconds": total_duration}, ensure_ascii=False)
-
-    remaining_task_list = [(i, task_list[i]) for i in sorted(remaining_indices)]
+    if not fd_cfg.get("enabled", True):
+        return tool_error("DeepSeek direct CC delegation is disabled (coding.fallback_deepseek_cc.enabled=false).")
 
     results = []
-    # Pre-populate results with CC-handled tasks so they appear in the final JSON.
-    for cc_r in sorted(claude_code_results.values(), key=lambda r: r["task_index"]):
-        results.append(cc_r)
-
-    n_tasks = len(remaining_task_list)
-    # Track goal labels for progress display (truncated for readability)
-    task_labels = [t["goal"][:40] for _, t in remaining_task_list]
-
-    # Save parent tool names BEFORE any child construction mutates the global.
-    # _build_child_agent() calls AIAgent() which calls get_tool_definitions(),
-    # which overwrites model_tools._last_resolved_tool_names with child's toolset.
-    import model_tools as _model_tools
-
-    _parent_tool_names = list(_model_tools._last_resolved_tool_names)
-
-    # Build all child agents on the main thread (thread-safe construction)
-    # Wrapped in try/finally so the global is always restored even if a
-    # child build raises (otherwise _last_resolved_tool_names stays corrupted).
-    children = []
-    try:
-        for i, t in remaining_task_list:
-            task_acp_args = t.get("acp_args") if "acp_args" in t else None
-            # Per-task role beats top-level; normalise again so unknown
-            # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                # P72/MOL-251 — wrap the 7 override_* values in a single
-                # SubagentOverrides dataclass.  Explicit field construction
-                # (not **creds splat) because creds also contains `model`
-                # which isn't a SubagentOverrides field.
-                overrides=SubagentOverrides(
-                    provider=creds["provider"],
-                    base_url=creds["base_url"],
-                    api_key=creds["api_key"],
-                    api_mode=creds["api_mode"],
-                    acp_command=t.get("acp_command")
-                    or acp_command
-                    or creds.get("command"),
-                    acp_args=(
-                        task_acp_args
-                        if task_acp_args is not None
-                        else (acp_args if acp_args is not None else creds.get("args"))
-                    ),
-                    # P43/MOL-227 — delegation.fallback_model wires the tier-3
-                    # Gemini chain into in-process swarm children.
-                    fallback_model=creds.get("fallback_model"),
-                ),
-                role=effective_role,
-                role_suffix=role_suffix,
-                profile_cfg=profile_cfg,  # P146/MOL-496 — inject profile into child agent
-            )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            # P141/MOL-491 (#163 review CRITICAL-2): tag child with the
-            # active profile name so iteration-audit records distinguish
-            # coding-profile dispatches from default-profile ones. Without
-            # this, every record reads `profile=default` (since no other
-            # set-site exists) — making the audit log unable to answer
-            # "is the coding profile hitting max_iterations more often?"
-            child._delegate_profile = profile or "default"
-            children.append((i, t, child))
-    finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
-        _model_tools._last_resolved_tool_names = _parent_tool_names
-
-    if n_tasks == 1:
-        # Single task -- run directly (no thread pool overhead)
-        _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
-        results.append(result)
-    else:
-        # Batch -- run in parallel with per-task progress lines
-        completed_count = 0
-        spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
-
-        with ThreadPoolExecutor(max_workers=max_children) as executor:
-            futures = {}
-            for i, t, child in children:
-                future = executor.submit(
-                    _run_single_child,
-                    task_index=i,
-                    goal=t["goal"],
-                    child=child,
-                    parent_agent=parent_agent,
-                )
-                futures[future] = i
-
-            # Poll futures with interrupt checking.  as_completed() blocks
-            # until ALL futures finish — if a child agent gets stuck,
-            # the parent blocks forever even after interrupt propagation.
-            # Instead, use wait() with a short timeout so we can bail
-            # when the parent is interrupted.
-            # Map task_index -> child agent, so fabricated entries for
-            # still-pending futures can carry the correct _delegate_role.
-            _child_by_index = {i: child for (i, _, child) in children}
-
-            pending = set(futures.keys())
-            while pending:
-                if getattr(parent_agent, "_interrupt_requested", False) is True:
-                    # Parent interrupted — collect whatever finished and
-                    # abandon the rest.  Children already received the
-                    # interrupt signal; we just can't wait forever.
-                    for f in pending:
-                        idx = futures[f]
-                        if f.done():
-                            try:
-                                entry = f.result()
-                            except Exception as exc:
-                                entry = {
-                                    "task_index": idx,
-                                    "status": "error",
-                                    "summary": None,
-                                    "error": str(exc),
-                                    "api_calls": 0,
-                                    "duration_seconds": 0,
-                                    "_child_role": getattr(
-                                        _child_by_index.get(idx), "_delegate_role", None
-                                    ),
-                                }
-                        else:
-                            entry = {
-                                "task_index": idx,
-                                "status": "interrupted",
-                                "summary": None,
-                                "error": "Parent agent interrupted — child did not finish in time",
-                                "api_calls": 0,
-                                "duration_seconds": 0,
-                                "_child_role": getattr(
-                                    _child_by_index.get(idx), "_delegate_role", None
-                                ),
-                            }
-                        results.append(entry)
-                        completed_count += 1
-                    break
-
-                from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
-
-                done, pending = _cf_wait(
-                    pending, timeout=0.5, return_when=FIRST_COMPLETED
-                )
-                for future in done:
-                    try:
-                        entry = future.result()
-                    except Exception as exc:
-                        idx = futures[future]
-                        entry = {
-                            "task_index": idx,
-                            "status": "error",
-                            "summary": None,
-                            "error": str(exc),
-                            "api_calls": 0,
-                            "duration_seconds": 0,
-                            "_child_role": getattr(
-                                _child_by_index.get(idx), "_delegate_role", None
-                            ),
-                        }
-                    results.append(entry)
-                    completed_count += 1
-
-                    # Print per-task completion line above the spinner
-                    idx = entry["task_index"]
-                    label = (
-                        task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
-                    )
-                    dur = entry.get("duration_seconds", 0)
-                    status = entry.get("status", "?")
-                    icon = "✓" if status == "completed" else "✗"
-                    remaining = n_tasks - completed_count
-                    completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
-                    if spinner_ref:
-                        try:
-                            spinner_ref.print_above(completion_line)
-                        except Exception:
-                            print(f"  {completion_line}")
-                    else:
-                        print(f"  {completion_line}")
-
-                    # Update spinner text to show remaining count
-                    if spinner_ref and remaining > 0:
-                        try:
-                            spinner_ref.update_text(
-                                f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining"
-                            )
-                        except Exception as e:
-                            logger.debug("Spinner update_text failed: %s", e)
-
-        # Sort by task_index so results match input order
-        results.sort(key=lambda r: r["task_index"])
-
-    # P115/MOL-447: Tier 3 audit-emit loop — see top-of-function _top_profile_cfg.
-    # Tier 1 (CC subprocess) already calls _emit_profile_audit at the top of the
-    # function. Tier 3 fires per-child so cua-profile (and any future non-coding
-    # profile) also populates its delegate-{profile}.log audit JSONL. Fail-open
-    # — a single child's audit-write failure does not abort the swarm.
-    # Verifier-substring anchor (P25/MOL-196 banner pattern): profile_cfg=_top_profile_cfg,
-    if _top_profile_cfg:
-        for _p115_entry in results:
-            try:
-                _emit_profile_audit(
-                    _top_profile_cfg,
-                    [],
-                    matched_rule=f"tier3 task_index={_p115_entry.get('task_index')}",
-                    caller="delegate_task_tier3",
-                    prompt="",
-                    exit_code=0 if _p115_entry.get("status") == "completed" else -1,
-                )
-            except Exception:
-                pass
-
-    # Notify parent's memory provider of delegation outcomes
-    if (
-        parent_agent
-        and hasattr(parent_agent, "_memory_manager")
-        and parent_agent._memory_manager
-    ):
-        for entry in results:
-            try:
-                _task_goal = (
-                    task_list[entry["task_index"]]["goal"]
-                    if entry["task_index"] < len(task_list)
-                    else ""
-                )
-                parent_agent._memory_manager.on_delegation(
-                    task=_task_goal,
-                    result=entry.get("summary", "") or "",
-                    child_session_id=(
-                        getattr(children[entry["task_index"]][2], "session_id", "")
-                        if entry["task_index"] < len(children)
-                        else ""
-                    ),
-                )
-            except Exception:
-                pass
-
-    # Fire subagent_stop hooks once per child, serialised on the parent thread.
-    # This keeps Python-plugin and shell-hook callbacks off of the worker threads
-    # that ran the children, so hook authors don't need to reason about
-    # concurrent invocation.  Role was captured into the entry dict in
-    # _run_single_child (or the fabricated-entry branches above) before the
-    # child was closed.
-    _parent_session_id = getattr(parent_agent, "session_id", None)
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-    except Exception:
-        _invoke_hook = None
-    # Aggregate child spend here so the parent's footer/UI reflect the true
-    # cost of a subagent-heavy turn.  Port of Kilo-Org/kilocode#9448.  Each
-    # child's cost was captured in _run_single_child before its AIAgent was
-    # closed; we fold them into the parent in one pass alongside the
-    # subagent_stop hook loop so we don't walk `results` twice.
-    _children_cost_total = 0.0
-    for entry in results:
-        child_role = entry.pop("_child_role", None)
-        child_cost = entry.pop("_child_cost_usd", 0.0)
-        try:
-            if child_cost:
-                _children_cost_total += float(child_cost)
-        except (TypeError, ValueError):
-            pass
-        if _invoke_hook is None:
+    for i, t in enumerate(task_list):
+        repo_path = _detect_repo_path(t["goal"], t.get("context", ""))
+        if not repo_path:
+            logger.warning("[delegate_task] No repo detected for task %d, skipping", i)
+            results.append({
+                "task_index": i,
+                "status": "error",
+                "summary": None,
+                "error": f"No repo path detected for task {i}. Ensure the goal or context mentions a repo under ~/Code/.",
+                "api_calls": 0,
+                "duration_seconds": 0,
+                "delegation": "claude-code-deepseek-direct",
+            })
             continue
-        try:
-            _invoke_hook(
-                "subagent_stop",
-                parent_session_id=_parent_session_id,
-                child_role=child_role,
-                child_summary=entry.get("summary"),
-                child_status=entry.get("status"),
-                duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
-            )
-        except Exception:
-            logger.debug("subagent_stop hook invocation failed", exc_info=True)
 
-    # Fold the aggregated child cost into the parent's session total.  This is
-    # additive — each delegate_task call contributes its own children — so
-    # nested orchestrator→worker trees roll up naturally: each layer's own
-    # delegate_task() folds its direct children in, and when the orchestrator
-    # itself finishes, its parent folds the orchestrator's now-inflated total
-    # on top.  Degrades silently if the parent lacks the counter (older test
-    # fixtures, etc.).
-    if _children_cost_total > 0.0:
+        logger.info("[delegate_task] DeepSeek direct for task %d (repo: %s)", i, repo_path)
         try:
-            current = float(getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0)
-            parent_agent.session_estimated_cost_usd = current + _children_cost_total
-            # Upgrade the cost_source so the UI doesn't label a partially-real
-            # total as "none" when the parent itself hadn't billed any calls
-            # yet (rare but possible when the parent's only action this turn
-            # was delegate_task).
-            if getattr(parent_agent, "session_cost_source", "none") in (None, "", "none"):
-                parent_agent.session_cost_source = "subagent"
-            if getattr(parent_agent, "session_cost_status", "unknown") in (None, "", "unknown"):
-                parent_agent.session_cost_status = "estimated"
-        except Exception:
-            logger.debug("Subagent cost rollup failed", exc_info=True)
+            ds_result = _run_claude_code_deepseek_direct_delegation(
+                goal=t["goal"],
+                context=t.get("context", ""),
+                repo_path=repo_path,
+                max_iterations=t.get("max_iterations") or effective_max_iter,
+                parent_agent=parent_agent,
+                skip_hitl=True,
+                profile_cfg=profile_cfg,
+            )
+            if "error" not in ds_result:
+                _verified = ds_result.get("verified", True)
+                _v_reason = ds_result.get("verification_reason", "")
+                _status = "completed" if _verified else "completed_unverified"
+                _error = None
+                if not _verified:
+                    _error = f"⚠️ VERIFICATION FAILED: {_v_reason}"
+                results.append({
+                    "task_index": i,
+                    "status": _status,
+                    "summary": ds_result.get("result", ""),
+                    "error": _error,
+                    "api_calls": ds_result.get("num_turns", 0),
+                    "duration_seconds": ds_result.get("duration_seconds", 0),
+                    "delegation": "claude-code-deepseek-direct",
+                })
+            else:
+                results.append({
+                    "task_index": i,
+                    "status": "error",
+                    "summary": None,
+                    "error": ds_result.get("error", "unknown error"),
+                    "api_calls": 0,
+                    "duration_seconds": 0,
+                    "delegation": "claude-code-deepseek-direct",
+                })
+        except Exception as e:
+            logger.warning("[delegate_task] DeepSeek direct routing error for task %d: %s", i, e)
+            results.append({
+                "task_index": i,
+                "status": "error",
+                "summary": None,
+                "error": str(e),
+                "api_calls": 0,
+                "duration_seconds": 0,
+                "delegation": "claude-code-deepseek-direct",
+            })
 
     total_duration = round(time.monotonic() - overall_start, 2)
-
     return json.dumps(
-        {
-            "results": results,
-            "total_duration_seconds": total_duration,
-        },
+        {"results": results, "total_duration_seconds": total_duration},
         ensure_ascii=False,
     )
 
