@@ -4160,7 +4160,11 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
         ".woff": "font/woff",
     }
     media_type = content_types.get(suffix, "application/octet-stream")
-    return FileResponse(target, media_type=media_type)
+    return FileResponse(
+        target,
+        media_type=media_type,
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 def _mount_plugin_api_routes():

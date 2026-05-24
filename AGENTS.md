@@ -772,6 +772,18 @@ kanban task.
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).
 
+Cache-busting dashboard plugin assets (MOL-2028):
+- The endpoint `serve_plugin_asset` in `hermes_cli/web_server.py` serves
+  dashboard plugin JS/CSS with `Cache-Control: no-cache` so browsers
+  always re-validate with the server rather than serving stale cached
+  versions.
+- After changing a plugin's static files, restart the dashboard or
+  gateway (`hermes gateway restart`) and do a hard browser refresh
+  (Shift+Cmd+R / Ctrl+Shift+R) to clear in-memory cached bundles.
+- For production builds, consider adding content hashes to plugin entry
+  filenames (e.g. `dist/index.<hash>.js`) and updating the manifest's
+  `entry` field for automatic cache busting.
+
 Isolation model:
 - **Board** is the hard boundary — workers are spawned with
   `HERMES_KANBAN_BOARD` pinned in their env so they can't see other
