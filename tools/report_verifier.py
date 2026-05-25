@@ -46,6 +46,11 @@ _MANIFEST_RE = re.compile(
     re.DOTALL,
 )
 
+# P252/MOL-2040: seam-anchored variant — the manifest plus any newlines
+# immediately around it. Used to excise the comment without disturbing
+# blank-line runs elsewhere in the report body.
+_MANIFEST_SEAM_RE = re.compile(r"\n*" + _MANIFEST_RE.pattern + r"\n*", re.DOTALL)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cron_verifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +90,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 def _extract_manifest(text: str) -> str | None:
     m = _MANIFEST_RE.search(text)
     return m.group(1).strip() if m else None
+
+
+def _strip_manifest(text: str) -> str:
+    # P252/MOL-2040: remove the raw WORK_MANIFEST HTML comment from the
+    # DELIVERED copy after it has been extracted. The saved cron output file
+    # (scheduler.py:2346, written pre-verify) keeps the manifest intact so CLI
+    # replay still parses it; only the Telegram/return text is cleaned. In
+    # text-mode Telegram the comment renders verbatim, which is the ugliest
+    # noise source for every claims_expected cron. Anchored to the manifest
+    # seam (the comment plus its surrounding newlines collapse to one blank
+    # line) so blank-line runs elsewhere in the report body survive intact.
+    return _MANIFEST_SEAM_RE.sub("\n\n", text).strip()
 
 
 def _parse_manifest(yaml_body: str) -> dict:
@@ -402,6 +419,11 @@ def verify_and_annotate(
         yaml_body = _extract_manifest(final_response)
         if yaml_body is None:
             return _no_manifest_header() + "\n\n" + final_response
+
+        # P252/MOL-2040: manifest extracted — strip the raw comment from the
+        # delivered text so all downstream returns (malformed/empty/passed)
+        # ship clean copy. Saved output file retains the manifest for replay.
+        final_response = _strip_manifest(final_response)
 
         try:
             manifest = _parse_manifest(yaml_body)
