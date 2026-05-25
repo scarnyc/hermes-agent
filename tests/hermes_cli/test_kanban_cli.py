@@ -341,3 +341,90 @@ def test_run_slash_specify_help_is_reachable(kanban_home):
     # Either the usage-error sentinel (stdout swallowed by argparse) or
     # a real help rendering — both mean the subcommand exists.
     assert "usage error" in out.lower() or "specify" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# B6/P256/MOL-2031 — swarm worktree reclaim on GC
+# ---------------------------------------------------------------------------
+
+def _git_repo_with_commit(path: Path) -> Path:
+    """Init a git repo with one commit so ``worktree add ... HEAD`` works."""
+    import subprocess
+    path.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+    }
+    def _g(*a):
+        subprocess.run(["git", "-C", str(path), *a],
+                       check=True, capture_output=True, text=True, env=env)
+    _g("init", "-q")
+    (path / "README.md").write_text("x\n")
+    _g("add", "-A")
+    _g("commit", "-q", "-m", "init")
+    return path
+
+
+def _make_worktree_task(conn, repo, monkeypatch):
+    """Create a worktree task, resolve+persist its worktree path (mirroring the
+    dispatch flow at kanban.py:1484-1485), and return (task_id, worktree_path)."""
+    monkeypatch.setattr(kb, "_coding_config",
+                        lambda: {"allowed_write_roots": [str(repo)]})
+    tid = kb.create_task(conn, title="ship", workspace_kind="worktree",
+                         workspace_path=str(repo))
+    task = kb.get_task(conn, tid)
+    ws = kb.resolve_workspace(task)
+    kb.set_workspace_path(conn, tid, str(ws))
+    return tid, ws
+
+
+def test_reclaim_swarm_worktree_removes_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
+    import subprocess
+    repo = _git_repo_with_commit(tmp_path / "work-repo")
+    with kb.connect() as conn:
+        tid, ws = _make_worktree_task(conn, repo, monkeypatch)
+    assert ws.is_dir()
+    reclaimed = kc._reclaim_swarm_worktree(tid, str(ws))
+    assert reclaimed == 1
+    assert not ws.exists()
+    # The swarm/<id> branch is gone too.
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         f"refs/heads/{kb._swarm_branch(tid)}"],
+        capture_output=True,
+    ).returncode != 0
+
+
+def test_reclaim_swarm_worktree_refuses_non_worktree_path(kanban_home, tmp_path):
+    # A path that isn't <repo>/.worktrees/<id> is not a swarm worktree we made.
+    assert kc._reclaim_swarm_worktree("t1", str(tmp_path / "random")) == 0
+    assert kc._reclaim_swarm_worktree("t1", None) == 0
+
+
+def test_reclaim_swarm_worktree_refuses_runtime_path(kanban_home):
+    # A stale pre-B2 worktree path pointing inside the runtime must never be
+    # reclaimed — we never run `git worktree remove` against production. In-fixture
+    # the runtime root resolves to <HERMES_HOME>/hermes-agent.
+    runtime_wt = kanban_home / "hermes-agent" / ".worktrees" / "t1"
+    assert kb._within_runtime_tree(runtime_wt.parent.parent) is True
+    assert kc._reclaim_swarm_worktree("t1", str(runtime_wt)) == 0
+
+
+def test_gc_reclaims_archived_worktree(kanban_home, tmp_path, monkeypatch):
+    import argparse
+    import subprocess
+    repo = _git_repo_with_commit(tmp_path / "work-repo")
+    with kb.connect() as conn:
+        tid, ws = _make_worktree_task(conn, repo, monkeypatch)
+        kb.archive_task(conn, tid)
+    assert ws.is_dir()
+    rc = kc._cmd_gc(argparse.Namespace())
+    assert rc == 0
+    assert not ws.exists()
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         f"refs/heads/{kb._swarm_branch(tid)}"],
+        capture_output=True,
+    ).returncode != 0

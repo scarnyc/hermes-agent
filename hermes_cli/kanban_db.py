@@ -2618,6 +2618,162 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
+# --- B2/P256/MOL-2031 — swarm worktree creation [MOL-2044; incident MOL-2034] ---
+# A ``worktree`` task used to receive an *uncreated* path (and, with no
+# explicit ``workspace_path``, ``Path.cwd()/".worktrees"/<id>`` — the
+# dispatcher CWD, i.e. the production runtime). B1 now turns that into a loud
+# auto-block, so the lane was non-functional. These helpers make the dispatch
+# engine *create and isolate* the worktree itself — by mechanism, not by
+# worker-side skill discipline — refusing any root inside the runtime before
+# touching git.
+
+# ~/Code/ and runtime-path matcher, mirrored from delegate_tool._CODE_PATH_RE so
+# the same paths a delegate would accept are discoverable here. The runtime path
+# is matched on purpose: discovery surfaces it, then the runtime-refusal gate in
+# resolve_workspace rejects it (HIGH-2).
+_TASK_REPO_PATH_RE = re.compile(
+    r'(/Users/[^/\s"\']+/Code/[^\s"\']*'
+    r'|~/Code/[^\s"\']*'
+    r'|/Users/[^/\s"\']+/\.hermes/hermes-agent(?![A-Za-z0-9-])[^\s"\']*'
+    r'|~/\.hermes/hermes-agent(?![A-Za-z0-9-])[^\s"\']*'
+    r')'
+)
+
+
+def _coding_config() -> dict:
+    """Load the ``coding`` config block (for ``allowed_write_roots``).
+
+    Lazy + entry-point agnostic, mirroring delegate_tool._load_config: the
+    runtime CLI_CONFIG first, then the persistent config — so kanban dispatch
+    validates against the same allow-list whether it runs from the CLI, the
+    dashboard plugin, or the gateway tick.
+    """
+    try:
+        from cli import CLI_CONFIG
+        cfg = CLI_CONFIG.get("coding") or {}
+        if cfg:
+            return cfg
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+        return load_config().get("coding") or {}
+    except Exception:
+        return {}
+
+
+def _allowed_write_roots_real() -> list[str]:
+    """Realpath-resolved ``coding.allowed_write_roots`` (may be empty)."""
+    roots: list[str] = []
+    for raw in _coding_config().get("allowed_write_roots", []) or []:
+        try:
+            roots.append(os.path.realpath(os.path.expanduser(raw)))
+        except OSError:
+            continue
+    return roots
+
+
+def _git_root_within_allowed(raw: str, allowed: list[str]) -> Optional[Path]:
+    """Walk up from ``raw`` to the enclosing git root; return it iff it sits
+    within one of ``allowed`` (else ``None``). Mirrors the validation in
+    delegate_tool._detect_repo_path."""
+    try:
+        candidate = os.path.realpath(os.path.expanduser(raw))
+    except OSError:
+        return None
+    while candidate and candidate != "/":
+        if os.path.isdir(os.path.join(candidate, ".git")):
+            for root in allowed:
+                if candidate == root or candidate.startswith(root + os.sep):
+                    return Path(candidate)
+            return None
+        candidate = os.path.dirname(candidate)
+    return None
+
+
+def _discover_repo_root(task: Task) -> Optional[Path]:
+    """Discover the repo root for a worktree task from task context — never the
+    dispatcher CWD. Sources, in precedence order: an explicit absolute
+    ``workspace_path``, then ``~/Code/``-style paths named in the title/body.
+    Each candidate's git-toplevel is validated against
+    ``coding.allowed_write_roots``."""
+    allowed = _allowed_write_roots_real()
+    if not allowed:
+        return None
+    candidates: list[str] = []
+    if task.workspace_path:
+        candidates.append(task.workspace_path)
+    text = f"{task.title or ''} {task.body or ''}"
+    for m in _TASK_REPO_PATH_RE.finditer(text):
+        candidates.append(m.group(1))
+    for raw in candidates:
+        repo = _git_root_within_allowed(raw, allowed)
+        if repo is not None:
+            return repo
+    return None
+
+
+def _swarm_branch(task_id: str) -> str:
+    """Branch name for a swarm worktree (kept in sync with B6 reclaim)."""
+    return f"swarm/{task_id}"
+
+
+def _ensure_worktrees_gitignored(repo_root: Path) -> None:
+    """Best-effort: keep ``.worktrees/`` out of the repo's index."""
+    gitignore = repo_root / ".gitignore"
+    entry = ".worktrees/"
+    try:
+        existing = gitignore.read_text() if gitignore.exists() else ""
+        if entry not in existing.splitlines():
+            with open(gitignore, "a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(f"{entry}\n")
+    except OSError:
+        pass
+
+
+def _create_swarm_worktree(repo_root: Path, task_id: str) -> Path:
+    """Create (or idempotently reuse) the swarm worktree at
+    ``<repo_root>/.worktrees/<task_id>`` on branch ``swarm/<task_id>``.
+
+    MED-1 stale-worktree recovery: a prior ``git worktree add`` that failed
+    mid-way leaves a dangling registration/branch; without cleanup a re-dispatch
+    hits ``fatal: ... already exists`` -> spawn failure -> permanent auto-block.
+    Prune, then reuse-or-clean before re-adding so re-dispatch is idempotent.
+    """
+    wt_path = repo_root / ".worktrees" / task_id
+    branch = _swarm_branch(task_id)
+    _ensure_worktrees_gitignored(repo_root)
+
+    def _git(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    # Clear dangling registrations whose dirs vanished.
+    _git("worktree", "prune")
+    # Already present on disk -> reuse (idempotent re-dispatch).
+    if wt_path.is_dir():
+        return wt_path
+    # Path registered but dir gone, or a leftover from a half-add: force-remove
+    # the registration (no-op if absent) and delete a dangling branch so the
+    # `add -b` below does not collide.
+    _git("worktree", "remove", "--force", str(wt_path))
+    if _git(
+        "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", timeout=10
+    ).returncode == 0:
+        _git("branch", "-D", branch, timeout=10)
+    add = _git("worktree", "add", str(wt_path), "-b", branch, "HEAD")
+    if add.returncode != 0 or not wt_path.is_dir():
+        raise RuntimeError(
+            f"task {task_id}: failed to create swarm worktree at {wt_path}: "
+            f"{add.stderr.strip() or 'git worktree add exit ' + str(add.returncode)}"
+        )
+    return wt_path
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -2631,9 +2787,17 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
       compute the absolute path themselves.
-    - ``worktree``: a git worktree at ``workspace_path``.  Not created
-      automatically in v1 -- the kanban-worker skill documents
-      ``git worktree add`` as a worker-side step.  Returns the intended path.
+    - ``worktree``: a git worktree the *engine* creates and isolates
+      (B2/P256/MOL-2031 — by mechanism, not worker-side skill discipline).
+      The repo root is discovered from task context (an explicit absolute
+      ``workspace_path`` or a ``~/Code/`` path in the title/body), validated
+      against ``coding.allowed_write_roots``, and **refused if it resolves
+      inside the Hermes runtime tree** (HIGH-2 confused-deputy gate, before
+      any git mutation).  The worktree lands at
+      ``<repo-root>/.worktrees/<id>`` on branch ``swarm/<id>``; a relative
+      ``workspace_path`` is still rejected.  When no repo root can be
+      discovered, falls back to a ``scratch``-style dir under the board root
+      — never a worktree *of the runtime*.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -2669,16 +2833,33 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        if not task.workspace_path:
-            # Default: .worktrees/<id>/ under CWD.  Worker skill creates it.
-            return Path.cwd() / ".worktrees" / task.id
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute worktree path "
-                f"{task.workspace_path!r}; use an absolute path"
+        # B2/P256/MOL-2031 — create + isolate the worktree by mechanism.
+        # Keep the relative-path rejection ahead of discovery so an explicit
+        # bad path fails loudly (preserves the non-absolute guard contract).
+        if task.workspace_path:
+            p = Path(task.workspace_path).expanduser()
+            if not p.is_absolute():
+                raise ValueError(
+                    f"task {task.id} has non-absolute worktree path "
+                    f"{task.workspace_path!r}; use an absolute path"
+                )
+        repo_root = _discover_repo_root(task)
+        if repo_root is None:
+            # No repo root in task context -> scratch fallback (never a
+            # worktree of the runtime). Mirrors the scratch branch shape.
+            p = workspaces_root(board=board) / task.id
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        if _within_runtime_tree(repo_root):
+            # HIGH-2: a task naming the runtime path passes allowed_write_roots
+            # (it includes ~/.hermes/hermes-agent). Refuse BEFORE any git call
+            # so we never mutate production's .git.
+            raise RuntimeError(
+                f"task {task.id}: discovered repo root {repo_root} is inside the "
+                f"Hermes runtime code tree; refusing to create a worktree of "
+                f"production. Point the task at a repo outside ~/.hermes/hermes-agent."
             )
-        return p
+        return _create_swarm_worktree(repo_root, task.id)
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
@@ -3669,6 +3850,42 @@ def _rotate_worker_log(log_path: Path, max_bytes: int) -> None:
         pass
 
 
+def _runtime_code_roots() -> list[Path]:
+    """Trees a kanban worker must NEVER use as its workspace.
+
+    The patch-preserved production runtime is single-instance: a worker that
+    inherits the dispatcher's CWD edits the very tree this dispatcher's code
+    is loaded from, landing dev straight in production (the MOL-2034
+    incident). Block against both the dispatcher's own module tree
+    (env-independent) and the canonical ``<hermes-root>/hermes-agent``
+    install, so a dispatcher running from a clone still can't target the
+    production runtime.
+    """
+    roots: list[Path] = []
+    try:
+        roots.append(Path(__file__).resolve().parents[1])
+    except (OSError, IndexError):
+        pass
+    try:
+        from hermes_constants import get_default_hermes_root
+        roots.append((get_default_hermes_root() / "hermes-agent").resolve())
+    except Exception:
+        pass
+    return roots
+
+
+def _within_runtime_tree(path: Path) -> bool:
+    """True if ``path`` is at or inside any runtime code tree (see B1)."""
+    try:
+        rp = path.resolve()
+    except OSError:
+        return False
+    for root in _runtime_code_roots():
+        if rp == root or root in rp.parents:
+            return True
+    return False
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -3691,6 +3908,27 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
+    # P254/MOL-2031 — B1 fail-closed workspace guard [MOL-2044; incident MOL-2034].
+    # A worker whose workspace does not exist used to fall through to
+    # ``cwd=None`` below, inheriting the dispatcher CWD — the production
+    # runtime — and writing dev straight into it (14 LSP commits, MOL-2034).
+    # Refuse to spawn unless the workspace is a real directory OUTSIDE the
+    # Hermes runtime code tree. The raise flows into dispatch_once's
+    # exception path -> _record_spawn_failure -> auto-block: loud, not silent.
+    _ws = Path(workspace).expanduser()
+    if not _ws.is_dir():
+        raise RuntimeError(
+            f"task {task.id}: workspace {workspace!r} does not exist on disk; "
+            f"refusing to spawn (a worker with no real workspace would inherit "
+            f"the dispatcher CWD and risk writing into the production runtime)."
+        )
+    if _within_runtime_tree(_ws):
+        raise RuntimeError(
+            f"task {task.id}: workspace {workspace!r} resolves inside the Hermes "
+            f"runtime code tree; refusing to spawn a worker that would edit "
+            f"production. Use a workspace outside ~/.hermes/hermes-agent."
+        )
+
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
@@ -3701,6 +3939,15 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # B3/P256/MOL-2031 — pin TERMINAL_CWD to the worktree so the worker's
+    # terminal / file / checkpoint tools key on it, not the gateway's global
+    # TERMINAL_CWD. ``env = dict(os.environ)`` inherits the gateway's value
+    # (gateway/run.py sets it to terminal.cwd or $HOME); those tools resolve
+    # via ``os.getenv("TERMINAL_CWD", os.getcwd())`` and so would prefer the
+    # inherited dir over ``cwd=workspace`` below — meaning checkpoints
+    # (MOL-2030's _project_hash) would snapshot the wrong project. Make the
+    # env var agree with the spawn CWD so isolation holds end to end.
+    env["TERMINAL_CWD"] = workspace
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
@@ -3766,7 +4013,7 @@ def _default_spawn(
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=workspace,  # B1: guaranteed a real dir outside the runtime by the guard above (MOL-2031)
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,

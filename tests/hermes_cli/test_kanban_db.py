@@ -527,7 +527,12 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
     assert ws.exists()
 
 
-def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
+def test_worktree_no_discoverable_repo_falls_back_to_scratch(kanban_home, tmp_path):
+    # B2/P256/MOL-2031: the engine creates+isolates worktrees by mechanism.
+    # When the task's workspace_path is not inside a discoverable git repo
+    # (here: tmp_path is not a repo), resolve_workspace falls back to a
+    # *created* scratch dir under the board root -- never the uncreated
+    # .worktrees path, and never a worktree of the runtime.
     target = str(tmp_path / ".worktrees" / "my-task")
     with kb.connect() as conn:
         t = kb.create_task(
@@ -535,8 +540,112 @@ def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
-    assert str(ws) == target
+    assert ws.exists()
+    assert ws.is_dir()
+    assert "kanban" in str(ws)
+    assert str(ws) != target
+
+
+def _git_repo_with_commit(path: Path) -> Path:
+    """Init a git repo with one commit so ``worktree add ... HEAD`` works."""
+    import subprocess
+    path.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
+    }
+    def _g(*a):
+        subprocess.run(["git", "-C", str(path), *a],
+                       check=True, capture_output=True, text=True, env=env)
+    _g("init", "-q")
+    (path / "README.md").write_text("x\n")
+    _g("add", "-A")
+    _g("commit", "-q", "-m", "init")
+    return path
+
+
+def test_worktree_creates_isolated_worktree(kanban_home, tmp_path, monkeypatch):
+    # B2/P256/MOL-2031 happy path: a worktree task whose workspace_path is a real
+    # repo inside allowed_write_roots gets a *created* worktree at
+    # <repo>/.worktrees/<id> on branch swarm/<id> — by mechanism, never the
+    # dispatcher CWD.
+    repo = _git_repo_with_commit(tmp_path / "work-repo")
+    monkeypatch.setattr(kb, "_coding_config",
+                        lambda: {"allowed_write_roots": [str(repo)]})
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree", workspace_path=str(repo)
+        )
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+    assert ws == repo / ".worktrees" / task.id
+    assert ws.is_dir()
+    # The worktree is checked out on swarm/<id>, and the repo registers it.
+    import subprocess
+    head = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert head == kb._swarm_branch(task.id)
+    wl = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list"],
+        capture_output=True, text=True,
+    ).stdout
+    assert str(ws) in wl
+
+
+def test_worktree_refuses_runtime_repo(kanban_home, tmp_path, monkeypatch):
+    # B2 HIGH-2 (confused-deputy): allowed_write_roots *includes* the runtime, so a
+    # task naming the runtime path passes discovery. resolve_workspace must REFUSE
+    # before any git call so production's .git is never mutated. In-fixture the
+    # runtime root resolves to <HERMES_HOME>/hermes-agent (get_default_hermes_root
+    # honors HERMES_HOME), so a repo there is treated exactly as production would be.
+    runtime_repo = _git_repo_with_commit(kanban_home / "hermes-agent")
+    monkeypatch.setattr(kb, "_coding_config",
+                        lambda: {"allowed_write_roots": [str(runtime_repo)]})
+    assert kb._within_runtime_tree(runtime_repo) is True
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="x", workspace_kind="worktree",
+            workspace_path=str(runtime_repo),
+        )
+        task = kb.get_task(conn, t)
+        with pytest.raises(RuntimeError, match="runtime"):
+            kb.resolve_workspace(task)
+    # No worktree was created in production.
+    assert not (runtime_repo / ".worktrees").exists()
+
+
+def test_worktree_recovers_from_stale_registration(kanban_home, tmp_path, monkeypatch):
+    # B2 MED-1: a half-completed prior add leaves a dangling branch/registration; a
+    # naive re-dispatch hits "already exists" -> spawn failure -> permanent
+    # auto-block. _create_swarm_worktree must prune + reuse-or-clean so re-dispatch
+    # is idempotent.
+    import shutil
+    import subprocess
+    repo = _git_repo_with_commit(tmp_path / "work-repo")
+    monkeypatch.setattr(kb, "_coding_config",
+                        lambda: {"allowed_write_roots": [str(repo)]})
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree", workspace_path=str(repo)
+        )
+        task = kb.get_task(conn, t)
+        ws1 = kb.resolve_workspace(task)
+        # Simulate a half-add: delete the worktree dir on disk but leave the
+        # branch + (now-stale) registration behind.
+        shutil.rmtree(ws1)
+        assert subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+             f"refs/heads/{kb._swarm_branch(task.id)}"],
+            capture_output=True,
+        ).returncode == 0
+        # Re-dispatch must recover, not raise.
+        ws2 = kb.resolve_workspace(task)
+    assert ws2 == repo / ".worktrees" / task.id
+    assert ws2.is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -829,7 +938,13 @@ class TestSharedBoardPaths:
             claim_expires=None,
             tenant=None,
         )
-        kb._default_spawn(task, str(tmp_path / "ws"))
+        # B1 guard (MOL-2031): _default_spawn now refuses a workspace that
+        # doesn't exist on disk, so create the scratch dir this env-injection
+        # test hands it. (Pre-guard the path was never created — the same
+        # missing-workspace shape that caused the MOL-2034 runtime corruption.)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        kb._default_spawn(task, str(ws))
 
         env = captured["env"]
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")
@@ -837,6 +952,108 @@ class TestSharedBoardPaths:
             default_home / "kanban" / "workspaces"
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
+
+
+class TestDefaultSpawnWorkspaceGuard:
+    """B1 fail-closed guard (MOL-2031 / MOL-2044; incident MOL-2034).
+
+    A worker whose resolved workspace did not exist used to fall through to
+    ``cwd=None`` in ``_default_spawn``'s ``Popen`` call, inheriting the
+    dispatcher CWD (the production runtime) and writing dev straight into it
+    — 14 LSP commits cherry-picked into ``~/.hermes/hermes-agent``. The guard
+    refuses to spawn unless the workspace is a real directory OUTSIDE the
+    runtime code tree; the raise auto-blocks the task instead of corrupting
+    production silently."""
+
+    def _set_home(self, monkeypatch, tmp_path, hermes_home):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+
+    def _task(self):
+        return kb.Task(
+            id="t_guard",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+    def _spy_popen(self, monkeypatch):
+        called = {"popen": False}
+
+        class _FakePopen:
+            def __init__(self, *a, **k):
+                called["popen"] = True
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        return called
+
+    def test_refuses_missing_workspace_without_spawning(
+        self, tmp_path, monkeypatch
+    ):
+        # Floor: the missing-workspace shape that caused MOL-2034 must raise
+        # BEFORE Popen — never inherit the dispatcher CWD.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        called = self._spy_popen(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="does not exist on disk"):
+            kb._default_spawn(self._task(), str(tmp_path / "nonexistent_ws"))
+        assert called["popen"] is False
+
+    def test_refuses_workspace_inside_runtime_tree(
+        self, tmp_path, monkeypatch
+    ):
+        # A workspace that *exists* but resolves inside the runtime code tree
+        # must also be refused (e.g. a worker handed ~/.hermes/hermes-agent).
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        called = self._spy_popen(monkeypatch)
+
+        fake_runtime = tmp_path / "fake-runtime"
+        fake_runtime.mkdir()
+        ws = fake_runtime / "hermes_cli"
+        ws.mkdir()
+        # Pin the runtime root so the assertion doesn't depend on where the
+        # test suite physically lives on disk.
+        monkeypatch.setattr(kb, "_runtime_code_roots", lambda: [fake_runtime])
+
+        with pytest.raises(RuntimeError, match="inside the Hermes"):
+            kb._default_spawn(self._task(), str(ws))
+        assert called["popen"] is False
+
+    def test_allows_scratch_workspace_outside_runtime(
+        self, tmp_path, monkeypatch
+    ):
+        # Ceiling: a real scratch workspace outside the runtime passes the
+        # guard and spawns normally (the legitimate non-repo lane).
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        called = self._spy_popen(monkeypatch)
+
+        ws = tmp_path / "scratch_ws"
+        ws.mkdir()
+        monkeypatch.setattr(
+            kb, "_runtime_code_roots", lambda: [tmp_path / "fake-runtime"]
+        )
+
+        kb._default_spawn(self._task(), str(ws))
+        assert called["popen"] is True
 
 
 # ---------------------------------------------------------------------------

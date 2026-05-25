@@ -2091,32 +2091,87 @@ def _cmd_specify(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+def _reclaim_swarm_worktree(task_id: str, workspace_path: Optional[str]) -> int:
+    """Reclaim a swarm worktree + its ``swarm/<id>`` branch for an archived task.
+
+    Returns 1 if a worktree was removed, else 0. Called by ``_cmd_gc`` only for
+    ``status = 'archived'`` tasks — i.e. past synthesizer completion, when the
+    swarm commits have already been consumed. So, unlike
+    ``cli._cleanup_worktree`` (which preserves unpushed work a human might still
+    push), this reclaims regardless of unpushed state (B6/P256/MOL-2031).
+
+    Safety: the persisted path must be ``<repo-root>/.worktrees/<task_id>`` and
+    the derived repo root must NOT resolve inside the Hermes runtime tree — a
+    pre-B2 worktree task may carry a stale runtime path, and we never run
+    ``git worktree remove`` against production.
+    """
+    import subprocess
+    if not workspace_path:
+        return 0
+    try:
+        wt = Path(workspace_path).expanduser().resolve()
+    except OSError:
+        return 0
+    # Expect the B2 layout <repo-root>/.worktrees/<task_id>; anything else is
+    # not a swarm worktree we created — leave it alone.
+    if wt.parent.name != ".worktrees" or wt.name != task_id:
+        return 0
+    repo_root = wt.parent.parent
+    if kb._within_runtime_tree(repo_root):
+        # Stale pre-B2 path pointing at production — refuse, never reclaim.
+        return 0
+    if not (repo_root / ".git").exists():
+        return 0
+    branch = kb._swarm_branch(task_id)
+
+    def _git(*a: str, timeout: int = 30) -> "subprocess.CompletedProcess":
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *a],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    rm = _git("worktree", "remove", "--force", str(wt))
+    reclaimed = 1 if rm.returncode == 0 else 0
+    # Clear any dangling registration, then delete the branch.
+    _git("worktree", "prune")
+    if _git(
+        "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", timeout=10
+    ).returncode == 0:
+        _git("branch", "-D", branch, timeout=10)
+    return reclaimed
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
+    """Remove scratch workspaces of archived tasks, reclaim swarm worktrees,
+    prune old events, and delete old worker logs."""
     import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    removed_wt = 0
     with kb.connect() as conn:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
         ).fetchall()
     for row in rows:
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+        kind = row["workspace_kind"]
+        if kind == "scratch":
+            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+            try:
+                path = path.resolve()
+            except OSError:
+                continue
+            try:
+                path.relative_to(scratch_root.resolve())
+            except ValueError:
+                # Safety: never delete outside the scratch root.
+                continue
+            if path.exists() and path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+                removed_ws += 1
+        elif kind == "worktree":
+            # B6/P256/MOL-2031 — reclaim the worktree + branch B2 created.
+            removed_wt += _reclaim_swarm_worktree(row["id"], row["workspace_path"])
+        # else: unknown kind — leave it alone.
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
@@ -2128,6 +2183,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         older_than_seconds=log_days * 24 * 3600,
     )
     print(f"GC complete: {removed_ws} workspace(s), "
+          f"{removed_wt} worktree(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
 

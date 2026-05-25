@@ -104,3 +104,6 @@ send_briefing_final.sh
 *.pre-MOL-*
 *.pre-P*
 *.pre-A*
+
+# Serena LSP index (per-session, machine-local; MOL-2031 C1)
+.serena/

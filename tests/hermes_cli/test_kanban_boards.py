@@ -358,6 +358,10 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
+        # B1/P254 mandates a real on-disk workspace before spawn (a worker
+        # with no workspace would inherit the dispatcher CWD — the MOL-2034
+        # hole). Create it so the env-capture path is reached.
+        (fresh_home / "ws").mkdir(parents=True, exist_ok=True)
         kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
@@ -397,6 +401,8 @@ class TestWorkerSpawnEnv:
             claim_expires=None,
             tenant=None,
         )
+        # B1/P254 mandates a real on-disk workspace before spawn.
+        (fresh_home / "ws").mkdir(parents=True, exist_ok=True)
         kb._default_spawn(task, str(fresh_home / "ws"), board=None)
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "default"
