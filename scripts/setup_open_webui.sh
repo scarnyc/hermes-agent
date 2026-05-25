@@ -52,12 +52,14 @@ require_cmd() {
 }
 
 choose_python() {
-  if command -v python3.11 >/dev/null 2>&1; then
+  if command -v python3.12 >/dev/null 2>&1; then
+    echo python3.12
+  elif command -v python3.11 >/dev/null 2>&1; then
     echo python3.11
   elif command -v python3 >/dev/null 2>&1; then
     echo python3
   else
-    echo "Python 3 is required." >&2
+    echo "Python 3.11 or 3.12 is required." >&2
     exit 1
   fi
 }
@@ -160,11 +162,11 @@ install_open_webui() {
   local py
   py="$(choose_python)"
   log "Using Python interpreter: $py"
-  "$py" -m venv "$OPEN_WEBUI_VENV"
+  "$py" -m venv --clear "$OPEN_WEBUI_VENV"
   # shellcheck disable=SC1090
   source "$OPEN_WEBUI_VENV/bin/activate"
-  python -m pip install --upgrade pip setuptools wheel
-  python -m pip install open-webui
+  "$py" -m pip install --upgrade pip setuptools wheel
+  "$py" -m pip install open-webui
 }
 
 write_launcher() {
@@ -307,15 +309,25 @@ main() {
   upsert_env API_SERVER_KEY "$api_key" "$HERMES_ENV_FILE"
   ensure_env_permissions
 
-  log 'Restarting Hermes gateway so API server settings take effect...'
-  hermes gateway restart >/dev/null 2>&1 || true
-  sleep 4
-  if ! curl -fsS "http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/health" >/dev/null; then
-    log 'Hermes API server did not answer on the first check. Trying to start gateway in the background...'
-    nohup hermes gateway run >/dev/null 2>&1 &
-    sleep 6
+  if curl -fsS "http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/health" >/dev/null 2>&1; then
+    log 'Hermes API server is already running — skipping restart.'
+  else
+    log 'Restarting Hermes gateway so API server settings take effect...'
+    hermes gateway restart >/dev/null 2>&1 || true
+    log 'Waiting for API server to become ready...'
+    for _ in $(seq 1 30); do
+      if curl -fsS "http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/health" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
+    if ! curl -fsS "http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/health" >/dev/null 2>&1; then
+      echo 'ERROR: Hermes API server failed to start within 60 seconds.' >&2
+      echo 'Check gateway logs: tail -100 ~/.hermes/logs/gateway.log' >&2
+      exit 1
+    fi
+    log 'Hermes API server is responding.'
   fi
-  curl -fsS "http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/health" >/dev/null
 
   log 'Installing Open WebUI into a dedicated virtualenv...'
   install_open_webui
