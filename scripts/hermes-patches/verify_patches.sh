@@ -60,6 +60,13 @@ else
     HERMES_AGENT="${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
     HERMES_SCRIPTS="${HERMES_HOME:-$HOME/.hermes}/scripts"
     HERMES_SKILLS="${HERMES_HOME:-$HOME/.hermes}/skills"
+    # MOL-2044 Finding 1: bind HERMES_POC_REPO in full-run mode too. Under
+    # `set -u` the first reference (P135_REPO_ROOT="$HERMES_POC_REPO") was an
+    # unbound-variable crash that aborted the integrity check before any later
+    # P-block ran. Default to the sibling control-plane checkout (the repo copy
+    # binds it to its own repo root via BASH_SOURCE; here we name it explicitly
+    # because BASH_SOURCE/../.. resolves to the runtime, not hermes-poc).
+    HERMES_POC_REPO="${HERMES_POC_REPO:-$HOME/Code/hermes-poc}"
 fi
 
 # P235/MOL-665: --terse mode. Self-delegates to the default (verbose) run and
