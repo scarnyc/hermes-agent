@@ -1368,6 +1368,17 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 # ── Provider resolution helpers ─────────────────────────────────────────────
 
+_provider_unhealthy_until: Dict[str, float] = {}
+
+
+def _mark_provider_unhealthy(name: str, ttl: int = 60) -> None:
+    _provider_unhealthy_until[name] = time.time() + ttl
+    logger.debug("Marked provider %r unhealthy for %ds", name, ttl)
+
+
+def _is_provider_unhealthy(name: str) -> bool:
+    until = _provider_unhealthy_until.get(name)
+    return until is not None and time.time() < until
 
 
 def _try_openrouter(explicit_api_key: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
