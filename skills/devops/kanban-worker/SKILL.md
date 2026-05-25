@@ -1,7 +1,7 @@
 ---
 name: kanban-worker
 description: Pitfalls, examples, and edge cases for Hermes Kanban workers. The lifecycle itself is auto-injected into every worker's system prompt as KANBAN_GUIDANCE (from agent/prompt_builder.py); this skill is what you load when you want deeper detail on specific scenarios.
-version: 2.0.0
+version: 2.1.0
 platforms: [linux, macos, windows]
 metadata:
   hermes:
@@ -29,6 +29,15 @@ If `$HERMES_TENANT` is set, the task belongs to a tenant namespace. When reading
 
 - Good: `business-a: Acme is our biggest customer`
 - Bad (leaks): `Acme is our biggest customer`
+
+## Stay inside your workspace — never the runtime or the patch ledger
+
+`$HERMES_KANBAN_WORKSPACE` is the only tree you write to. The patch-preserved production runtime at `~/.hermes/hermes-agent/` is off-limits: a worker that `cd`s there and commits corrupts production. This is exactly what MOL-2034 was — a dispatched worker cherry-picked 14 upstream commits straight into the runtime because its workspace path had resolved to the dispatcher's CWD. If a path you're about to write resolves inside `~/.hermes/hermes-agent/`, stop; you're in the wrong tree.
+
+You also never touch the patch ledger. Patch numbers (`P###` headers in `PATCHES.md`) are allocated by the human/CC backport step, which computes the next free number across every in-flight source — merged ledger, open PRs, sibling worktrees, the runtime copy. You can't see all of those from inside your run, so any number you pick will eventually collide. Describe *what* you changed in your `kanban_complete` summary and let the backport assign the `P###`.
+
+- Good: "Edited `resolve_workspace()` to create the worktree before returning; diff in summary." → backport numbers it.
+- Bad: "Applied as P257." → a guessed number that may already be claimed elsewhere.
 
 ## Good summary + metadata shapes
 
@@ -138,6 +147,8 @@ If you open the task and `kanban_show` returns `runs: [...]` with one or more cl
 
 - Call `delegate_task` as a substitute for `kanban_create`. `delegate_task` is for short reasoning subtasks inside YOUR run; `kanban_create` is for cross-agent handoffs that outlive one API loop.
 - Modify files outside `$HERMES_KANBAN_WORKSPACE` unless the task body says to.
+- `cd` into or commit to the production runtime `~/.hermes/hermes-agent/` — work only inside your workspace (MOL-2034).
+- Assign yourself a patch `P###` or edit `PATCHES.md` — describe the change in your summary; the backport numbers it.
 - Create follow-up tasks assigned to yourself — assign to the right specialist.
 - Complete a task you didn't actually finish. Block it instead.
 
