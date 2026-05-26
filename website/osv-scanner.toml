@@ -1,0 +1,153 @@
+# osv-scanner ignore config - governs website/package-lock.json (MOL-2043 F1).
+# Deployment-scoped ignore: 'website' is an upstream sub-project NOT
+# deployed in the local closed-loop Hermes agent. See MOL-2043 Jira comment.
+
+[[IgnoredVulns]]
+id = "CVE-2026-1525"
+ignoreUntil = 2026-08-25
+reason = "undici@7.23.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-1526"
+ignoreUntil = 2026-08-25
+reason = "undici@7.23.0 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-1527"
+ignoreUntil = 2026-08-25
+reason = "undici@7.23.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-1528"
+ignoreUntil = 2026-08-25
+reason = "undici@7.23.0 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-2229"
+ignoreUntil = 2026-08-25
+reason = "undici@7.23.0 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-2581"
+ignoreUntil = 2026-08-25
+reason = "undici@7.23.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-2950"
+ignoreUntil = 2026-08-25
+reason = "lodash-es@4.17.23 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-33671"
+ignoreUntil = 2026-08-25
+reason = "picomatch@2.3.1 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-33672"
+ignoreUntil = 2026-08-25
+reason = "picomatch@2.3.1 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-33750"
+ignoreUntil = 2026-08-25
+reason = "brace-expansion@1.1.12 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-34043"
+ignoreUntil = 2026-08-25
+reason = "serialize-javascript@6.0.2 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41148"
+ignoreUntil = 2026-08-25
+reason = "mermaid@11.13.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41149"
+ignoreUntil = 2026-08-25
+reason = "mermaid@11.13.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41150"
+ignoreUntil = 2026-08-25
+reason = "mermaid@11.13.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41159"
+ignoreUntil = 2026-08-25
+reason = "mermaid@11.13.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41238"
+ignoreUntil = 2026-08-25
+reason = "dompurify@3.3.3 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41239"
+ignoreUntil = 2026-08-25
+reason = "dompurify@3.3.3 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41240"
+ignoreUntil = 2026-08-25
+reason = "dompurify@3.3.3 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41305"
+ignoreUntil = 2026-08-25
+reason = "postcss@8.5.8 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-41907"
+ignoreUntil = 2026-08-25
+reason = "uuid@8.3.2 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-45736"
+ignoreUntil = 2026-08-25
+reason = "ws@8.19.0 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-4800"
+ignoreUntil = 2026-08-25
+reason = "lodash-es@4.17.23 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-4867"
+ignoreUntil = 2026-08-25
+reason = "path-to-regexp@0.1.12 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-6321"
+ignoreUntil = 2026-08-25
+reason = "fast-uri@3.1.0 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-6322"
+ignoreUntil = 2026-08-25
+reason = "fast-uri@3.1.0 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-6402"
+ignoreUntil = 2026-08-25
+reason = "webpack-dev-server@5.2.3 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-8723"
+ignoreUntil = 2026-08-25
+reason = "qs@6.14.2 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "GHSA-39q2-94rc-95cp"
+ignoreUntil = 2026-08-25
+reason = "dompurify@3.3.3 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "GHSA-5c6j-r48x-rmvq"
+ignoreUntil = 2026-08-25
+reason = "serialize-javascript@6.0.2 (high) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "GHSA-r4q5-vmmm-2653"
+ignoreUntil = 2026-08-25
+reason = "follow-redirects@1.15.11 (medium) in the upstream 'website' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'website' is ever independently built/served (tracked: MOL-2043 follow-up)."

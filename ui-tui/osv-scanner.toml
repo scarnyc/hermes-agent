@@ -1,0 +1,18 @@
+# osv-scanner ignore config - governs ui-tui/package-lock.json (MOL-2043 F1).
+# Deployment-scoped ignore: 'ui-tui' is an upstream sub-project NOT
+# deployed in the local closed-loop Hermes agent. See MOL-2043 Jira comment.
+
+[[IgnoredVulns]]
+id = "CVE-2026-41305"
+ignoreUntil = 2026-08-25
+reason = "postcss@8.5.9 (medium) in the upstream 'ui-tui' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'ui-tui' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-45149"
+ignoreUntil = 2026-08-25
+reason = "brace-expansion@5.0.5 (medium) in the upstream 'ui-tui' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'ui-tui' is ever independently built/served (tracked: MOL-2043 follow-up)."
+
+[[IgnoredVulns]]
+id = "CVE-2026-45736"
+ignoreUntil = 2026-08-25
+reason = "ws@8.20.0 (medium) in the upstream 'ui-tui' sub-project. Not deployed in the local closed-loop Hermes agent (the agent runtime is the Python gateway / uv.lock); this lockfile is scanned only because the fork mirrors the full upstream monorepo. Build/dev-time or non-exposed in this single-user deployment. Lift + upgrade if 'ui-tui' is ever independently built/served (tracked: MOL-2043 follow-up)."

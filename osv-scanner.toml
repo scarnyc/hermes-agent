@@ -1,0 +1,14 @@
+# osv-scanner ignore config - governs uv.lock (MOL-2043 F1).
+# Terminally-unreachable PyPI CVEs only. See the MOL-2043 Jira comment for the
+# full triage + disposition. Same-major fixes were BUMPED (commit 6fc20c722);
+# litellm-highs / starlette / anthropic stay OPEN under the follow-up ticket.
+
+[[IgnoredVulns]]
+id = "CVE-2026-26209"
+ignoreUntil = 2026-08-25
+reason = "cbor2 transitive dep with zero first-party imports in the Hermes agent (grep-verified) - CVE unreachable through any agent code path. cbor2 5->6 is a breaking major bump deferred; nothing here calls cbor2."
+
+[[IgnoredVulns]]
+id = "CVE-2026-35030"
+ignoreUntil = 2026-08-25
+reason = "litellm proxy-mode JWT-auth CVE (requires enable_jwt_auth on the litellm PROXY server). Hermes uses litellm only as a client SDK (litellm.completion), never runs the proxy - unreachable. The 5 litellm HIGH CVEs are left OPEN and tracked by the MOL-2043 follow-up validated-bump ticket, NOT ignored."
