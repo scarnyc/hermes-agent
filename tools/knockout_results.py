@@ -46,7 +46,7 @@ DEFAULT_REPO = "~/.hermes/hermes-agent"
 # against our fork's HEAD would false-FAIL. Forensic lesson from MOL-708:
 # local_commit a12ea7674 (on-fork, the SHA to verify) vs upstream_commit
 # a61420952 (inside upstream PR #28914).
-# P276/MOL-2219: `fork_commit` is an accepted on-fork alias (the non-canonical key
+# P279/MOL-2219: `fork_commit` is an accepted on-fork alias (the non-canonical key
 # the MOL-631 synth wrote under), placed AFTER canonical `local_commit` so the
 # canonical key wins when both are present. Deliberately EXCLUDES upstream_commit /
 # merge_commit — those name different git objects (MOL-708 lesson). The real

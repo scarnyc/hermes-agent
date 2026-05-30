@@ -501,7 +501,7 @@ def _no_manifest_header() -> str:
     ])
 
 
-# P276/MOL-2219: prose↔manifest divergence guard. The collector is a transcriber
+# P279/MOL-2219: prose↔manifest divergence guard. The collector is a transcriber
 # (omit-don't-fabricate); this is the SOLE checker, so the affirmative-claim scan
 # lives here. Negation-aware + sentence-scoped so an honest no-op ("no commit
 # needed", "nothing to cherry-pick") never trips a false ❌ (skeptic Trickster
@@ -605,7 +605,7 @@ def verify_and_annotate(
                 results.append(_verify_jira_status(entry))
 
         if not results:
-            # P276/MOL-2219: an empty manifest is benign ONLY if the prose makes no
+            # P279/MOL-2219: an empty manifest is benign ONLY if the prose makes no
             # affirmative work claim. If prose net-asserts a commit/push/transition
             # with no corresponding verifiable claim, treat it as SUSPECT (the
             # MOL-631 fabrication shape) and fail loudly — never disguise it as

@@ -471,7 +471,7 @@ def test_integration_bogus_sha_fails_banner(tmp_path, monkeypatch):
     assert "unknown commit" in annotated
 
 
-# ── P276/MOL-2219: fork_commit alias acceptance ─────────────────────
+# ── P279/MOL-2219: fork_commit alias acceptance ─────────────────────
 # The MOL-631 synth wrote the SHA under the non-canonical `fork_commit` key, which
 # the old _SHA_KEYS dropped → empty git_commits → the fabrication masqueraded as
 # "none claimed". The alias lets a real SHA under that name reach the manifest

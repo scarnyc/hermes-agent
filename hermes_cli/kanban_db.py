@@ -2180,7 +2180,26 @@ class HallucinatedCardsError(ValueError):
         )
 
 
-# P277/MOL-2219: completion-metadata commit keys, canonical order. Mirrors
+class FabricatedCommitError(ValueError):
+    """Raised by ``complete_task`` when completion metadata claims a commit
+    SHA that does not resolve to a commit object in the task's repo.
+
+    The fabricated SHA is attached as ``.claimed_commit`` for callers that
+    want structured access. Kept as a ``ValueError`` subclass so existing
+    tool-error handlers treat it as a recoverable user error (the caller
+    blocks the task rather than crashing the worker).
+    """
+
+    def __init__(self, claimed_commit: str, completing_task_id: str):
+        self.claimed_commit = claimed_commit
+        self.completing_task_id = completing_task_id
+        super().__init__(
+            f"completion blocked: claimed commit {claimed_commit} does not "
+            f"resolve to a commit in the task's repository (fabricated)"
+        )
+
+
+# P280/MOL-2219: completion-metadata commit keys, canonical order. Mirrors
 # tools/knockout_results._SHA_KEYS — local_commit is canonical; fork_commit is
 # the non-canonical alias the MOL-631 synth used. Excludes upstream/merge SHAs
 # (those name commits the worker did not author).
@@ -2199,10 +2218,16 @@ def _claimed_commit_sha(metadata: Optional[dict]) -> "Optional[str]":
 
 
 def _task_repo_root(conn: sqlite3.Connection, task_id: str) -> "Optional[str]":
+    # P280/MOL-2219: a task's git repo IS its workspace_path. The tasks table
+    # has no repo_root column (PRAGMA-confirmed) — the prior SELECT repo_root
+    # raised OperationalError on every real completion, defeating the gate.
+    # Worktree tasks (workspace_path = <repo>/.worktrees/<id>) share the parent
+    # object DB, so a SHA committed in the worktree still resolves via
+    # `git -C <workspace_path> cat-file`.
     row = conn.execute(
-        "SELECT repo_root FROM tasks WHERE id = ?", (task_id,)
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
-    return row["repo_root"] if row and row["repo_root"] else None
+    return row["workspace_path"] if row and row["workspace_path"] else None
 
 
 def _commit_resolves(sha: str, repo_root: Optional[str]) -> "Optional[bool]":
@@ -2298,7 +2323,7 @@ def complete_task(
     else:
         verified_cards = []
 
-    # Gate (P277/MOL-2219): a claimed commit SHA in completion metadata must
+    # Gate (P280/MOL-2219): a claimed commit SHA in completion metadata must
     # resolve in the task's repo. Runs BEFORE the main write txn so a fabricated
     # completion never reaches 'done' (block_task only transitions running|ready,
     # not done). A rejected attempt emits an auditable event in its own txn, then

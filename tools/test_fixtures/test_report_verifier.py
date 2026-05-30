@@ -323,12 +323,12 @@ def test_verify_and_annotate_dispatches_git_commit(monkeypatch, git_repo):
     assert "git_commit" in out
 
 
-# ── P276/MOL-2219: prose↔manifest divergence guard ──────────────────────
+# ── P279/MOL-2219: prose↔manifest divergence guard ──────────────────────
 # The MOL-631 fabrication shape: synth prose claims "committed 6ef1ad7 + pushed
 # + → Done" while the manifest carries no verifiable claim. The guard fires ❌ on
 # net-affirmative prose and stays silent on honest no-ops (negation-aware).
 
-_P276_EMPTY_MANIFEST = "<!-- WORK_MANIFEST v1\nWORK_MANIFEST -->"
+_P279_EMPTY_MANIFEST = "<!-- WORK_MANIFEST v1\nWORK_MANIFEST -->"
 
 
 def test_prose_scanner_detects_affirmative_commit():
@@ -354,7 +354,7 @@ def test_prose_scanner_neutral_returns_none():
 def test_empty_manifest_with_affirmative_prose_is_suspect():
     prose = ("Manually ported the fix and committed it as 6ef1ad7. "
              "Pushed to main. MOL-631 transitioned to Done.")
-    response = f"{prose}\n\n{_P276_EMPTY_MANIFEST}"
+    response = f"{prose}\n\n{_P279_EMPTY_MANIFEST}"
     job = {"id": "test", "name": "knockout", "claims_expected": True}
     out = rv.verify_and_annotate(job, response, "unit_test", 0.0)
     assert "❌ UNVERIFIABLE CLAIM" in out
@@ -364,7 +364,7 @@ def test_empty_manifest_with_affirmative_prose_is_suspect():
 
 def test_empty_manifest_with_negated_prose_stays_benign():
     prose = "No commit was needed; nothing to cherry-pick and did not push."
-    response = f"{prose}\n\n{_P276_EMPTY_MANIFEST}"
+    response = f"{prose}\n\n{_P279_EMPTY_MANIFEST}"
     job = {"id": "test", "name": "knockout", "claims_expected": True}
     out = rv.verify_and_annotate(job, response, "unit_test", 0.0)
     assert "❌ UNVERIFIABLE CLAIM" not in out
@@ -373,7 +373,7 @@ def test_empty_manifest_with_negated_prose_stays_benign():
 
 def test_empty_manifest_neutral_prose_stays_benign():
     prose = "Reviewed the ticket; nothing actionable surfaced this run."
-    response = f"{prose}\n\n{_P276_EMPTY_MANIFEST}"
+    response = f"{prose}\n\n{_P279_EMPTY_MANIFEST}"
     job = {"id": "test", "name": "knockout", "claims_expected": True}
     out = rv.verify_and_annotate(job, response, "unit_test", 0.0)
     assert "❌ UNVERIFIABLE CLAIM" not in out
