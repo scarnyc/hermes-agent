@@ -321,3 +321,60 @@ def test_verify_and_annotate_dispatches_git_commit(monkeypatch, git_repo):
     out = rv.verify_and_annotate(job, response, "unit_test", 0.0)
     assert "VERIFICATION: 1/1 claims passed" in out
     assert "git_commit" in out
+
+
+# ── P276/MOL-2219: prose↔manifest divergence guard ──────────────────────
+# The MOL-631 fabrication shape: synth prose claims "committed 6ef1ad7 + pushed
+# + → Done" while the manifest carries no verifiable claim. The guard fires ❌ on
+# net-affirmative prose and stays silent on honest no-ops (negation-aware).
+
+_P276_EMPTY_MANIFEST = "<!-- WORK_MANIFEST v1\nWORK_MANIFEST -->"
+
+
+def test_prose_scanner_detects_affirmative_commit():
+    assert rv._prose_asserts_unverified_work(
+        "I committed the fix as 6ef1ad7 and pushed to main.") is not None
+
+
+def test_prose_scanner_detects_transition_to_done():
+    reason = rv._prose_asserts_unverified_work("MOL-631 transitioned to Done.")
+    assert reason is not None and "transition to Done" in reason
+
+
+def test_prose_scanner_negation_suppresses():
+    assert rv._prose_asserts_unverified_work(
+        "No commit was needed. Nothing to cherry-pick. Did not push.") is None
+
+
+def test_prose_scanner_neutral_returns_none():
+    assert rv._prose_asserts_unverified_work(
+        "Reviewed the ticket and summarized the findings.") is None
+
+
+def test_empty_manifest_with_affirmative_prose_is_suspect():
+    prose = ("Manually ported the fix and committed it as 6ef1ad7. "
+             "Pushed to main. MOL-631 transitioned to Done.")
+    response = f"{prose}\n\n{_P276_EMPTY_MANIFEST}"
+    job = {"id": "test", "name": "knockout", "claims_expected": True}
+    out = rv.verify_and_annotate(job, response, "unit_test", 0.0)
+    assert "❌ UNVERIFIABLE CLAIM" in out
+    assert "Empty WORK_MANIFEST" not in out
+    assert "6ef1ad7" in out
+
+
+def test_empty_manifest_with_negated_prose_stays_benign():
+    prose = "No commit was needed; nothing to cherry-pick and did not push."
+    response = f"{prose}\n\n{_P276_EMPTY_MANIFEST}"
+    job = {"id": "test", "name": "knockout", "claims_expected": True}
+    out = rv.verify_and_annotate(job, response, "unit_test", 0.0)
+    assert "❌ UNVERIFIABLE CLAIM" not in out
+    assert "Empty WORK_MANIFEST" in out
+
+
+def test_empty_manifest_neutral_prose_stays_benign():
+    prose = "Reviewed the ticket; nothing actionable surfaced this run."
+    response = f"{prose}\n\n{_P276_EMPTY_MANIFEST}"
+    job = {"id": "test", "name": "knockout", "claims_expected": True}
+    out = rv.verify_and_annotate(job, response, "unit_test", 0.0)
+    assert "❌ UNVERIFIABLE CLAIM" not in out
+    assert "Empty WORK_MANIFEST" in out

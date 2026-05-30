@@ -469,3 +469,32 @@ def test_integration_bogus_sha_fails_banner(tmp_path, monkeypatch):
         {"id": "knockout-results-test", "claims_expected": True}, report, "sess", 0.0)
     assert "⚠️ VERIFICATION: 1/1 claims failed" in annotated
     assert "unknown commit" in annotated
+
+
+# ── P276/MOL-2219: fork_commit alias acceptance ─────────────────────
+# The MOL-631 synth wrote the SHA under the non-canonical `fork_commit` key, which
+# the old _SHA_KEYS dropped → empty git_commits → the fabrication masqueraded as
+# "none claimed". The alias lets a real SHA under that name reach the manifest
+# (and be ❌'d by the verifier when absent). Canonical local_commit still wins.
+# Manifest parsed via report_verifier's own _extract_manifest/_parse_manifest so
+# the test asserts the real collector↔verifier contract, not a test-local shim.
+
+def test_extract_sha_accepts_fork_commit():
+    assert kr._extract_sha({"fork_commit": "6ef1ad7"}) == "6ef1ad7"
+
+
+def test_extract_sha_canonical_local_commit_wins_over_fork():
+    assert kr._extract_sha(
+        {"local_commit": LOCAL_SHA, "fork_commit": "deadbeef"}) == LOCAL_SHA
+
+
+def test_fork_commit_key_flows_into_git_commits(tmp_path):
+    meta = {"ticket": "MOL-708", "fork_commit": LOCAL_SHA}
+    db = _make_db(tmp_path, synth_metadata=meta)
+    log = _make_log(tmp_path)
+    report = kr.collect_results(SYNTH, kanban_db=db, knockout_log=log)
+    body = rv._extract_manifest(report)
+    assert body is not None, "collector emitted no WORK_MANIFEST"
+    git_commits = rv._parse_manifest(body).get("git_commits", [])
+    assert git_commits, "fork_commit alias did not flow into git_commits"
+    assert git_commits[0]["sha"] == LOCAL_SHA

@@ -46,7 +46,13 @@ DEFAULT_REPO = "~/.hermes/hermes-agent"
 # against our fork's HEAD would false-FAIL. Forensic lesson from MOL-708:
 # local_commit a12ea7674 (on-fork, the SHA to verify) vs upstream_commit
 # a61420952 (inside upstream PR #28914).
-_SHA_KEYS = ("local_commit", "commit", "sha")
+# P276/MOL-2219: `fork_commit` is an accepted on-fork alias (the non-canonical key
+# the MOL-631 synth wrote under), placed AFTER canonical `local_commit` so the
+# canonical key wins when both are present. Deliberately EXCLUDES upstream_commit /
+# merge_commit — those name different git objects (MOL-708 lesson). The real
+# fabrication-catch is the report_verifier divergence guard; this alias just lets a
+# genuine SHA under that name reach _verify_git_commit (and be ❌'d when absent).
+_SHA_KEYS = ("local_commit", "fork_commit", "commit", "sha")
 
 _MAX_CHAIN_DEPTH = 64  # cycle / runaway guard on the link walk
 

@@ -501,6 +501,45 @@ def _no_manifest_header() -> str:
     ])
 
 
+# P276/MOL-2219: prose↔manifest divergence guard. The collector is a transcriber
+# (omit-don't-fabricate); this is the SOLE checker, so the affirmative-claim scan
+# lives here. Negation-aware + sentence-scoped so an honest no-op ("no commit
+# needed", "nothing to cherry-pick") never trips a false ❌ (skeptic Trickster
+# HIGH: never a false ❌). It fires only when prose NET-asserts a commit/push/
+# transition while the manifest carried no corresponding verifiable claim — the
+# exact MOL-631 fabrication shape (synth prose said "committed 6ef1ad7 + pushed +
+# → Done" with an empty git_commits manifest).
+_AFFIRM_COMMIT_RE = re.compile(
+    r"\b(?:committed|cherry-?picked|ported|commit\s+[0-9a-f]{7,40})\b", re.I)
+_AFFIRM_PUSH_RE = re.compile(r"\bpushed\b", re.I)
+_AFFIRM_DONE_RE = re.compile(
+    r"(?:→\s*done\b|\b(?:transitioned|moved|marked|set)\b[^.]*\bdone\b)", re.I)
+_NEGATION_RE = re.compile(
+    r"\b(?:no|not|never|nothing|none|without|skip|skipped|unable|"
+    r"didn't|doesn't|wasn't|weren't|don't|couldn't|cannot|can't)\b|n't|no-op",
+    re.I)
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
+
+
+def _prose_asserts_unverified_work(prose: str) -> "str | None":
+    """Return a short reason if PROSE net-affirms a commit/push/transition (so an
+    empty manifest is suspect), else None. Sentence-scoped + negation-aware so an
+    honest no-op never trips it."""
+    if not prose:
+        return None
+    asserted: list[str] = []
+    for sentence in _SENTENCE_SPLIT_RE.split(prose):
+        if _NEGATION_RE.search(sentence):
+            continue
+        if _AFFIRM_COMMIT_RE.search(sentence) and "commit" not in asserted:
+            asserted.append("commit")
+        if _AFFIRM_PUSH_RE.search(sentence) and "push" not in asserted:
+            asserted.append("push")
+        if _AFFIRM_DONE_RE.search(sentence) and "transition to Done" not in asserted:
+            asserted.append("transition to Done")
+    return ", ".join(asserted) if asserted else None
+
+
 def verify_and_annotate(
     job: dict,
     final_response: str,
@@ -566,6 +605,18 @@ def verify_and_annotate(
                 results.append(_verify_jira_status(entry))
 
         if not results:
+            # P276/MOL-2219: an empty manifest is benign ONLY if the prose makes no
+            # affirmative work claim. If prose net-asserts a commit/push/transition
+            # with no corresponding verifiable claim, treat it as SUSPECT (the
+            # MOL-631 fabrication shape) and fail loudly — never disguise it as
+            # "none claimed". This is a meta-observation, not a fabricated verdict.
+            suspect = _prose_asserts_unverified_work(final_response)
+            if suspect:
+                return (
+                    f"❌ UNVERIFIABLE CLAIM — synthesizer prose asserts {suspect} "
+                    "but emitted no verifiable WORK_MANIFEST claim. Treated as "
+                    "SUSPECT (possible fabrication); NOT confirmed.\n\n"
+                    f"{SEPARATOR}\n\n{final_response}")
             return ("ℹ️ Empty WORK_MANIFEST (no claims to verify)\n\n"
                     f"{SEPARATOR}\n\n{final_response}")
 
