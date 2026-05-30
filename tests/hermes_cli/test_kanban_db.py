@@ -1183,3 +1183,92 @@ def test_connect_falls_back_to_delete_on_locking_protocol(kanban_home, caplog):
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
     conn.close()
+
+
+# ── P280/MOL-2219: commit self-verify gate ──────────────────────────────
+# The MOL-631 fabrication shape: a worker reports `completed` with a commit SHA
+# in completion metadata that was never actually committed. complete_task now
+# resolves any claimed SHA against the task's repo_root via `git cat-file -t`
+# BEFORE writing 'done'. Unresolvable in a real repo -> FabricatedCommitError
+# (caller blocks); unknown/!git repo -> skip (never a false block).
+
+
+def _init_git_repo_head(path):
+    """Init a real git repo at *path* with one commit; return its HEAD sha."""
+    import os
+    import subprocess
+    from pathlib import Path
+    path = str(path)
+    env = dict(os.environ,
+               GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "init", "-q", path], check=True, env=env)
+    (Path(path) / "f.txt").write_text("hello\n")
+    subprocess.run(["git", "-C", path, "add", "f.txt"], check=True, env=env)
+    subprocess.run(["git", "-C", path, "commit", "-q", "-m", "init"],
+                   check=True, env=env)
+    r = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"],
+                       capture_output=True, text=True, check=True, env=env)
+    return r.stdout.strip()
+
+
+_FABRICATED_SHA = "6ef1ad7"  # the actual MOL-631 fabricated short SHA
+
+
+def test_complete_blocks_fabricated_commit(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo_head(repo)
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="land the fix",
+                         workspace_kind="dir", workspace_path=str(repo))
+    with pytest.raises(kb.FabricatedCommitError):
+        kb.complete_task(
+            conn, tid,
+            result="ported + committed",
+            metadata={"local_commit": _FABRICATED_SHA},
+        )
+    # The task must NOT have reached 'done'.
+    assert kb.get_task(conn, tid).status != "done"
+    # A rejected attempt is auditable.
+    events = [e for e in kb.list_events(conn, tid)
+              if e.kind == "completion_blocked_fabrication"]
+    assert events, "no completion_blocked_fabrication audit event emitted"
+
+
+def test_complete_accepts_real_commit(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    head = _init_git_repo_head(repo)
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="real work",
+                         workspace_kind="dir", workspace_path=str(repo))
+    ok = kb.complete_task(
+        conn, tid,
+        result="committed for real",
+        metadata={"local_commit": head},
+    )
+    assert ok is True
+    assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_no_commit_metadata_unaffected(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo_head(repo)
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="doc-only",
+                         workspace_kind="dir", workspace_path=str(repo))
+    ok = kb.complete_task(conn, tid, result="reviewed; nothing to commit",
+                          metadata={"notes": "no code change"})
+    assert ok is True
+    assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_skips_gate_without_repo_root(kanban_home):
+    # No repo_root -> the gate cannot know which repo to check, so it must skip
+    # rather than manufacture a false block (Phase 1 divergence guard is the
+    # downstream backstop). A fabricated SHA here still completes at the DB layer.
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="no repo")
+    ok = kb.complete_task(conn, tid, result="x",
+                          metadata={"local_commit": _FABRICATED_SHA})
+    assert ok is True
+    assert kb.get_task(conn, tid).status == "done"

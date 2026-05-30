@@ -1540,13 +1540,31 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except (kb.FabricatedCommitError, kb.HallucinatedCardsError) as exc:
+                # P280/MOL-2219: a fabricated completion (unresolvable commit SHA
+                # or phantom created_cards) must fail LOUDLY, not crash the worker
+                # with a raw traceback. Block the task so it leaves 'running' for
+                # human triage and can never reach 'done', and surface the reason.
+                failed.append(tid)
+                blocked = kb.block_task(
+                    conn, tid, reason=str(exc),
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+                tail = "" if blocked else (
+                    " (could not transition to blocked; task left in place — "
+                    "inspect manually)"
+                )
+                print(f"BLOCKED {tid}: {exc}{tail}", file=sys.stderr)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess  # P272/MOL-2219: read-only git for git_commits claim
 import sys
 import urllib.error
 import urllib.request
@@ -114,6 +115,12 @@ def _parse_manifest(yaml_body: str) -> dict:
         "file_ops": parsed.get("file_ops") or [],
         "jira_transitions": parsed.get("jira_transitions") or [],
         "jira_comments": parsed.get("jira_comments") or [],
+        # P272/MOL-2219: results-reporting claim types. git_commits proves a
+        # cherry-pick actually landed THIS run (not merely present); jira_status
+        # asserts a ticket's current state (pair with jira_transitions for the
+        # who-did-it changelog-window check).
+        "git_commits": parsed.get("git_commits") or [],
+        "jira_status": parsed.get("jira_status") or [],
     }
 
 
@@ -337,6 +344,108 @@ def _verify_jira_comment(entry: dict, job_start_ts_utc: float, now_utc: float) -
     )
 
 
+def _run_git(repo: str, args: list[str], timeout: float = 10.0) -> tuple[int, str]:
+    # P272/MOL-2219: read-only git on the patch-preserved runtime tree. ONLY
+    # query verbs (rev-parse / merge-base --is-ancestor / log) are ever passed —
+    # never fetch/rebase/reset/pull. Returns (returncode, combined_output).
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.returncode, (proc.stdout + proc.stderr).strip()
+    except Exception as e:
+        return 127, f"{type(e).__name__}: {e}"
+
+
+def _verify_git_commit(entry: dict) -> ClaimResult:
+    # P272/MOL-2219: prove a cherry-pick actually LANDED THIS RUN, not merely that
+    # it is present in history (skeptic #1). With a pre-swarm `head_before`
+    # baseline we assert NOT-ancestor-before AND ancestor-now; without it we
+    # degrade to a present-only pass and say so honestly.
+    repo_raw = str(entry.get("repo", ""))
+    sha = str(entry.get("sha", ""))
+    if not repo_raw or not sha:
+        return ClaimResult("git_commit", entry, False, "missing repo or sha field")
+
+    repo = os.path.expanduser(repo_raw)
+
+    rc, _ = _run_git(repo, ["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
+    if rc != 0:
+        return ClaimResult("git_commit", entry, False, f"{sha} — unknown commit in {repo_raw}")
+
+    rc, _ = _run_git(repo, ["merge-base", "--is-ancestor", sha, "HEAD"])
+    if rc != 0:
+        return ClaimResult("git_commit", entry, False, f"{sha} — NOT reachable from HEAD")
+
+    subject = str(entry.get("subject", "")).strip()
+    if subject:
+        src, actual_subject = _run_git(repo, ["log", "-1", "--format=%s", sha])
+        if src != 0 or subject.lower() not in actual_subject.lower():
+            return ClaimResult(
+                "git_commit", entry, False,
+                f"{sha} — subject mismatch: expected substring {subject!r}, "
+                f"actual {actual_subject!r}",
+            )
+
+    head_before = str(entry.get("head_before", "")).strip()
+    if head_before:
+        brc, _ = _run_git(repo, ["rev-parse", "--verify", "--quiet", f"{head_before}^{{commit}}"])
+        if brc != 0:
+            return ClaimResult(
+                "git_commit", entry, True,
+                f"{sha} — present in HEAD; baseline {head_before} unresolvable "
+                f"(not proven to have landed during this run)",
+            )
+        arc, _ = _run_git(repo, ["merge-base", "--is-ancestor", sha, head_before])
+        if arc == 0:
+            return ClaimResult(
+                "git_commit", entry, False,
+                f"{sha} — already present before run (ancestor of baseline "
+                f"{head_before}) — no-op",
+            )
+        return ClaimResult(
+            "git_commit", entry, True,
+            f"{sha} — landed this run (absent from baseline {head_before}, "
+            f"reachable from HEAD)",
+        )
+
+    return ClaimResult(
+        "git_commit", entry, True,
+        f"{sha} — present in HEAD (no baseline; not proven to have landed during this run)",
+    )
+
+
+def _verify_jira_status(entry: dict) -> ClaimResult:
+    # P272/MOL-2219: assert a ticket's CURRENT live status. Complements
+    # jira_transitions (changelog-within-window) — pair them so the report
+    # proves both who-flipped-it and where-it-rests-now (skeptic #5).
+    issue = str(entry.get("issue", ""))
+    expected = str(entry.get("status", ""))
+    if not issue or not expected:
+        return ClaimResult("jira_status", entry, False, "missing issue or status field")
+
+    auth = _jira_auth()
+    if not auth:
+        return ClaimResult("jira_status", entry, False, f"{issue} — no Jira credentials in env")
+
+    try:
+        data = _jira_get(f"/rest/api/2/issue/{issue}?fields=status", auth)
+    except Exception as e:
+        return ClaimResult(
+            "jira_status", entry, False,
+            f"{issue} — status API error: {type(e).__name__}: {e}",
+        )
+
+    actual = ((data.get("fields", {}) or {}).get("status", {}) or {}).get("name", "")
+    if actual.strip().lower() == expected.strip().lower():
+        return ClaimResult("jira_status", entry, True, f"{issue} — status is {actual!r} (matches)")
+    return ClaimResult(
+        "jira_status", entry, False,
+        f"{issue} — status is {actual!r}, expected {expected!r}",
+    )
+
+
 def _persist_results(job: dict, cron_session_id: str, results: list[ClaimResult]) -> None:
     if not HERMES_DB.parent.exists():
         return
@@ -390,6 +499,45 @@ def _no_manifest_header() -> str:
         "(original report from Hermes follows)",
         SEPARATOR,
     ])
+
+
+# P279/MOL-2219: prose↔manifest divergence guard. The collector is a transcriber
+# (omit-don't-fabricate); this is the SOLE checker, so the affirmative-claim scan
+# lives here. Negation-aware + sentence-scoped so an honest no-op ("no commit
+# needed", "nothing to cherry-pick") never trips a false ❌ (skeptic Trickster
+# HIGH: never a false ❌). It fires only when prose NET-asserts a commit/push/
+# transition while the manifest carried no corresponding verifiable claim — the
+# exact MOL-631 fabrication shape (synth prose said "committed 6ef1ad7 + pushed +
+# → Done" with an empty git_commits manifest).
+_AFFIRM_COMMIT_RE = re.compile(
+    r"\b(?:committed|cherry-?picked|ported|commit\s+[0-9a-f]{7,40})\b", re.I)
+_AFFIRM_PUSH_RE = re.compile(r"\bpushed\b", re.I)
+_AFFIRM_DONE_RE = re.compile(
+    r"(?:→\s*done\b|\b(?:transitioned|moved|marked|set)\b[^.]*\bdone\b)", re.I)
+_NEGATION_RE = re.compile(
+    r"\b(?:no|not|never|nothing|none|without|skip|skipped|unable|"
+    r"didn't|doesn't|wasn't|weren't|don't|couldn't|cannot|can't)\b|n't|no-op",
+    re.I)
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
+
+
+def _prose_asserts_unverified_work(prose: str) -> "str | None":
+    """Return a short reason if PROSE net-affirms a commit/push/transition (so an
+    empty manifest is suspect), else None. Sentence-scoped + negation-aware so an
+    honest no-op never trips it."""
+    if not prose:
+        return None
+    asserted: list[str] = []
+    for sentence in _SENTENCE_SPLIT_RE.split(prose):
+        if _NEGATION_RE.search(sentence):
+            continue
+        if _AFFIRM_COMMIT_RE.search(sentence) and "commit" not in asserted:
+            asserted.append("commit")
+        if _AFFIRM_PUSH_RE.search(sentence) and "push" not in asserted:
+            asserted.append("push")
+        if _AFFIRM_DONE_RE.search(sentence) and "transition to Done" not in asserted:
+            asserted.append("transition to Done")
+    return ", ".join(asserted) if asserted else None
 
 
 def verify_and_annotate(
@@ -446,7 +594,29 @@ def verify_and_annotate(
             if isinstance(entry, dict):
                 results.append(_verify_jira_comment(entry, job_start_ts_utc, now_utc))
 
+        # P272/MOL-2219: results-reporting claims (no job_start/now args — the
+        # git_commit baseline lives in the manifest, jira_status is point-in-time).
+        for entry in manifest.get("git_commits", []):
+            if isinstance(entry, dict):
+                results.append(_verify_git_commit(entry))
+
+        for entry in manifest.get("jira_status", []):
+            if isinstance(entry, dict):
+                results.append(_verify_jira_status(entry))
+
         if not results:
+            # P279/MOL-2219: an empty manifest is benign ONLY if the prose makes no
+            # affirmative work claim. If prose net-asserts a commit/push/transition
+            # with no corresponding verifiable claim, treat it as SUSPECT (the
+            # MOL-631 fabrication shape) and fail loudly — never disguise it as
+            # "none claimed". This is a meta-observation, not a fabricated verdict.
+            suspect = _prose_asserts_unverified_work(final_response)
+            if suspect:
+                return (
+                    f"❌ UNVERIFIABLE CLAIM — synthesizer prose asserts {suspect} "
+                    "but emitted no verifiable WORK_MANIFEST claim. Treated as "
+                    "SUSPECT (possible fabrication); NOT confirmed.\n\n"
+                    f"{SEPARATOR}\n\n{final_response}")
             return ("ℹ️ Empty WORK_MANIFEST (no claims to verify)\n\n"
                     f"{SEPARATOR}\n\n{final_response}")
 

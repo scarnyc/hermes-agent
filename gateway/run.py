@@ -3654,6 +3654,11 @@ class GatewayRunner:
         # so human-in-the-loop workflows hear back without polling.
         asyncio.create_task(self._kanban_notifier_watcher())
 
+        # P274/MOL-2219: deliver a VERIFIED results report (cherry-pick SHA +
+        # live Jira status, ground-truth-checked by the cron verifier) when an
+        # autonomous-knockout swarm's synthesizer reaches a terminal event.
+        asyncio.create_task(self._knockout_results_watcher())
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
@@ -4053,6 +4058,116 @@ class GatewayRunner:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
+            # Sleep with cancellation checks.
+            for _ in range(int(max(1, interval))):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
+
+    async def _knockout_results_watcher(self, interval: float = 30.0) -> None:
+        """P274/MOL-2219: deliver a VERIFIED results report when an autonomous-
+        knockout swarm finishes.
+
+        The 22:00 knockout cron emits a *dispatch receipt* — it predates the
+        swarm's actual work (cherry-pick, tests, Done transition land minutes
+        later), so its ✅ banner would look identical had the swarm silently
+        no-op'd. This watcher closes that gap: once the swarm's synthesizer
+        leaf reaches a terminal ``task_event``, it runs the deterministic
+        collector (claims only), hands the WORK_MANIFEST to the cron verifier
+        (the SOLE checker — git + Jira ground truth, not the worker grading its
+        own homework), and delivers the ✅/❌-bannered report to the Telegram
+        home channel. A once-only ``results_delivered`` marker appended to
+        ``autonomous-knockout.jsonl`` dedups delivery; an 18h age gate keeps a
+        lost marker file from re-firing ancient swarms.
+
+        Read-only against the patch-preserved runtime git tree — the collector
+        and verifier only ever READ git/Jira, never fetch/rebase.
+        """
+        from gateway.config import Platform as _Platform
+        try:
+            from tools import knockout_results as _kr
+            from tools.report_verifier import verify_and_annotate as _verify
+            from cron.scheduler import (
+                _get_home_target_chat_id as _home_chat,
+                _get_home_target_thread_id as _home_thread,
+            )
+        except Exception as exc:
+            logger.warning(
+                "knockout results: deps not importable; watcher disabled: %s", exc
+            )
+            return
+
+        # Let adapters finish wiring + avoid racing the dispatcher's own tick.
+        await asyncio.sleep(20)
+
+        while self._running:
+            try:
+                now_ts = time.time()
+                pending = await asyncio.to_thread(
+                    _kr.find_pending_knockout_results, now_ts=now_ts
+                )
+                for swarm in pending:
+                    synth_id = swarm["synth_id"]
+                    root_id = swarm["root_id"]
+                    try:
+                        report = await asyncio.to_thread(
+                            _kr.collect_results, synth_id
+                        )
+                        annotated = await asyncio.to_thread(
+                            _verify,
+                            {
+                                "id": f"knockout-results-{root_id}",
+                                "claims_expected": True,
+                            },
+                            report,
+                            synth_id,   # cron_session_id (used only for logging)
+                            0.0,        # job_start_ts_utc — git/jira claims ignore it
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "knockout results: collect/verify failed for %s: %s",
+                            root_id, exc,
+                        )
+                        continue
+                    chat_id = (_home_chat("telegram") or "").strip()
+                    adapter = (
+                        self.adapters.get(_Platform("telegram"))
+                        if chat_id else None
+                    )
+                    if adapter is None:
+                        # Home channel not connected yet — leave the swarm
+                        # pending (no marker) and retry on the next tick.
+                        logger.warning(
+                            "knockout results: telegram home channel "
+                            "unavailable; retrying (swarm %s)", root_id,
+                        )
+                        continue
+                    metadata: dict[str, Any] = {}
+                    thread_id = _home_thread("telegram")
+                    if thread_id:
+                        metadata["thread_id"] = thread_id
+                    try:
+                        await adapter.send(chat_id, annotated, metadata=metadata)
+                    except Exception as exc:
+                        logger.warning(
+                            "knockout results: telegram send failed for %s: %s",
+                            root_id, exc,
+                        )
+                        continue  # retry next tick; age gate bounds the retries
+                    await asyncio.to_thread(
+                        _kr.mark_results_delivered,
+                        _kr.DEFAULT_KNOCKOUT_LOG,
+                        swarm_id=root_id,
+                        synth_id=synth_id,
+                        now_iso=datetime.now().astimezone().isoformat(),
+                    )
+                    logger.info(
+                        "knockout results: delivered verified report for "
+                        "swarm %s (synth %s, ticket %s)",
+                        root_id, synth_id, swarm.get("ticket_key"),
+                    )
+            except Exception as exc:
+                logger.warning("knockout results watcher tick failed: %s", exc)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:
