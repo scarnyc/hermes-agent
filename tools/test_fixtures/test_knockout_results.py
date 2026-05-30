@@ -311,6 +311,75 @@ def test_find_pending_excludes_still_running(tmp_path):
         kanban_db=db, knockout_log=log, now_ts=_LOG_BASE_TS + 600) == []
 
 
+def _make_stranded_db(tmp_path, *, builder_status, builder_events,
+                      verifier_status="todo", synth_status="todo"):
+    """Build the Finding-A topology: ROOT done → BUILDER → VERIFIER → SYNTH,
+    where an upstream worker failed and the synthesizer leaf NEVER ran (no event
+    of its own). ``builder_events`` is a list of (kind, created_at) appended to
+    BUILDER. Mirrors the live MOL-633 smoke (t_60f1760a)."""
+    db = tmp_path / "kanban.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(_SCHEMA)
+    rows = [
+        (ROOT, "Swarm root", "done", "MOL-633"),
+        (BUILDER, "Implement MOL-633", builder_status, None),
+        (VERIFIER, "Verify swarm outputs", verifier_status, None),
+        (SYNTH, "Synthesize swarm outputs", synth_status, None),
+    ]
+    for tid, title, status, idem in rows:
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_at,idempotency_key) "
+            "VALUES (?,?,?,?,?)", (tid, title, status, 1000, idem))
+    for p, c in [(ROOT, BUILDER), (BUILDER, VERIFIER), (VERIFIER, SYNTH)]:
+        conn.execute("INSERT INTO task_links(parent_id,child_id) VALUES (?,?)", (p, c))
+    for kind, ts in builder_events:
+        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) "
+                     "VALUES (?,?,?,?)", (BUILDER, kind, None, ts))
+    conn.commit()
+    conn.close()
+    return str(db)
+
+
+def test_find_pending_fires_on_upstream_stranded_swarm(tmp_path):
+    # Finding A (P275): an upstream worker gave_up, so recompute_ready never
+    # promotes the synthesizer past todo → the leaf emits NO terminal event. The
+    # swarm is at terminal REST (no forward progress possible) and MUST fire a
+    # results report — honestly, with a synthetic 'stranded' kind. The old
+    # synth-terminal-only gate skipped this forever (silent no-op).
+    db = _make_stranded_db(
+        tmp_path, builder_status="blocked",
+        builder_events=[("crashed", 1100), ("gave_up", 1200)])
+    log = _make_log(tmp_path, ticket="MOL-633")
+    pending = kr.find_pending_knockout_results(
+        kanban_db=db, knockout_log=log, now_ts=_LOG_BASE_TS + 600)
+    assert len(pending) == 1
+    assert pending[0] == {"synth_id": SYNTH, "root_id": ROOT,
+                          "ticket_key": "MOL-633", "terminal_kind": "stranded"}
+
+
+def test_find_pending_excludes_todo_leaf_awaiting_promotion(tmp_path):
+    # Over-fire guard: synth is todo but ALL parents are done → recompute_ready
+    # will promote it next tick. The swarm is still LIVE (transient pre-promotion
+    # window), so the watcher must NOT fire a premature "stranded" report.
+    db = _make_stranded_db(
+        tmp_path, builder_status="done", builder_events=[("completed", 1100)],
+        verifier_status="done", synth_status="todo")
+    log = _make_log(tmp_path, ticket="MOL-633")
+    assert kr.find_pending_knockout_results(
+        kanban_db=db, knockout_log=log, now_ts=_LOG_BASE_TS + 600) == []
+
+
+def test_find_pending_excludes_reclaimable_block(tmp_path):
+    # A dependency-block (a `blocked` event WITHOUT a `gave_up` breaker trip) is
+    # reclaimable — the dispatcher may unblock it. Don't fire while the swarm can
+    # still recover; only a definitive gave_up strands the leaf.
+    db = _make_stranded_db(
+        tmp_path, builder_status="blocked", builder_events=[("blocked", 1100)])
+    log = _make_log(tmp_path, ticket="MOL-633")
+    assert kr.find_pending_knockout_results(
+        kanban_db=db, knockout_log=log, now_ts=_LOG_BASE_TS + 600) == []
+
+
 def test_find_pending_excludes_too_old(tmp_path):
     db = _make_db(tmp_path, synth_metadata=_FULL_META)
     log = _make_log(tmp_path)

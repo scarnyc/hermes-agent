@@ -257,6 +257,77 @@ def _latest_terminal_event(conn: sqlite3.Connection, task_id: str) -> Optional[s
     return kind if kind in TERMINAL_EVENT_KINDS else None
 
 
+# P275/MOL-2219 Finding A: statuses that mean a task will still advance on a
+# future dispatcher tick. "in_progress" is accepted alongside the canonical
+# "running" defensively (older runs / test fixtures use it).
+_LIVE_STATUSES = ("ready", "running", "in_progress", "triage")
+
+
+def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ? LIMIT 1", (task_id,)
+    ).fetchone()
+    return row["status"] if row else None
+
+
+def _parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    return [
+        r["parent_id"]
+        for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+        ).fetchall()
+    ]
+
+
+def _all_parents_done(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when every gating parent is ``done`` (so recompute_ready will promote
+    this task next tick). A parentless task is trivially unblocked."""
+    parents = _parent_ids(conn, task_id)
+    if not parents:
+        return True
+    return all(_task_status(conn, p) == "done" for p in parents)
+
+
+def _has_gave_up_event(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True if the task ever emitted a ``gave_up`` event — the failure circuit
+    breaker tripped at its limit (status → blocked + run closed gave_up). This is
+    DEFINITIVE: unlike a bare ``blocked`` dependency-block (reclaimable) or a
+    ``crashed``/``timed_out`` that bounces back to ``ready`` for retry, a gave_up
+    task will not auto-recover."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'gave_up' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _swarm_can_progress(conn: sqlite3.Connection, chain: list[str]) -> bool:
+    """Can the swarm still make forward progress toward its synthesizer?
+
+    P275/MOL-2219 Finding A. ``recompute_ready`` only promotes a todo task once
+    ALL its parents are ``done``; a ``gave_up`` upstream worker never becomes
+    ``done``, so the synthesizer leaf is stranded in ``todo`` and never emits a
+    terminal event — the swarm-results watcher would wait for it forever (silent
+    no-op). This predicate detects that terminal-rest state.
+
+    A swarm is LIVE iff some chain task will advance on a future tick:
+      - status in {ready, running, triage} → actively dispatchable
+      - blocked WITHOUT a gave_up event → a dependency block that may be reclaimed
+      - todo whose parents are ALL done → recompute_ready promotes it next tick
+    Otherwise (every non-done task is gave_up-blocked or todo-stranded behind a
+    non-done parent) the swarm is at terminal rest → returns False.
+    """
+    for tid in chain:
+        status = _task_status(conn, tid)
+        if status in _LIVE_STATUSES:
+            return True
+        if status == "blocked" and not _has_gave_up_event(conn, tid):
+            return True
+        if status == "todo" and _all_parents_done(conn, tid):
+            return True
+    return False
+
+
 def _load_pending_knockout_swarms(
     log_path: str, *, max_age_hours: float, now_ts: float
 ) -> list[dict]:
@@ -345,7 +416,18 @@ def find_pending_knockout_results(
                 continue
             kind = _latest_terminal_event(conn, leaf)
             if kind is None:
-                continue  # swarm still running — re-check next tick
+                # P275/MOL-2219 Finding A: the synth leaf has no terminal event.
+                # Either the swarm is genuinely still running, OR an upstream
+                # worker gave_up and stranded the leaf in todo forever (a gave_up
+                # parent never becomes done, so recompute_ready never promotes
+                # the synth). Distinguish by forward-progress: if the swarm can
+                # no longer advance, it is at terminal REST by upstream stranding
+                # — fire honestly with a synthetic 'stranded' kind (collect_results
+                # then reports the dead frontier: empty manifest, no false ✅).
+                chain = _walk_to_root(conn, leaf)
+                if _swarm_can_progress(conn, chain):
+                    continue  # genuinely still running — re-check next tick
+                kind = "stranded"
             out.append({
                 "synth_id": leaf,
                 "root_id": root_id,
