@@ -2180,6 +2180,57 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# P277/MOL-2219: completion-metadata commit keys, canonical order. Mirrors
+# tools/knockout_results._SHA_KEYS — local_commit is canonical; fork_commit is
+# the non-canonical alias the MOL-631 synth used. Excludes upstream/merge SHAs
+# (those name commits the worker did not author).
+_COMMIT_SHA_KEYS = ("local_commit", "fork_commit", "commit", "sha")
+
+
+def _claimed_commit_sha(metadata: Optional[dict]) -> "Optional[str]":
+    """First non-empty commit SHA in completion metadata, by canonical order."""
+    if not metadata:
+        return None
+    for key in _COMMIT_SHA_KEYS:
+        val = metadata.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _task_repo_root(conn: sqlite3.Connection, task_id: str) -> "Optional[str]":
+    row = conn.execute(
+        "SELECT repo_root FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return row["repo_root"] if row and row["repo_root"] else None
+
+
+def _commit_resolves(sha: str, repo_root: Optional[str]) -> "Optional[bool]":
+    """Three-valued: True = SHA resolves to a commit in *repo_root*;
+    False = repo_root is a valid git repo but the SHA is absent (fabricated);
+    None = cannot verify (no repo_root, not a git repo, or git unavailable) —
+    the caller skips the gate rather than manufacture a false block.
+    """
+    if not repo_root:
+        return None
+    try:
+        chk = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--git-dir"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if chk.returncode != 0:
+            return None  # not a git repo → unverifiable
+        res = subprocess.run(
+            ["git", "-C", repo_root, "cat-file", "-t", sha],
+            capture_output=True, text=True, timeout=10,
+        )
+        if res.returncode == 0 and res.stdout.strip() == "commit":
+            return True
+        return False  # valid repo, SHA is not a commit object → fabricated
+    except (OSError, subprocess.SubprocessError):
+        return None  # git missing / timeout → unverifiable, skip
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2246,6 +2297,32 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate (P277/MOL-2219): a claimed commit SHA in completion metadata must
+    # resolve in the task's repo. Runs BEFORE the main write txn so a fabricated
+    # completion never reaches 'done' (block_task only transitions running|ready,
+    # not done). A rejected attempt emits an auditable event in its own txn, then
+    # raises FabricatedCommitError; the caller blocks the task. Unverifiable
+    # contexts (no repo_root / not a git repo / git unavailable) skip the gate
+    # rather than manufacture a false block.
+    claimed_sha = _claimed_commit_sha(metadata)
+    if claimed_sha:
+        repo_root = _task_repo_root(conn, task_id)
+        if _commit_resolves(claimed_sha, repo_root) is False:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_fabrication",
+                    {
+                        "claimed_commit": claimed_sha,
+                        "repo_root": repo_root,
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            raise FabricatedCommitError(claimed_sha, task_id)
 
     with write_txn(conn):
         if expected_run_id is None:
